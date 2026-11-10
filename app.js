@@ -11,7 +11,7 @@
    * The rankings Worker (Cloudflare) address, e.g. "https://octive-rankings.yourname.workers.dev".
    * Empty: the site reads data/leaderboard.json instead.
    */
-  const WORKER_URL = "";
+  const WORKER_URL = "https://octive-rankings-api.lunalazum18.workers.dev/";
   /** Optional: a link to where people can download the game (itch.io, GitHub Releases). */
   const DOWNLOAD_URL = "";
 
