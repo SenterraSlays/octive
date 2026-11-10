@@ -109,7 +109,7 @@
   /** Renders a bio into an element: #0-#f colours, #RRGGBB, #l bold, #o italic, #n underline, #m strike, #k scrambled, #g rainbow, #r reset. */
   function renderBio(el, src) {
     el.textContent = "";
-    src = (src || "").replace(/\r/g, "").slice(0, 400).split("\n").slice(0, 8).join("\n");
+    src = (src || "").replace(/\r/g, "").replace(/^\n+/, "").trimEnd().slice(0, 400).split("\n").slice(0, 8).join("\n");
     let cur = {};
     let text = "";
     const animated = [];
