@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OCTIVE Rankings</title>
+  <meta name="description" content="Global performance ranking for OCTIVE, the vertical scrolling rhythm game.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpolygon points='10,2 22,2 30,10 30,22 22,30 10,30 2,22 2,10' fill='%237c6cff'/%3E%3C/svg%3E">
+</head>
+<body>
+  <header class="nav">
+    <a class="brand" href="#/">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><polygon points="10,2 22,2 30,10 30,22 22,30 10,30 2,22 2,10"/></svg>
+      <span>OCTIVE</span>
+    </a>
+    <nav>
+      <a href="#/" data-nav="rankings">Rankings</a>
+      <a id="download-link" href="#" hidden>Download</a>
+    </nav>
+    <span class="updated" id="updated"></span>
+  </header>
+
+  <main id="app" aria-live="polite"></main>
+
+  <footer class="foot">
+    <span>Live rankings from the game's online accounts.</span>
+    <span>Performance points: best play per chart, weighted 100%, 95%, 90%…</span>
+  </footer>
+
+  <template id="tpl-rankings">
+    <section class="hero">
+      <div>
+        <h1>Performance Ranking</h1>
+        <p class="sub">Every player with an OCTIVE account, ranked by total performance points.</p>
+      </div>
+      <div class="hero-side">
+        <div class="stat"><span class="stat-label">Players</span><span class="stat-value" data-count>0</span></div>
+        <label class="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+          <input type="search" placeholder="Find a player" data-search autocomplete="off">
+        </label>
+      </div>
+    </section>
+    <div class="notice" data-sample hidden>Showing sample data: the live ranking appears after the first update runs.</div>
+    <div class="table" role="table" aria-label="Global performance ranking">
+      <div class="thead" role="row">
+        <span role="columnheader">Rank</span>
+        <span role="columnheader">Player</span>
+        <span role="columnheader" class="num">Accuracy</span>
+        <span role="columnheader" class="num hide-sm">Level</span>
+        <span role="columnheader" class="num">Performance</span>
+      </div>
+      <div data-rows></div>
+    </div>
+    <p class="empty" data-empty hidden>No ranked players yet. Make an account in the game's Profile screen and finish a chart.</p>
+  </template>
+
+  <template id="tpl-row">
+    <a class="row" role="row">
+      <span class="rank" role="cell"></span>
+      <span class="player" role="cell">
+        <span class="avatar"><img alt="" loading="lazy" hidden><span class="initial"></span></span>
+        <span class="name"></span>
+        <span class="badge" hidden></span>
+      </span>
+      <span class="num acc" role="cell"></span>
+      <span class="num lvl hide-sm" role="cell"></span>
+      <span class="num pp" role="cell"></span>
+    </a>
+  </template>
+
+  <template id="tpl-player">
+    <a class="back" href="#/">← All players</a>
+    <article class="card">
+      <span class="card-rank"></span>
+      <div class="card-avatar"><img alt="" hidden><span class="initial"></span></div>
+      <div class="card-body">
+        <div class="card-name-row"><h1 class="card-name"></h1><span class="badge" hidden></span></div>
+        <div class="card-title" hidden></div>
+        <dl class="card-stats">
+          <div><dt>Performance</dt><dd class="c-pp"></dd></div>
+          <div><dt>Accuracy</dt><dd class="c-acc"></dd></div>
+          <div><dt>Global rank</dt><dd class="c-rank"></dd></div>
+        </dl>
+        <div class="level"><span class="c-lvl"></span><div class="bar"><div class="fill"></div></div><span class="c-next"></span></div>
+      </div>
+    </article>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
