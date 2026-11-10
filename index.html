@@ -39,6 +39,7 @@
       </div>
       <div class="hero-side">
         <div class="stat"><span class="stat-label">Players</span><span class="stat-value" data-count>0</span></div>
+        <div class="stat"><span class="stat-label">Online</span><span class="stat-value online-count" data-online>0</span></div>
         <label class="search">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
           <input type="search" placeholder="Find a player" data-search autocomplete="off">
@@ -52,6 +53,7 @@
         <span role="columnheader">Player</span>
         <span role="columnheader" class="num">Accuracy</span>
         <span role="columnheader" class="num hide-sm">Level</span>
+        <span role="columnheader" class="num hide-sm">Plays</span>
         <span role="columnheader" class="num">Performance</span>
       </div>
       <div data-rows></div>
@@ -63,12 +65,13 @@
     <a class="row" role="row">
       <span class="rank" role="cell"></span>
       <span class="player" role="cell">
-        <span class="avatar"><img alt="" loading="lazy" hidden><span class="initial"></span></span>
+        <span class="avatar"><img alt="" loading="lazy" hidden><span class="initial"></span><span class="dot" hidden></span></span>
         <span class="name"></span>
         <span class="badge" hidden></span>
       </span>
       <span class="num acc" role="cell"></span>
       <span class="num lvl hide-sm" role="cell"></span>
+      <span class="num plays hide-sm" role="cell"></span>
       <span class="num pp" role="cell"></span>
     </a>
   </template>
@@ -77,10 +80,11 @@
     <a class="back" href="#/">← All players</a>
     <article class="card">
       <span class="card-rank"></span>
-      <div class="card-avatar"><img alt="" hidden><span class="initial"></span></div>
+      <div class="card-avatar"><img alt="" hidden><span class="initial"></span><span class="dot" hidden></span></div>
       <div class="card-body">
         <div class="card-name-row"><h1 class="card-name"></h1><span class="badge" hidden></span></div>
         <div class="card-title" hidden></div>
+        <div class="card-status"></div>
         <dl class="card-stats">
           <div><dt>Performance</dt><dd class="c-pp"></dd></div>
           <div><dt>Accuracy</dt><dd class="c-acc"></dd></div>
@@ -89,6 +93,18 @@
         <div class="level"><span class="c-lvl"></span><div class="bar"><div class="fill"></div></div><span class="c-next"></span></div>
       </div>
     </article>
+    <div class="devfriend" hidden><span class="heart">♥</span> Friends with DEV <span class="devfriend-sub">· friends with the developer of OCTIVE</span></div>
+    <section class="tiles">
+      <div class="tile"><span>Global rank</span><b class="s-rank"></b></div>
+      <div class="tile"><span>Level</span><b class="s-level"></b></div>
+      <div class="tile"><span>Total score</span><b class="s-score"></b></div>
+      <div class="tile"><span>Play count</span><b class="s-plays"></b></div>
+      <div class="tile"><span>Full combos</span><b class="s-fc"></b></div>
+      <div class="tile"><span>Max combo</span><b class="s-combo"></b></div>
+      <div class="tile"><span>Play time</span><b class="s-time"></b></div>
+      <div class="tile"><span>Experience</span><b class="s-xp"></b></div>
+    </section>
+    <section class="bio" hidden><h2>About</h2><p class="bio-text"></p></section>
   </template>
 
   <script src="app.js"></script>
