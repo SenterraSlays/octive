@@ -947,7 +947,8 @@ export default {
       if (url.pathname === "/" || url.pathname === "/leaderboard") return json(await leaderboard(env), 30);
       const m = url.pathname.match(/^\/avatar\/([A-Za-z0-9_-]{1,64})$/);
       if (m) return await avatar(env, m[1], url.searchParams.get("v"));
-      const w = url.pathname.match(/^\/web\/(\d{1,3}\.\d{1,3}\.\d{1,3})\/((?:Build|StreamingAssets)\/[A-Za-z0-9._\/-]{1,200})$/);
+      // /web/<version>/[~<build stamp>/]Build/... — the stamp only makes browsers fetch a re-uploaded build
+      const w = url.pathname.match(/^\/web\/(\d{1,3}\.\d{1,3}\.\d{1,3})\/(?:~[A-Za-z0-9-]{1,40}\/)?((?:Build|StreamingAssets)\/[A-Za-z0-9._\/-]{1,200})$/);
       if (w && !w[2].includes("..")) return await webFile(env, w[1], w[2], request);
       const r = url.pathname.match(/^\/releases\/([A-Za-z0-9._-]{1,120})$/);
       if (r) return await release(env, r[1], request);

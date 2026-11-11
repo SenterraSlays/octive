@@ -87,7 +87,7 @@
       .then((r) => r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
       .then((m) => {
         if (!m.web) { fail('The browser version isn\'t out yet. <a href="../#/download">Download OCTIVE</a> for Windows or Android instead.'); return; }
-        const w = m.web, base = `${WORKER}/web/${w.version}`;
+        const w = m.web, base = `${WORKER}/web/${w.version}/~${w.build || String(m.published || "").replace(/[^0-9]/g, "")}`;
         document.title = `OCTIVE ${w.version} · Play in your browser`;
         status.textContent = `Loading OCTIVE ${w.version}…`;
         const script = document.createElement("script");
