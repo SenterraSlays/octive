@@ -314,6 +314,26 @@ async function privateItems(env, playerId, keys) {
   return out;
 }
 
+/**
+ * Saves one Cloud Save item as the signed-in player (their own token, like the game does), so the
+ * service account only needs read access.
+ */
+async function saveAsPlayer(env, token, playerId, key, value, isPublic) {
+  const url = `https://cloud-save.services.api.unity.com/v1/data/projects/${env.UGS_PROJECT_ID}/players/${encodeURIComponent(playerId)}/${isPublic ? "public/" : ""}items`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + token, "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ key, value }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    if (res.status === 401) fail(401, "Your sign-in ran out. Sign in again.");
+    const e = new Error(`Unity returned ${res.status} saving ${key}: ${text.slice(0, 200)}`);
+    e.status = 502;
+    throw e;
+  }
+}
+
 async function saveItem(env, playerId, key, value, isPublic) {
   await admin(env, "POST", `${config(env).save}/players/${encodeURIComponent(playerId)}/${isPublic ? "public/" : ""}items`, { key, value });
 }
@@ -517,9 +537,10 @@ async function account(request, env, route) {
         small = sm;
       }
       edits.at = now;
-      await saveItem(env, who.playerId, "webEdits", edits, false);
-      await saveItem(env, who.playerId, "card", card, true);
-      if (small) await saveItem(env, who.playerId, "avatar", small, true);
+      const token = request.headers.get("Authorization").slice(7).trim();
+      await saveAsPlayer(env, token, who.playerId, "webEdits", edits, false);
+      await saveAsPlayer(env, token, who.playerId, "card", card, true);
+      if (small) await saveAsPlayer(env, token, who.playerId, "avatar", small, true);
       cards.delete(who.playerId); boardAt = 0;
       return reply(await me(env, who));
     }
