@@ -12,6 +12,7 @@
     MOD: { badge: "MOD", title: "OCTIVE moderator", cls: "role-mod" },
     TESTER: { badge: "TESTER", title: "OCTIVE tester", cls: "role-tester" },
     VIP: { badge: "VIP", title: "OCTIVE VIP", cls: "role-vip" },
+    CREATOR: { badge: "CREATOR", title: "Content creator", cls: "role-creator" },
   };
   /**
    * The rankings Worker (Cloudflare) address, e.g. "https://octive-rankings.yourname.workers.dev".
@@ -27,7 +28,7 @@
   let data = null;
 
   // the game's level curve: level 1 → 2 takes 10,000 xp, every level after takes 7% more
-  const xpFor = (lv) => lv <= 1 ? 0 : Math.round(10000 * (Math.pow(1.07, lv - 1) - 1) / 0.07);
+  const xpFor = (lv) => lv <= 1 ? 0 : Math.round(100000 * (Math.pow(1.07, lv - 1) - 1) / 0.07);
 
   if (DOWNLOAD_URL) { const d = document.getElementById("download-link"); d.href = DOWNLOAD_URL; d.hidden = false; }
 
@@ -84,7 +85,52 @@
     root.classList.add(role.cls);
     badgeEl.textContent = role.badge;
     badgeEl.hidden = false;
+    // the player's other badges (a player can have several, e.g. TESTER and VIP)
+    let after = badgeEl;
+    for (const b of (p.badges || [])) {
+      if (b === role.badge || !GRANTED[b]) continue;
+      const extra = document.createElement("span");
+      extra.className = "badge extra " + GRANTED[b].cls;
+      extra.textContent = b;
+      extra.title = GRANTED[b].title;
+      after.after(extra);
+      after = extra;
+    }
     return role;
+  }
+
+  // ---------------------------------------------------------------- content creators' socials (same rules as the game)
+  const SOCIALS = [
+    ["youtube", "YouTube", "https://www.youtube.com/@{0}"], ["twitch", "Twitch", "https://www.twitch.tv/{0}"],
+    ["tiktok", "TikTok", "https://www.tiktok.com/@{0}"], ["x", "X (Twitter)", "https://x.com/{0}"],
+    ["instagram", "Instagram", "https://www.instagram.com/{0}"], ["bluesky", "Bluesky", "https://bsky.app/profile/{0}"],
+    ["discord", "Discord", null], ["website", "Website", null],
+  ];
+  function socialUrl(format, value) {
+    const v = String(value || "").trim();
+    if (!v || v.length > 200) return null;
+    const safe = (s) => { try { const u = new URL(s); return (u.protocol === "https:" || u.protocol === "http:") && u.host ? u.href : null; } catch { return null; } };
+    if (/^https?:\/\//i.test(v)) return safe(v);
+    if (!format) return v.includes(".") && !v.includes(" ") ? safe("https://" + v) : null;
+    const h = v.replace(/^@+/, "");
+    return /^[A-Za-z0-9._-]{1,60}$/.test(h) ? format.replace("{0}", h) : null;
+  }
+  function renderSocials(box, socials) {
+    box.textContent = "";
+    let n = 0;
+    for (const [id, name, format] of SOCIALS) {
+      const url = socialUrl(format, socials && socials[id]);
+      if (!url) continue;
+      const a = document.createElement("a");
+      a.className = "social"; a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer";
+      const label = document.createElement("span"); label.className = "social-name"; label.textContent = name;
+      const handle = document.createElement("span"); handle.className = "social-handle";
+      handle.textContent = /^https?:/i.test(socials[id]) ? socials[id].replace(/^https?:\/\/(www\.)?/i, "").replace(/\/$/, "") : socials[id];
+      a.append(label, handle);
+      box.appendChild(a);
+      n++;
+    }
+    return n;
   }
 
   function ago(iso) {
@@ -234,6 +280,10 @@
     if (p.bio && p.bio.trim()) {
       view.querySelector(".bio").hidden = false;
       renderBio(view.querySelector(".bio-text"), p.bio);
+    }
+    if ((p.badges || []).includes("CREATOR") && p.socials) {
+      const box = view.querySelector(".social-links");
+      if (box && renderSocials(box, p.socials) > 0) view.querySelector(".socials").hidden = false;
     }
     app.replaceChildren(view);
     document.title = `${p.name} · OCTIVE Rankings`;

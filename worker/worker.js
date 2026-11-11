@@ -2,20 +2,45 @@
 // Services. It keeps the Unity service-account key secret and serves:
 //   GET /leaderboard            the global PP ranking with each player's public card (JSON)
 //   GET /avatar/<playerId>?v=…  a player's public avatar (JPG)
+//   GET /releases/<file>         game updates from the R2 bucket bound as RELEASES (latest.json + builds)
 // Secrets (Worker → Settings → Variables and Secrets): UGS_KEY_ID, UGS_SECRET_KEY, UGS_PROJECT_ID,
-// UGS_ENVIRONMENT_ID. Results are kept in memory (ranking 60 s, cards 10 min, avatars until they
+// UGS_ENVIRONMENT_ID. Results are kept in memory (ranking 60 s, cards 3 min, avatars until they
 // change) so the site stays fast and inside Unity's request limits; if Unity can't be reached the
 // last ranking is served.
+//
+// Developers moderate from inside the game: their public "moderation" data (bans, forced names and
+// pictures, badges) is read here too, so banned players disappear from the site as well.
 
 const LEADERBOARD = "global-pp";
 const TOP = 50;                    // players shown
 const BOARD_TTL = 60_000;          // ranking refresh
-const CARD_TTL = 10 * 60_000;      // public card refresh
-const CARD_FETCH_BUDGET = 25;      // cards fetched per request (Cloudflare free plan: 50 subrequests)
+const CARD_TTL = 3 * 60_000;       // public card + online status refresh
+const CARD_FETCH_BUDGET = 40;      // cards fetched per request (Cloudflare free plan: 50 subrequests)
+const ONLINE_MS = 5 * 60_000;      // "online" when the game wrote its heartbeat this recently
+const DEVELOPERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE"]; // same list as the game's PlayerRoles
 
 let board = null, boardAt = 0, boardPromise = null;
-const cards = new Map();           // playerId -> { card, at }
+const cards = new Map();           // playerId -> { card, seen, at }
 const avatars = new Map();         // playerId:hash -> Uint8Array
+let moderation = { bans: {}, overrides: {}, roles: {}, badges: {} };
+const BADGE_ORDER = ["DEV", "MOD", "CREATOR", "VIP", "TESTER"];
+const SOCIAL_KEYS = ["youtube", "twitch", "tiktok", "x", "instagram", "bluesky", "discord", "website"];
+
+/** Every badge of a player, most important first (DEV is built in; others come from the developers' list). */
+function badgesOf(id) {
+  const list = DEVELOPERS.includes(id) ? ["DEV"] : [];
+  const granted = moderation.badges[id] || (moderation.roles[id] ? [moderation.roles[id]] : []);
+  for (const b of granted) if (typeof b === "string" && BADGE_ORDER.includes(b) && !list.includes(b)) list.push(b);
+  return list.sort((a, b) => BADGE_ORDER.indexOf(a) - BADGE_ORDER.indexOf(b));
+}
+
+/** A content creator's links from their card: known platforms, short strings only (the site builds the URLs). */
+function socialsOf(card) {
+  const out = {};
+  const s = card && typeof card.socials === "object" && card.socials ? card.socials : {};
+  for (const k of SOCIAL_KEYS) if (typeof s[k] === "string" && s[k].length > 0 && s[k].length <= 200) out[k] = s[k];
+  return out;
+}
 
 const stripTag = (n) => { if (!n) return "Player"; const i = n.lastIndexOf("#"); return i > 0 ? n.slice(0, i) : n; };
 
@@ -56,45 +81,88 @@ async function api(url, auth) {
   return res.json();
 }
 
-/** One public Cloud Save item of a player (value parsed when it is JSON), or undefined. */
-async function publicItem(cfg, playerId, key) {
-  const body = await api(`${cfg.save}/players/${encodeURIComponent(playerId)}/public/items?keys=${encodeURIComponent(key)}`, cfg.auth);
-  const it = (body?.results ?? []).find((r) => r.key === key);
-  if (!it) return undefined;
-  let v = it.value;
-  if (typeof v === "string" && key !== "avatar") { try { v = JSON.parse(v); } catch { /* keep the string */ } }
-  return v;
+/** Several public Cloud Save items of a player (values parsed when they are JSON). */
+async function publicItems(cfg, playerId, keys) {
+  const q = keys.map((k) => "keys=" + encodeURIComponent(k)).join("&");
+  const body = await api(`${cfg.save}/players/${encodeURIComponent(playerId)}/public/items?${q}`, cfg.auth);
+  const out = {};
+  for (const it of body?.results ?? []) {
+    let v = it.value;
+    if (typeof v === "string" && it.key !== "avatar" && it.key !== "seen") { try { v = JSON.parse(v); } catch { /* keep the string */ } }
+    out[it.key] = v;
+  }
+  return out;
+}
+
+async function loadModeration(cfg) {
+  const merged = { bans: {}, overrides: {}, roles: {}, badges: {} };
+  await Promise.all(DEVELOPERS.map(async (dev) => {
+    try {
+      const m = (await publicItems(cfg, dev, ["moderation"])).moderation;
+      if (!m) return;
+      Object.assign(merged.bans, m.bans || {});
+      for (const [id, o] of Object.entries(m.overrides || {}))
+        if (!merged.overrides[id] || new Date(o.at) > new Date(merged.overrides[id].at)) merged.overrides[id] = o;
+      Object.assign(merged.roles, m.roles || {});
+      Object.assign(merged.badges, m.badges || {});
+    } catch { /* keep the previous lists */ }
+  }));
+  moderation = merged;
 }
 
 async function buildBoard(env) {
   const cfg = config(env);
-  const page = await api(`${cfg.scores}?offset=0&limit=${TOP}`, cfg.auth);
+  const page = await api(`${cfg.scores}?offset=0&limit=${TOP + 10}`, cfg.auth);
   if (!page) throw new Error(`Leaderboard "${LEADERBOARD}" not found: create it in the Unity dashboard.`);
-  const entries = page.results ?? [];
+  await loadModeration(cfg);
+  const entries = (page.results ?? []).filter((e) => !moderation.bans[e.playerId]).slice(0, TOP);
   const now = Date.now();
-  // refresh the stalest cards first, within this request's budget
+
   const stale = entries.map((e) => e.playerId)
     .filter((id) => !cards.has(id) || now - cards.get(id).at > CARD_TTL)
     .sort((a, b) => (cards.get(a)?.at ?? 0) - (cards.get(b)?.at ?? 0))
     .slice(0, CARD_FETCH_BUDGET);
   await Promise.all(stale.map(async (id) => {
-    try { cards.set(id, { card: (await publicItem(cfg, id, "card")) ?? null, at: now }); }
-    catch (e) { if (!cards.has(id)) cards.set(id, { card: null, at: 0 }); }
+    try {
+      const items = await publicItems(cfg, id, ["card", "seen"]);
+      cards.set(id, { card: items.card ?? null, seen: items.seen || "", at: now });
+    } catch (e) { if (!cards.has(id)) cards.set(id, { card: null, seen: "", at: 0 }); }
   }));
-  const players = entries.map((e) => {
-    const card = cards.get(e.playerId)?.card;
+  const players = entries.map((e, i) => {
+    const c = cards.get(e.playerId) || {};
+    const card = c.card || {};
+    let meta = {};
+    try { meta = e.metadata ? JSON.parse(e.metadata) : {}; } catch { /* none */ }
+    const ov = moderation.overrides[e.playerId] || {};
+    const seen = c.seen ? Date.parse(c.seen) : 0;
+    let avatarHash = card.avatar || "";
+    if (ov.avatar === "default") avatarHash = "";
+    else if (ov.avatar) avatarHash = "mod-" + Date.parse(ov.at);
     return {
       id: e.playerId,
-      rank: e.rank + 1,
+      rank: i + 1,
       pp: Math.round(e.score * 100) / 100,
-      name: (card && card.name) || stripTag(e.playerName),
-      accuracy: card?.accuracy ?? 0,
-      level: card?.level ?? 1,
-      levelProgress: card?.levelProgress ?? 0,
-      avatarHash: card?.avatar || "",
+      name: ov.name || card.name || meta.n || stripTag(e.playerName),
+      accuracy: card.accuracy ?? meta.a ?? 0,
+      level: card.level ?? meta.l ?? 1,
+      levelProgress: card.levelProgress ?? meta.lp ?? 0,
+      totalScore: card.totalScore ?? meta.ts ?? 0,
+      xp: card.xp ?? 0,
+      playCount: card.playCount ?? meta.pc ?? 0,
+      fullCombos: card.fullCombos ?? meta.fc ?? 0,
+      maxCombo: card.maxCombo ?? 0,
+      playTimeMs: card.playTimeMs ?? 0,
+      bio: typeof card.bio === "string" ? card.bio : "",
+      devFriend: !!card.devFriend,
+      role: DEVELOPERS.includes(e.playerId) ? "DEV" : (badgesOf(e.playerId)[0] || moderation.roles[e.playerId] || null),
+      badges: badgesOf(e.playerId),
+      socials: badgesOf(e.playerId).includes("CREATOR") ? socialsOf(card) : {},
+      online: seen > 0 && now - seen < ONLINE_MS,
+      lastSeen: seen > 0 ? new Date(seen).toISOString() : null,
+      avatarHash,
     };
   });
-  return { updated: new Date(now).toISOString(), leaderboard: LEADERBOARD, total: page.total ?? players.length, players };
+  return { updated: new Date(now).toISOString(), leaderboard: LEADERBOARD, total: players.length, online: players.filter((p) => p.online).length, players };
 }
 
 async function leaderboard(env) {
@@ -107,21 +175,55 @@ async function leaderboard(env) {
   return boardPromise;
 }
 
+function b64Bytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
 async function avatar(env, playerId, hash) {
   const key = `${playerId}:${hash || "latest"}`;
   let bytes = avatars.get(key);
   if (!bytes) {
-    const b64 = await publicItem(config(env), playerId, "avatar");
+    const ov = moderation.overrides[playerId];
+    if (ov && ov.avatar === "default") return cors(new Response("No avatar", { status: 404 }));
+    let b64 = ov && ov.avatar ? ov.avatar : (await publicItems(config(env), playerId, ["avatar"])).avatar;
     if (typeof b64 !== "string" || !b64.length) return cors(new Response("No avatar", { status: 404 }));
-    const bin = atob(b64);
-    bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    bytes = b64Bytes(b64);
     if (avatars.size > 300) avatars.delete(avatars.keys().next().value);
     avatars.set(key, bytes);
   }
   return cors(new Response(bytes, {
     headers: { "Content-Type": "image/jpeg", "Cache-Control": hash ? "public, max-age=31536000, immutable" : "public, max-age=600" },
   }));
+}
+
+// ---------------------------------------------------------------- game updates
+// The game checks /releases/latest.json and downloads the files it names from the R2 bucket bound as
+// RELEASES (Worker → Settings → Bindings → R2 bucket, variable name RELEASES).
+const RELEASE_TYPES = { json: "application/json; charset=utf-8", zip: "application/zip", apk: "application/vnd.android.package-archive" };
+
+async function release(env, key, request) {
+  if (!env.RELEASES) return cors(new Response("Updates aren't set up: bind the R2 bucket as RELEASES.", { status: 503 }));
+  const range = request.headers.get("Range");
+  const obj = await env.RELEASES.get(key, range ? { range: request.headers } : undefined);
+  if (!obj) return cors(new Response("Not found", { status: 404 }));
+  const ext = key.split(".").pop().toLowerCase();
+  const h = new Headers();
+  h.set("Content-Type", RELEASE_TYPES[ext] || "application/octet-stream");
+  // latest.json changes with every release; the builds themselves are versioned and never change
+  h.set("Cache-Control", key === "latest.json" ? "no-cache, max-age=0" : "public, max-age=31536000, immutable");
+  if (ext !== "json") h.set("Content-Disposition", `attachment; filename="${key}"`);
+  h.set("ETag", obj.httpEtag);
+  if (obj.range && range) {
+    const off = obj.range.offset ?? 0, len = obj.range.length ?? obj.size - off;
+    h.set("Content-Range", `bytes ${off}-${off + len - 1}/${obj.size}`);
+    h.set("Content-Length", String(len));
+    return cors(new Response(obj.body, { status: 206, headers: h }));
+  }
+  h.set("Content-Length", String(obj.size));
+  return cors(new Response(obj.body, { headers: h }));
 }
 
 export default {
@@ -133,6 +235,8 @@ export default {
       if (url.pathname === "/" || url.pathname === "/leaderboard") return json(await leaderboard(env), 30);
       const m = url.pathname.match(/^\/avatar\/([A-Za-z0-9_-]{1,64})$/);
       if (m) return await avatar(env, m[1], url.searchParams.get("v"));
+      const r = url.pathname.match(/^\/releases\/([A-Za-z0-9._-]{1,120})$/);
+      if (r) return await release(env, r[1], request);
       return cors(new Response("Not found", { status: 404 }));
     } catch (e) {
       return json({ error: e.message }, 0, e.status === 429 ? 503 : 502);
