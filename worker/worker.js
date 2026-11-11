@@ -3,6 +3,8 @@
 //   GET /leaderboard            the global PP ranking with each player's public card (JSON)
 //   GET /avatar/<playerId>?v=…  a player's public avatar (JPG)
 //   GET /releases/<file>         game updates from the R2 bucket bound as RELEASES (latest.json + builds)
+//   GET /scores/<songId>/<chartId>, POST /scores/submit   leaderboards of OCTIVE Official charts
+//   /support/... /stripe/webhook  supporter purchases (Stripe), status and looks; /social/<id>, /follow
 //   POST /discord                Discord slash commands (/profile, /leaderboard, /online, /download, /link, /unlink)
 //   /account/...                 website sign-in, profile editing, email linking and password resets
 //                                (see "accounts" below; email needs BREVO_API_KEY + MAIL_FROM)
@@ -129,9 +131,9 @@ async function buildBoard(env) {
     .slice(0, CARD_FETCH_BUDGET);
   await Promise.all(stale.map(async (id) => {
     try {
-      const items = await publicItems(cfg, id, ["card", "seen"]);
-      cards.set(id, { card: items.card ?? null, seen: items.seen || "", at: now });
-    } catch (e) { if (!cards.has(id)) cards.set(id, { card: null, seen: "", at: 0 }); }
+      const items = await publicItems(cfg, id, ["card", "seen", "platform"]);
+      cards.set(id, { card: items.card ?? null, seen: items.seen || "", platform: items.platform || "", at: now });
+    } catch (e) { if (!cards.has(id)) cards.set(id, { card: null, seen: "", platform: "", at: 0 }); }
   }));
   const players = entries.map((e, i) => {
     const c = cards.get(e.playerId) || {};
@@ -164,6 +166,8 @@ async function buildBoard(env) {
       socials: badgesOf(e.playerId).includes("CREATOR") ? socialsOf(card) : {},
       online: seen > 0 && now - seen < ONLINE_MS,
       lastSeen: seen > 0 ? new Date(seen).toISOString() : null,
+      platform: c.platform || "",
+      status: seen > 0 && now - seen < ONLINE_MS ? platformStatus(c.platform) : null,
       avatarHash,
     };
   });
@@ -468,6 +472,8 @@ async function me(env, who) {
     emailVerified: !!rec.verified,
     pendingEmail: rec.pending && rec.pending.exp > Date.now() ? rec.pending.email : null,
     discord: rec.discord ? { name: rec.discord.name || "", at: rec.discord.at || null } : null,
+    supporter: supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId),
+    looks: await r2json(env, `looks/${who.playerId}.json`, {}),
   };
 }
 
@@ -500,6 +506,12 @@ async function account(request, env, route) {
     case "me": {
       const who = await signedIn(request, env);
       return reply(await me(env, who));
+    }
+    case "seen": {
+      // the website, signed in and open: "Viewing Website" in the ranking for a few minutes
+      const who = await signedIn(request, env);
+      await env.RELEASES.put(`webseen/${who.playerId}`, "1");
+      return reply({ ok: true });
     }
     case "profile": {
       const b = await bodyOf(request);
@@ -742,7 +754,7 @@ async function profileOf(env, playerId) {
   try { board = await leaderboard(env); } catch { /* card only */ }
   const ranked = board?.players?.find((p) => p.id === playerId);
   if (ranked) return ranked;
-  const items = await publicItems(config(env), playerId, ["card", "seen"]);
+  const items = await publicItems(config(env), playerId, ["card", "seen", "platform"]);
   const card = items.card;
   if (!card || moderation.bans[playerId]) return null;
   const seen = items.seen ? Date.parse(items.seen) : 0;
@@ -752,6 +764,7 @@ async function profileOf(env, playerId) {
     level: card.level || 1, levelProgress: card.levelProgress || 0, playCount: card.playCount || 0, maxCombo: card.maxCombo || 0,
     fullCombos: card.fullCombos || 0, playTimeMs: card.playTimeMs || 0, totalScore: card.totalScore || 0, bio: card.bio || "",
     badges: badgesOf(playerId), online: seen > 0 && Date.now() - seen < ONLINE_MS, lastSeen: seen ? new Date(seen).toISOString() : null,
+    platform: items.platform || "", status: seen > 0 && Date.now() - seen < ONLINE_MS ? platformStatus(items.platform) : null,
     avatarHash: ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : (card.avatar || ""),
   };
 }
@@ -774,7 +787,7 @@ function profileEmbed(p) {
       { name: "Max combo", value: p.maxCombo ? `${fmtN(p.maxCombo)}x` : "—", inline: true },
       { name: "Full combos", value: fmtN(p.fullCombos), inline: true },
       { name: "Play time", value: playTimeText(p.playTimeMs), inline: true },
-      { name: "Status", value: p.online ? "🟢 Online now" : p.lastSeen ? `Last online ${agoText(p.lastSeen)}` : "Offline", inline: true },
+      { name: "Status", value: p.online ? "🟢 " + statusText(p) : p.lastSeen ? `Last online ${agoText(p.lastSeen)}` : "Offline", inline: true },
     ],
     footer: { text: "OCTIVE · senterraslays.github.io/octive-rankings" },
   };
@@ -930,6 +943,386 @@ async function discordInteraction(request, env, ctx) {
   return new Response(JSON.stringify({ type: 5, data: ephemeral ? { flags: EPHEMERAL } : {} }), { headers: { "Content-Type": "application/json" } });
 }
 
+// ---------------------------------------------------------------- chart leaderboards (official songs)
+// Every OCTIVE Official chart (song id "octive-…") has a top-100 leaderboard: one entry per player, their
+// best. The game submits a play with the player's Unity token (checked like the website's sign-in);
+// the board lives in R2 at scores/<songId>/<chartId>.json and is cached for a few seconds.
+const BOARD_SIZE = 100;
+const SCORE_MAX = 1_000_000;
+const boards = new Map(); // key -> { data, at }
+
+const officialSong = (id) => /^octive-[a-z0-9-]{1,80}$/.test(id || "");
+const chartIdOk = (id) => /^[A-Za-z0-9_-]{1,80}$/.test(id || "");
+
+async function readBoard(env, songId, chartId) {
+  const key = `scores/${songId}/${chartId}.json`;
+  const c = boards.get(key);
+  if (c && Date.now() - c.at < 15_000) return c.data;
+  const o = await env.RELEASES.get(key);
+  let data = { entries: [] };
+  if (o) { try { data = await o.json(); } catch { /* start over */ } }
+  data.entries ||= [];
+  boards.set(key, { data, at: Date.now() });
+  if (boards.size > 500) boards.delete(boards.keys().next().value);
+  return data;
+}
+
+async function chartScores(request, env, url) {
+  const m = url.pathname.match(/^\/scores\/([a-z0-9-]{1,90})\/([A-Za-z0-9_-]{1,80})$/);
+  if (m && request.method === "GET") {
+    if (!officialSong(m[1])) return reply({ entries: [], official: false });
+    const data = await readBoard(env, m[1], m[2]);
+    if (Date.now() - boardAt > BOARD_TTL) { try { await loadModeration(config(env)); } catch { /* keep */ } }
+    let sup = {};
+    try { sup = await supporters(env); } catch { /* none */ }
+    const entries = data.entries.filter((e) => !moderation.bans[e.playerId]).slice(0, 50).map((e, i) => ({ ...e, rank: i + 1, supporter: !!sup[e.playerId]?.active }));
+    return reply({ official: true, entries, total: data.entries.length });
+  }
+  if (url.pathname === "/scores/submit") {
+    const b = await bodyOf(request);
+    const who = await signedIn(request, env);
+    const songId = String(b.songId || ""), chartId = String(b.chartId || "");
+    if (!officialSong(songId) || !chartIdOk(chartId)) fail(400, "Only OCTIVE Official charts have online leaderboards.");
+    const score = Math.round(Number(b.score)), acc = Number(b.accuracy);
+    if (!(score >= 0 && score <= SCORE_MAX) || !(acc >= 0 && acc <= 100)) fail(400, "That score isn't valid.");
+    const cfg = config(env);
+    await loadModeration(cfg);
+    if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+    const card = (await publicItems(cfg, who.playerId, ["card"])).card || {};
+    const ov = moderation.overrides[who.playerId] || {};
+    const entry = {
+      playerId: who.playerId,
+      name: String(ov.name || card.name || who.username || "Player").slice(0, 40),
+      avatarHash: ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : String(card.avatar || ""),
+      score, accuracy: Math.round(acc * 100) / 100,
+      grade: String(b.grade || "").slice(0, 3),
+      maxCombo: Math.max(0, Math.round(Number(b.maxCombo) || 0)),
+      fullCombo: !!b.fullCombo,
+      pp: Math.max(0, Math.round((Number(b.pp) || 0) * 100) / 100),
+      counts: Array.isArray(b.counts) ? b.counts.slice(0, 6).map((n) => Math.max(0, Math.round(Number(n) || 0))) : [],
+      badges: badgesOf(who.playerId),
+      date: new Date().toISOString(),
+      version: String(b.version || "").slice(0, 12),
+    };
+    const key = `scores/${songId}/${chartId}.json`;
+    boards.delete(key);
+    const data = await readBoard(env, songId, chartId);
+    const i = data.entries.findIndex((e) => e.playerId === who.playerId);
+    let improved = true;
+    if (i >= 0) {
+      if (data.entries[i].score >= score) improved = false;
+      else data.entries.splice(i, 1);
+    }
+    if (improved) {
+      data.entries.push(entry);
+      data.entries.sort((a, c) => c.score - a.score || c.accuracy - a.accuracy || Date.parse(a.date) - Date.parse(c.date));
+      data.entries = data.entries.slice(0, BOARD_SIZE);
+      await env.RELEASES.put(key, JSON.stringify(data), { httpMetadata: { contentType: "application/json" } });
+      boards.set(key, { data, at: Date.now() });
+    }
+    const rank = data.entries.findIndex((e) => e.playerId === who.playerId) + 1;
+    return reply({ ok: true, improved, rank: rank || null, total: data.entries.length });
+  }
+  fail(404, "Not found");
+}
+
+// ---------------------------------------------------------------- what a player is on
+/** The game's "platform" tag: desktop, mobile or web (the browser build). */
+function platformStatus(tag) { return tag === "desktop" || tag === "mobile" || tag === "web" ? tag : "game"; }
+const WEB_MS = 4 * 60_000; // "Viewing Website" while the site pinged this recently
+let webIndex = null, webIndexAt = 0;
+/** Signed-in website visitors: webseen/<playerId> objects, by upload time (cached 30 s). */
+async function webVisitors(env) {
+  if (webIndex && Date.now() - webIndexAt < 30_000) return webIndex;
+  const out = {};
+  let cursor;
+  do {
+    const list = await env.RELEASES.list({ prefix: "webseen/", cursor });
+    for (const o of list.objects) out[o.key.slice(8)] = o.uploaded.getTime();
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+  webIndex = out; webIndexAt = Date.now();
+  return out;
+}
+const STATUS_TEXT = { desktop: "Online Desktop", mobile: "Online Mobile", web: "Online Website", site: "Viewing Website" };
+function statusText(p) { return p.online ? STATUS_TEXT[p.status] || "Online" : "Offline"; }
+/** Playing beats browsing; someone appearing offline in the game isn't shown on the website either. */
+function withWeb(p, web) {
+  if (p.online || p.platform === "hidden") return p;
+  const at = web[p.id] || 0;
+  if (Date.now() - at < WEB_MS) return { ...p, online: true, status: "site", lastSeen: new Date(at).toISOString() };
+  if (at && (!p.lastSeen || at > Date.parse(p.lastSeen))) return { ...p, lastSeen: new Date(at).toISOString() };
+  return p;
+}
+
+// ---------------------------------------------------------------- supporters (Stripe) and following
+// Supporter: $2.50 a month, bought on the website (Stripe Checkout) in blocks of 1–24 months with a
+// discount for longer blocks. Membership time adds up across purchases; anniversary badges and the
+// lifetime statistics use the total time actually supported (gaps don't reset it).
+// R2: supporters/<playerId>.json  { periods: [{ start, end }], purchases: [...], lifetime }
+//     looks/<playerId>.json       { nameStyle, effect, banner (hash), gif (hash) }  (supporters only)
+//     looks/banner/<id>.jpg, looks/gif/<id>.gif
+//     follows/<playerId>.json     { following: [ids] }   followers/<playerId>.json { followers: [ids] }
+// Secrets: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET (Tools/stripe_setup.py sets both).
+const MONTH_MS = 30.4375 * 86_400_000;
+const PRICE_CENTS = 250;
+const MAX_MONTHS = 24;
+const LIFETIME_SUPPORTERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE"]; // Senterra
+const OWNER = "PlwcYVKV9y7NBFWfUaC263XpCFbE"; // everyone follows the developer
+const MILESTONES = [[0, "new"], [1, "1 month"], [3, "3 months"], [6, "6 months"], [12, "1 year"], [24, "2 years"], [36, "3 years"], [48, "4 years"], [60, "5 years"], [120, "10 years"]];
+const EFFECTS = ["none", "sparkles", "snow", "hearts", "embers", "stars", "aurora", "rain"];
+
+function discountFor(m) { return m >= 24 ? 0.4 : m >= 12 ? 0.3 : m >= 6 ? 0.2 : m >= 3 ? 0.1 : 0; }
+function priceFor(m) { return Math.round(PRICE_CENTS * m * (1 - discountFor(m))); }
+
+async function r2json(env, key, fallback) {
+  const o = await env.RELEASES.get(key);
+  if (!o) return fallback;
+  try { return await o.json(); } catch { return fallback; }
+}
+const r2put = (env, key, v) => env.RELEASES.put(key, JSON.stringify(v), { httpMetadata: { contentType: "application/json" } });
+
+/** Status of a supporter record: active, until, days supported in total, milestone. */
+function supportStatus(rec, playerId) {
+  const now = Date.now();
+  const lifetime = LIFETIME_SUPPORTERS.includes(playerId) || !!rec?.lifetime;
+  const periods = rec?.periods || [];
+  let days = 0, until = 0, since = null;
+  for (const p of periods) {
+    const s = Date.parse(p.start), e = Date.parse(p.end);
+    if (!since || s < Date.parse(since)) since = p.start;
+    days += Math.max(0, Math.min(e, now) - s) / 86_400_000;
+    until = Math.max(until, e);
+  }
+  if (lifetime) { const first = since ? Date.parse(since) : Date.parse("2026-11-09"); days = Math.max(days, (now - first) / 86_400_000); since = since || "2026-11-09T00:00:00Z"; }
+  const active = lifetime || until > now;
+  const months = Math.floor(days / 30.4375);
+  let milestone = null;
+  if (active || days > 0) for (const [m, label] of MILESTONES) if (months >= m) milestone = { months: m, label };
+  return {
+    active, lifetime, until: lifetime ? null : until ? new Date(until).toISOString() : null,
+    days: Math.floor(days), months, since,
+    milestone, purchases: (rec?.purchases || []).length,
+    totalMonthsBought: (rec?.purchases || []).reduce((n, p) => n + (p.months || 0), 0),
+  };
+}
+
+let supportIndex = null, supportIndexAt = 0;
+/** Every supporter (active or with time on record) and their looks, cached a minute. */
+async function supporters(env) {
+  if (supportIndex && Date.now() - supportIndexAt < 60_000) return supportIndex;
+  const out = {};
+  const ids = new Set(LIFETIME_SUPPORTERS);
+  let cursor;
+  do {
+    const list = await env.RELEASES.list({ prefix: "supporters/", cursor });
+    for (const o of list.objects) ids.add(o.key.slice(11, -5));
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+  await Promise.all([...ids].map(async (id) => {
+    const rec = await r2json(env, `supporters/${id}.json`, null);
+    const st = supportStatus(rec, id);
+    if (!st.active && st.days <= 0) return;
+    const looks = st.active ? await r2json(env, `looks/${id}.json`, {}) : {};
+    out[id] = { ...st, nameStyle: looks.nameStyle || "", effect: looks.effect || "none", banner: looks.banner || "", gif: looks.gif || "" };
+  }));
+  supportIndex = out; supportIndexAt = Date.now();
+  return out;
+}
+
+/** Following: everyone follows the developer (can't be undone); anyone else can be followed. */
+async function followingOf(env, id) {
+  const f = await r2json(env, `follows/${id}.json`, { following: [] });
+  const list = (f.following || []).filter((x) => x !== OWNER && x !== id);
+  return id === OWNER ? list : [OWNER, ...list];
+}
+async function followerCount(env, id) {
+  if (id === OWNER) {
+    // every player follows the developer: count everyone on the ranking (and anyone with an explicit follow)
+    try { const b = await leaderboard(env); return Math.max(b.total || 0, (await r2json(env, `followers/${id}.json`, { followers: [] })).followers.length); } catch { return 0; }
+  }
+  return ((await r2json(env, `followers/${id}.json`, { followers: [] })).followers || []).length;
+}
+
+// ---- Stripe
+
+async function stripe(env, path, form) {
+  if (!env.STRIPE_SECRET_KEY) fail(503, "Payments aren't set up yet.");
+  const res = await fetch("https://api.stripe.com/v1/" + path, {
+    method: form ? "POST" : "GET",
+    headers: { Authorization: "Bearer " + env.STRIPE_SECRET_KEY, ...(form ? { "Content-Type": "application/x-www-form-urlencoded" } : {}) },
+    body: form ? new URLSearchParams(form).toString() : undefined,
+  });
+  const data = await res.json();
+  if (!res.ok) fail(502, "Stripe: " + (data.error?.message || res.status));
+  return data;
+}
+
+async function stripeSignatureOk(env, header, body) {
+  if (!env.STRIPE_WEBHOOK_SECRET || !header) return false;
+  const parts = Object.fromEntries(header.split(",").map((kv) => { const i = kv.indexOf("="); return [kv.slice(0, i), kv.slice(i + 1)]; }));
+  const sigs = header.split(",").filter((p) => p.startsWith("v1=")).map((p) => p.slice(3));
+  const t = parts.t;
+  if (!t || !sigs.length || Math.abs(Date.now() / 1000 - Number(t)) > 600) return false;
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.STRIPE_WEBHOOK_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`${t}.${body}`)));
+  const hex = [...mac].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return sigs.includes(hex);
+}
+
+/** Adds bought months to a player's record (once per checkout session). */
+async function grantMonths(env, playerId, months, session) {
+  const key = `supporters/${playerId}.json`;
+  const rec = await r2json(env, key, { periods: [], purchases: [] });
+  rec.periods ||= []; rec.purchases ||= [];
+  if (rec.purchases.some((p) => p.session === session.id)) return rec;
+  const now = Date.now();
+  const last = rec.periods[rec.periods.length - 1];
+  const add = months * MONTH_MS;
+  if (last && Date.parse(last.end) > now) last.end = new Date(Date.parse(last.end) + add).toISOString();
+  else rec.periods.push({ start: new Date(now).toISOString(), end: new Date(now + add).toISOString() });
+  rec.purchases.push({ at: new Date(now).toISOString(), months, amount: session.amount_total, currency: session.currency, session: session.id, gift: session.metadata?.gift === "1" ? session.metadata?.buyer || "" : undefined });
+  await r2put(env, key, rec);
+  supportIndex = null;
+  return rec;
+}
+
+async function supportRoutes(request, env, url, ctx) {
+  const path = url.pathname;
+  if (path === "/support/prices") {
+    const tiers = [];
+    for (let m = 1; m <= MAX_MONTHS; m++) tiers.push({ months: m, cents: priceFor(m), discount: discountFor(m) });
+    return reply({ monthly: PRICE_CENTS, currency: "usd", tiers, effects: EFFECTS });
+  }
+  if (path === "/support/all") return reply({ supporters: await supporters(env), owner: OWNER });
+  if (path === "/stripe/webhook" && request.method === "POST") {
+    const body = await request.text();
+    if (!(await stripeSignatureOk(env, request.headers.get("Stripe-Signature"), body))) return new Response("bad signature", { status: 400 });
+    const ev = JSON.parse(body);
+    if (ev.type === "checkout.session.completed" || ev.type === "checkout.session.async_payment_succeeded") {
+      const s = ev.data.object;
+      const id = s.metadata?.playerId, months = Number(s.metadata?.months);
+      if (s.payment_status === "paid" && id && months >= 1 && months <= MAX_MONTHS) await grantMonths(env, id, months, s);
+    }
+    return new Response("ok");
+  }
+  if (path === "/support/checkout") {
+    const b = await bodyOf(request);
+    const who = await signedIn(request, env);
+    const months = Math.round(Number(b.months));
+    if (!(months >= 1 && months <= MAX_MONTHS)) fail(400, `Choose 1 to ${MAX_MONTHS} months.`);
+    // gifting: someone else's account by player id (from their profile)
+    let target = who.playerId;
+    if (b.giftTo) {
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(String(b.giftTo))) fail(400, "That player can't be found.");
+      target = String(b.giftTo);
+      if (target !== who.playerId) {
+        const card = (await publicItems(config(env), target, ["card"])).card;
+        if (!card || moderation.bans[target]) fail(400, "That player can't be found (they need to have played online once).");
+      }
+    }
+    const cents = priceFor(months), pct = Math.round(discountFor(months) * 100);
+    const s = await stripe(env, "checkout/sessions", {
+      mode: "payment",
+      success_url: `${SITE}#/supporter?thanks=1`,
+      cancel_url: `${SITE}#/supporter`,
+      client_reference_id: target,
+      "metadata[playerId]": target,
+      "metadata[months]": String(months),
+      "metadata[buyer]": who.playerId,
+      "metadata[gift]": target !== who.playerId ? "1" : "0",
+      "line_items[0][quantity]": "1",
+      "line_items[0][price_data][currency]": "usd",
+      "line_items[0][price_data][unit_amount]": String(cents),
+      "line_items[0][price_data][product_data][name]": `OCTIVE Supporter · ${months} month${months === 1 ? "" : "s"}${target !== who.playerId ? " (gift)" : ""}`,
+      "line_items[0][price_data][product_data][description]": pct ? `${pct}% off · $2.50 a month` : "$2.50 a month",
+      "payment_intent_data[metadata][playerId]": target,
+      "payment_intent_data[metadata][months]": String(months),
+    });
+    return reply({ url: s.url });
+  }
+  if (path === "/support/me") {
+    const who = await signedIn(request, env);
+    const rec = await r2json(env, `supporters/${who.playerId}.json`, null);
+    const looks = await r2json(env, `looks/${who.playerId}.json`, {});
+    return reply({ ...supportStatus(rec, who.playerId), looks, history: (rec?.purchases || []).map((p) => ({ at: p.at, months: p.months, amount: p.amount, currency: p.currency })) });
+  }
+  if (path === "/support/looks") {
+    // supporters: name colours (bio codes), profile effect, banner picture, animated GIF profile picture
+    const b = await bodyOf(request);
+    const who = await signedIn(request, env);
+    const st = supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId);
+    if (!st.active) fail(403, "This is a supporter perk.");
+    const looks = await r2json(env, `looks/${who.playerId}.json`, {});
+    if (b.nameStyle !== undefined) {
+      const style = String(b.nameStyle || "").slice(0, 200);
+      const plain = stripBio(style);
+      const card = (await publicItems(config(env), who.playerId, ["card"])).card || {};
+      const name = String(card.name || who.username || "");
+      if (style && plain !== name) fail(400, `The coloured name has to spell your name exactly ("${name}").`);
+      looks.nameStyle = style;
+    }
+    if (b.effect !== undefined) {
+      if (!EFFECTS.includes(b.effect)) fail(400, "Unknown effect.");
+      looks.effect = b.effect;
+    }
+    if (b.banner !== undefined) {
+      if (!b.banner) { looks.banner = ""; await env.RELEASES.delete(`looks/banner/${who.playerId}.jpg`); }
+      else {
+        if (!/^[A-Za-z0-9+/=]{100,1400000}$/.test(String(b.banner))) fail(400, "That banner couldn't be used.");
+        const bytes = b64Bytes(String(b.banner));
+        if (!(bytes[0] === 0xff && bytes[1] === 0xd8)) fail(400, "Banners must be JPG.");
+        await env.RELEASES.put(`looks/banner/${who.playerId}.jpg`, bytes, { httpMetadata: { contentType: "image/jpeg" } });
+        looks.banner = (await sha256Hex(bytes)).slice(0, 16);
+      }
+    }
+    if (b.gif !== undefined) {
+      if (!b.gif) { looks.gif = ""; await env.RELEASES.delete(`looks/gif/${who.playerId}.gif`); }
+      else {
+        if (!/^[A-Za-z0-9+/=]{100,2800000}$/.test(String(b.gif))) fail(400, "That GIF is too big (2 MB at most).");
+        const bytes = b64Bytes(String(b.gif));
+        if (!(bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46)) fail(400, "That isn't a GIF.");
+        await env.RELEASES.put(`looks/gif/${who.playerId}.gif`, bytes, { httpMetadata: { contentType: "image/gif" } });
+        looks.gif = (await sha256Hex(bytes)).slice(0, 16);
+      }
+    }
+    await r2put(env, `looks/${who.playerId}.json`, looks);
+    supportIndex = null;
+    return reply({ ok: true, looks });
+  }
+  let m = path.match(/^\/looks\/(banner|gif)\/([A-Za-z0-9_-]{1,64})$/);
+  if (m) {
+    const o = await env.RELEASES.get(`looks/${m[1]}/${m[2]}.${m[1] === "gif" ? "gif" : "jpg"}`);
+    if (!o) return cors(new Response("Not found", { status: 404 }));
+    return cors(new Response(o.body, { headers: { "Content-Type": m[1] === "gif" ? "image/gif" : "image/jpeg", "Cache-Control": url.searchParams.get("v") ? "public, max-age=31536000, immutable" : "public, max-age=300" } }));
+  }
+  // following
+  m = path.match(/^\/social\/([A-Za-z0-9_-]{1,64})$/);
+  if (m) {
+    const id = m[1];
+    const [following, followers] = await Promise.all([followingOf(env, id), followerCount(env, id)]);
+    let youFollow = null;
+    const h = request.headers.get("Authorization") || "";
+    if (h.startsWith("Bearer ")) { try { const who = await signedIn(request, env); youFollow = (await followingOf(env, who.playerId)).includes(id); } catch { /* signed out */ } }
+    return reply({ following, followers, youFollow, owner: OWNER });
+  }
+  if (path === "/follow") {
+    const b = await bodyOf(request);
+    const who = await signedIn(request, env);
+    const target = String(b.playerId || "");
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(target) || target === who.playerId) fail(400, "You can't follow that player.");
+    if (target === OWNER && !b.follow) fail(400, "Everyone follows the OCTIVE developer.");
+    const f = await r2json(env, `follows/${who.playerId}.json`, { following: [] });
+    const fr = await r2json(env, `followers/${target}.json`, { followers: [] });
+    f.following = (f.following || []).filter((x) => x !== target);
+    fr.followers = (fr.followers || []).filter((x) => x !== who.playerId);
+    if (b.follow) { if (f.following.length >= 2000) fail(400, "You follow too many players."); f.following.push(target); fr.followers.push(who.playerId); }
+    await Promise.all([r2put(env, `follows/${who.playerId}.json`, f), r2put(env, `followers/${target}.json`, fr)]);
+    return reply({ ok: true, following: await followingOf(env, who.playerId), followers: await followerCount(env, target) });
+  }
+  return null;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -938,13 +1331,28 @@ export default {
       try { return await discordInteraction(request, env, ctx); }
       catch (e) { return new Response("error: " + e.message, { status: 500 }); }
     }
+    if (/^\/(support\/|stripe\/webhook$|looks\/|social\/|follow$)/.test(url.pathname)) {
+      try { const r = await supportRoutes(request, env, url, ctx); if (r) return r; }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+    }
+    if (url.pathname.startsWith("/scores/")) {
+      try { return await chartScores(request, env, url); }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+    }
     if (url.pathname.startsWith("/account/")) {
       try { return await account(request, env, url.pathname.slice(9)); }
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (request.method !== "GET") return cors(new Response("Method not allowed", { status: 405 }));
     try {
-      if (url.pathname === "/" || url.pathname === "/leaderboard") return json(await leaderboard(env), 30);
+      if (url.pathname === "/" || url.pathname === "/leaderboard") {
+        const board = await leaderboard(env);
+        let sup = {}, web = {};
+        try { sup = await supporters(env); } catch { /* none */ }
+        try { web = await webVisitors(env); } catch { /* none */ }
+        const players = board.players.map((p) => withWeb({ ...p, supporter: sup[p.id] || null }, web));
+        return json({ ...board, online: players.filter((p) => p.online).length, players }, 30);
+      }
       const m = url.pathname.match(/^\/avatar\/([A-Za-z0-9_-]{1,64})$/);
       if (m) return await avatar(env, m[1], url.searchParams.get("v"));
       // /web/<version>/[~<build stamp>/]Build/... — the stamp only makes browsers fetch a re-uploaded build

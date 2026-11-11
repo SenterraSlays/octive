@@ -59,8 +59,9 @@
   function setAvatar(box, p) {
     const img = box.querySelector("img"), initial = box.querySelector(".initial");
     initial.textContent = (p.name || "?").charAt(0).toUpperCase();
-    if (p.avatar) {
-      img.src = p.avatar.includes("?") || !p.avatarHash ? p.avatar : p.avatar + "?v=" + encodeURIComponent(p.avatarHash);
+    const gif = isSupporter(p) && p.supporter.gif ? avatarUrl(p) : null;
+    if (gif || p.avatar) {
+      img.src = gif || (p.avatar.includes("?") || !p.avatarHash ? p.avatar : p.avatar + "?v=" + encodeURIComponent(p.avatarHash));
       img.hidden = false; initial.hidden = true;
       img.onerror = () => { img.hidden = true; initial.hidden = false; };
     }
@@ -68,7 +69,8 @@
     if (dot) {
       dot.hidden = false;
       dot.classList.toggle("on", !!p.online);
-      dot.title = p.online ? "Online now" : p.lastSeen ? "Last online " + ago(p.lastSeen) : "Offline";
+      dot.title = statusText(p);
+      dot.classList.toggle("site", !!p.online && p.status === "site");
     }
   }
 
@@ -225,9 +227,10 @@
         r.href = "#/u/" + encodeURIComponent(p.id);
         r.dataset.place = String(p.rank);
         r.querySelector(".rank").textContent = "#" + fmt0.format(p.rank);
-        r.querySelector(".name").textContent = p.name || "Player";
+        nameInto(r.querySelector(".name"), p);
         setAvatar(r.querySelector(".avatar"), p);
         setRole(r, r.querySelector(".badge"), p);
+        if (isSupporter(p)) { r.classList.add("supporter"); r.querySelector(".player").append(supporterPill(p, true)); }
         r.querySelector(".acc").textContent = fmt2.format(p.accuracy || 0) + "%";
         r.querySelector(".lvl").textContent = "Lv" + (p.level || 1);
         r.querySelector(".plays").textContent = fmt0.format(p.playCount || 0);
@@ -255,8 +258,10 @@
     const role = setRole(card, view.querySelector(".badge"), p);
     if (role) { const t = view.querySelector(".card-title"); t.textContent = role.title; t.hidden = false; }
     const status = view.querySelector(".card-status");
-    status.textContent = p.online ? "● Online now" : p.lastSeen ? "Last online " + ago(p.lastSeen) : "Offline";
+    status.textContent = p.online ? "● " + statusText(p) : statusText(p);
     status.classList.toggle("on", !!p.online);
+    decorateCard(card, p);
+    card.after(socialRow(p));
     const set = (sel, v) => { view.querySelector(sel).textContent = v; };
     set(".c-pp", fmt0.format(p.pp || 0) + "pp");
     set(".c-acc", fmt2.format(p.accuracy || 0) + "%");
@@ -279,6 +284,8 @@
       view.querySelector(".bio").hidden = false;
       renderBio(view.querySelector(".bio-text"), p.bio);
     }
+    const sup = supporterSection(p);
+    if (sup) view.querySelector(".tiles").after(sup);
     if ((p.badges || []).includes("CREATOR") && p.socials) {
       const box = view.querySelector(".social-links");
       if (box && renderSocials(box, p.socials) > 0) view.querySelector(".socials").hidden = false;
@@ -512,7 +519,7 @@
       const headers = { "Content-Type": "application/json" };
       const token = store.get("octive.token", true);
       if (auth && token) headers.Authorization = "Bearer " + token;
-      const res = await fetch(worker + "/account/" + path, { method: body === undefined ? "GET" : "POST", headers, body: body === undefined ? undefined : JSON.stringify(body) });
+      const res = await fetch(worker + (path.startsWith("/") ? path : "/account/" + path), { method: body === undefined ? "GET" : "POST", headers, body: body === undefined ? undefined : JSON.stringify(body) });
       let out = {};
       try { out = await res.json(); } catch { /* empty */ }
       return { res, out };
@@ -626,7 +633,7 @@
     const panels = [];
     if (me.banned) panels.push(h("div.notice", { text: "This account is banned, so it can't be changed or appear in the ranking." }));
     if (!me.hasCard) panels.push(h("div.notice", { text: "Your profile appears online after your first play in the game while signed in. Until then it can't be edited here." }));
-    if (me.hasCard && !me.banned) panels.push(picturePanel(), bioPanel());
+    if (me.hasCard && !me.banned) panels.push(supporterPanel(), picturePanel(), bioPanel());
     if (me.hasCard && !me.banned && me.creator) panels.push(socialsPanel());
     panels.push(discordPanel(), emailPanel(), passwordPanel());
     app.replaceChildren(head, h("div.panels", {}, panels));
@@ -837,6 +844,406 @@
     setTimeout(() => user.focus(), 30);
   }
 
+  // ---------------------------------------------------------------- supporter (Stripe), looks, following, status
+
+  const STATUS_TEXT = { desktop: "Online Desktop", mobile: "Online Mobile", web: "Online Website", site: "Viewing Website" };
+  /** "Online Desktop", "Viewing Website", "Last online 3 hours ago"… */
+  function statusText(p) {
+    if (p.online) return STATUS_TEXT[p.status] || "Online";
+    return p.lastSeen ? "Last online " + ago(p.lastSeen) : "Offline";
+  }
+
+  const MONTHLY = 250;
+  const discountFor = (m) => m >= 24 ? 0.4 : m >= 12 ? 0.3 : m >= 6 ? 0.2 : m >= 3 ? 0.1 : 0;
+  const priceFor = (m) => Math.round(MONTHLY * m * (1 - discountFor(m)));
+  const usd = (cents) => "$" + (cents / 100).toFixed(2);
+  const MILESTONE_ART = [[36, "3y", "36 months"], [12, "1y", "12 months"], [6, "6m", "6 months"], [3, "3m", "3 months"], [1, "1m", "1 month"], [0, "new", "New supporter"]];
+  const milestoneArt = (months) => (MILESTONE_ART.find(([m]) => months >= m) || MILESTONE_ART[MILESTONE_ART.length - 1]);
+  const EFFECT_NAMES = { none: "None", sparkles: "Sparkles", snow: "Snow", hearts: "Hearts", embers: "Embers", stars: "Stars", aurora: "Aurora", rain: "Rain" };
+  const monthsText = (days) => { const m = Math.floor((days || 0) / 30.4375); return m >= 12 ? `${Math.floor(m / 12)} year${m >= 24 ? "s" : ""}${m % 12 ? ` ${m % 12} month${m % 12 === 1 ? "" : "s"}` : ""}` : m >= 1 ? `${m} month${m === 1 ? "" : "s"}` : `${Math.max(0, Math.floor(days || 0))} day${Math.floor(days) === 1 ? "" : "s"}`; };
+  const isSupporter = (p) => !!(p && p.supporter && p.supporter.active);
+
+  function hashQuery() {
+    const i = location.hash.indexOf("?");
+    return new URLSearchParams(i >= 0 ? location.hash.slice(i + 1) : "");
+  }
+
+  /** A supporter's name in their colours (bio codes), or plain. */
+  function nameInto(el, p) {
+    const style = p.supporter && p.supporter.active && p.supporter.nameStyle;
+    if (style) renderBio(el, style); else el.textContent = p.name || "Player";
+  }
+
+  /** The animated GIF picture of a supporter, else their normal picture. */
+  function avatarUrl(p) {
+    if (worker && isSupporter(p) && p.supporter.gif) return `${worker}/looks/gif/${encodeURIComponent(p.id)}?v=${encodeURIComponent(p.supporter.gif)}`;
+    return p.avatar || null;
+  }
+
+  function supporterPill(p, small) {
+    const s = p.supporter;
+    const [, key] = milestoneArt(s.months || 0);
+    return h("span.sup-pill" + (small ? ".small" : ""), { title: s.lifetime ? "Lifetime OCTIVE supporter" : `OCTIVE supporter · ${monthsText(s.days)} in total` },
+      h("img", { src: `badges/supporter-${key}.png`, alt: "" }), small ? null : h("span", { text: "Supporter" }));
+  }
+
+  /** Profile effects drawn on a canvas over the card (same set as the game). */
+  function effectLayer(kind) {
+    const cv = h("canvas.fx-layer", { "aria-hidden": "true" });
+    if (!kind || kind === "none") return cv;
+    const ctx = cv.getContext("2d");
+    const parts = [];
+    const rnd = (a, b) => a + Math.random() * (b - a);
+    const spawn = (w, hh, initial) => {
+      const p = { x: rnd(0, w), y: initial ? rnd(0, hh) : (kind === "embers" ? hh + 8 : -8), r: rnd(1.2, 3.2), v: rnd(10, 30), t: rnd(0, 6.28), life: rnd(2, 6) };
+      if (kind === "rain") { p.v = rnd(180, 260); p.r = rnd(8, 16); }
+      if (kind === "sparkles" || kind === "stars") { p.y = rnd(0, hh); p.v = 0; }
+      return p;
+    };
+    let last = performance.now();
+    const step = (now) => {
+      if (!cv.isConnected) { if (performance.now() - last > 5000) return; }
+      const dt = Math.min(0.05, (now - last) / 1000); last = now;
+      const w = cv.clientWidth, hh = cv.clientHeight;
+      if (cv.width !== w || cv.height !== hh) { cv.width = w; cv.height = hh; }
+      ctx.clearRect(0, 0, w, hh);
+      const want = kind === "aurora" ? 0 : kind === "rain" ? 70 : 40;
+      while (parts.length < want) parts.push(spawn(w, hh, true));
+      if (kind === "aurora") {
+        const t = now / 1000;
+        for (let i = 0; i < 3; i++) {
+          const g = ctx.createLinearGradient(0, 0, w, 0);
+          const hue = (t * 12 + i * 70) % 360;
+          g.addColorStop(0, `hsla(${hue},90%,65%,0)`); g.addColorStop(0.5, `hsla(${hue},90%,65%,0.16)`); g.addColorStop(1, `hsla(${(hue + 60) % 360},90%,65%,0)`);
+          ctx.fillStyle = g;
+          ctx.beginPath(); ctx.moveTo(0, hh * 0.2);
+          for (let x = 0; x <= w; x += 20) ctx.lineTo(x, hh * (0.25 + 0.12 * i) + Math.sin(x / 90 + t * (0.6 + i * 0.2)) * 22);
+          ctx.lineTo(w, 0); ctx.lineTo(0, 0); ctx.fill();
+        }
+      }
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const p = parts[i]; p.t += dt;
+        if (kind === "snow") { p.y += p.v * dt; p.x += Math.sin(p.t) * 10 * dt; ctx.fillStyle = "rgba(255,255,255,.75)"; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill(); }
+        else if (kind === "rain") { p.y += p.v * dt; ctx.strokeStyle = "rgba(140,190,255,.45)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - 2, p.y + p.r); ctx.stroke(); }
+        else if (kind === "embers") { p.y -= p.v * dt; p.x += Math.sin(p.t * 2) * 8 * dt; ctx.fillStyle = `rgba(255,${140 + (p.r * 20 | 0)},60,${0.8 - (p.t / p.life) * 0.6})`; ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 0.8, 0, 7); ctx.fill(); }
+        else if (kind === "hearts") { p.y += p.v * dt * 0.8; p.x += Math.sin(p.t) * 6 * dt; ctx.fillStyle = "rgba(255,110,170,.7)"; ctx.font = `${8 + p.r * 4}px sans-serif`; ctx.fillText("♥", p.x, p.y); }
+        else { // sparkles, stars: twinkle in place
+          const a = Math.max(0, Math.sin((p.t / p.life) * Math.PI));
+          ctx.fillStyle = kind === "stars" ? `rgba(255,236,170,${a})` : `rgba(255,255,255,${a})`;
+          const s = p.r * (kind === "stars" ? 1.6 : 1.2);
+          ctx.beginPath(); ctx.moveTo(p.x, p.y - s * 2); ctx.lineTo(p.x + s * 0.5, p.y); ctx.lineTo(p.x, p.y + s * 2); ctx.lineTo(p.x - s * 0.5, p.y); ctx.fill();
+          ctx.beginPath(); ctx.moveTo(p.x - s * 2, p.y); ctx.lineTo(p.x, p.y + s * 0.5); ctx.lineTo(p.x + s * 2, p.y); ctx.lineTo(p.x, p.y - s * 0.5); ctx.fill();
+        }
+        if (p.y > hh + 20 || p.y < -20 || p.t > p.life && (kind === "sparkles" || kind === "stars" || kind === "embers")) parts[i] = spawn(w, hh, kind === "sparkles" || kind === "stars");
+      }
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+    return cv;
+  }
+
+  /** Supporter decoration on a profile card: banner, effect, pill, coloured name. */
+  function decorateCard(card, p) {
+    if (!isSupporter(p)) return;
+    const s = p.supporter;
+    card.classList.add("supporter");
+    if (s.banner && worker) {
+      card.style.setProperty("--banner", `url("${worker}/looks/banner/${encodeURIComponent(p.id)}?v=${encodeURIComponent(s.banner)}")`);
+      card.classList.add("has-banner");
+    }
+    if (s.effect && s.effect !== "none") card.prepend(effectLayer(s.effect));
+    const nameEl = card.querySelector(".card-name");
+    if (nameEl) nameInto(nameEl, p);
+    const row = card.querySelector(".card-name-row");
+    if (row) row.append(supporterPill(p));
+  }
+
+  /** Lifetime supporter statistics and the anniversary badges earned. */
+  function supporterSection(p) {
+    const s = p.supporter;
+    if (!s || (!s.active && !(s.days > 0))) return null;
+    const earned = MILESTONE_ART.slice().reverse().filter(([m]) => (s.months || 0) >= m);
+    return h("section.sup-section", {},
+      h("h2", { text: s.lifetime ? "Lifetime supporter" : s.active ? "OCTIVE supporter" : "Former supporter" }),
+      h("div.tiles", {},
+        h("div.tile", {}, h("span", { text: "Supported for" }), h("b", { text: monthsText(s.days) })),
+        h("div.tile", {}, h("span", { text: "Since" }), h("b", { text: s.since ? new Date(s.since).toLocaleDateString(undefined, { month: "short", year: "numeric" }) : "—" })),
+        s.lifetime ? h("div.tile", {}, h("span", { text: "Until" }), h("b", { text: "Forever" }))
+          : s.active && s.until ? h("div.tile", {}, h("span", { text: "Until" }), h("b", { text: new Date(s.until).toLocaleDateString(undefined, { dateStyle: "medium" }) })) : null,
+        h("div.tile", {}, h("span", { text: "Months bought" }), h("b", { text: fmt0.format(s.totalMonthsBought || 0) }))),
+      h("div.sup-earned", {}, earned.map(([, key, label]) => h("figure", {}, h("img", { src: `badges/supporter-${key}.png`, alt: "" }), h("figcaption", { text: label })))));
+  }
+
+  /** Followers / following, a Follow button and Gift supporter. */
+  function socialRow(p) {
+    const followers = h("b", { text: "…" }), following = h("b", { text: "…" });
+    const followBtn = h("button.btn", { type: "button", hidden: true });
+    const out = h("span.social-msg");
+    const isOwner = p.id === ROLE_OWNER;
+    let youFollow = false;
+    const paint = () => {
+      followBtn.hidden = !!(me && me.playerId === p.id);
+      followBtn.textContent = isOwner || youFollow ? "Following" : "Follow";
+      followBtn.classList.toggle("primary", !(isOwner || youFollow));
+      followBtn.disabled = isOwner;
+      followBtn.title = isOwner ? "Every player follows the OCTIVE developer" : !me ? "Sign in to follow players" : youFollow ? "Click to unfollow" : "";
+    };
+    followBtn.addEventListener("click", async () => {
+      if (!me) { location.hash = "#/account"; return; }
+      const want = !youFollow;
+      followBtn.disabled = true;
+      try {
+        const r = await callApi("/follow", { playerId: p.id, follow: want }, true);
+        youFollow = want; followers.textContent = fmt0.format(r.followers);
+      } catch (e) { out.textContent = e.message; }
+      followBtn.disabled = false; paint();
+    });
+    const gift = h("a.btn.gift", { href: "#/supporter?gift=" + encodeURIComponent(p.id), hidden: !!(me && me.playerId === p.id) || !!(p.supporter && p.supporter.lifetime) }, "♥ Gift supporter");
+    const row = h("div.social-row", {},
+      h("span.follow-count", {}, followers, " followers"), h("span.follow-count", {}, following, " following"),
+      h("span.grow"), out, followBtn, gift);
+    paint();
+    (async () => {
+      try {
+        const token = store.get("octive.token", true);
+        const res = await fetch(`${worker}/social/${encodeURIComponent(p.id)}`, { headers: token ? { Authorization: "Bearer " + token } : {} });
+        const s = await res.json();
+        followers.textContent = fmt0.format(s.followers || 0);
+        following.textContent = fmt0.format((s.following || []).length);
+        youFollow = isOwner || s.youFollow === true;
+        paint();
+      } catch { followers.textContent = "—"; following.textContent = "—"; }
+    })();
+    return row;
+  }
+  const ROLE_OWNER = "PlwcYVKV9y7NBFWfUaC263XpCFbE";
+
+  // ---------------------------------------------------------------- #/supporter
+
+  function supporterPage() {
+    document.title = "Supporter · OCTIVE";
+    const q = hashQuery();
+    let months = 3;
+    let giftTo = q.get("gift") || null;
+    const thanks = q.get("thanks") === "1";
+
+    const perks = [
+      ["Supporter badge", "A supporter badge on your profile and next to your name on leaderboards, with anniversary art as your support adds up."],
+      ["Account banner", "A banner picture across the top of your profile, in the game and on the website."],
+      ["Coloured name", "Colour and style your name with the same codes as bios: rainbow, bold, any colour."],
+      ["Profile effects", "Sparkles, snow, hearts, embers, stars, aurora or rain over your profile card."],
+      ["Animated picture", "A GIF profile picture that's animated everywhere it shows."],
+      ["Name changes any time", "No waiting between name changes."],
+      ["Leaderboard border", "A pink supporter border on your leaderboard rows."],
+      ["Lifetime statistics", "Your total time supporting shows on your profile and never resets, even with gaps."],
+    ];
+
+    const total = h("b.price-total"), each = h("span.price-each"), save = h("span.price-save");
+    const slider = h("input.months-slider", { type: "range", min: 1, max: 24, step: 1, value: months, "aria-label": "Months" });
+    const monthsLabel = h("b.months-label");
+    const quick = h("div.quick-months", {}, [1, 3, 6, 12, 24].map((m) => h("button.chip", { type: "button", "data-m": m, onclick: () => { months = m; slider.value = m; upd(); } }, m === 1 ? "1 month" : `${m} months`)));
+    const upd = () => {
+      months = Number(slider.value);
+      monthsLabel.textContent = months === 1 ? "1 month" : `${months} months`;
+      const cents = priceFor(months), pct = Math.round(discountFor(months) * 100);
+      total.textContent = usd(cents);
+      each.textContent = `${usd(cents / months)} a month`;
+      save.textContent = pct ? `${pct}% off · you save ${usd(MONTHLY * months - cents)}` : "No discount below 3 months";
+      save.classList.toggle("on", pct > 0);
+      for (const b of quick.children) b.classList.toggle("on", Number(b.dataset.m) === months);
+    };
+    slider.addEventListener("input", upd);
+
+    // who it's for: me, or a gift to another player
+    const forMe = h("button.seg", { type: "button" }, "For me");
+    const forGift = h("button.seg", { type: "button" }, "♥ As a gift");
+    const giftBox = h("div.gift-box", { hidden: true });
+    const giftSearch = h("input", { type: "search", placeholder: "Search ranked players by name…", spellcheck: "false" });
+    const giftList = h("div.gift-list");
+    const giftChosen = h("div.gift-chosen");
+    giftBox.append(giftChosen, giftSearch, giftList);
+    const playerById = (id) => data && data.players.find((x) => x.id === id);
+    const paintGift = () => {
+      forMe.classList.toggle("on", giftTo === null); forGift.classList.toggle("on", giftTo !== null);
+      giftBox.hidden = giftTo === null;
+      giftChosen.textContent = "";
+      if (giftTo) {
+        const p = playerById(giftTo);
+        giftChosen.append(h("span", { text: "Gift for " }), h("b", { text: p ? p.name : "this player" }),
+          h("button.link", { type: "button", onclick: () => { giftTo = ""; paintGift(); giftSearch.focus(); } }, "change"));
+      } else if (giftTo === "") giftChosen.append(h("span", { text: "Who should get it?" }));
+      giftSearch.hidden = !!giftTo; giftList.hidden = !!giftTo;
+    };
+    const searchGift = () => {
+      giftList.textContent = "";
+      const term = giftSearch.value.trim().toLowerCase();
+      if (!term || !data) return;
+      for (const p of data.players.filter((x) => (x.name || "").toLowerCase().includes(term) && (!me || x.id !== me.playerId)).slice(0, 8))
+        giftList.append(h("button.gift-pick", { type: "button", onclick: () => { giftTo = p.id; paintGift(); } }, h("span", { text: p.name }), h("span.dim", { text: "#" + fmt0.format(p.rank) })));
+      if (!giftList.children.length) giftList.append(h("p.panel-sub", { text: "Nobody by that name in the ranking. You can also gift from a player's profile in the game." }));
+    };
+    giftSearch.addEventListener("input", searchGift);
+    forMe.addEventListener("click", () => { giftTo = null; paintGift(); });
+    forGift.addEventListener("click", () => { if (giftTo === null) giftTo = ""; paintGift(); setTimeout(() => giftSearch.focus(), 20); });
+
+    const out = msg();
+    const buy = h("button.btn.primary.wide.buy", { type: "button" }, "Continue to payment");
+    buy.addEventListener("click", () => busy(buy, async () => {
+      setMsg(out, "");
+      if (!me) { setMsg(out, "Sign in first (same account as the game)."); return; }
+      if (giftTo === "") { setMsg(out, "Choose who gets the gift."); return; }
+      try {
+        const r = await callApi("/support/checkout", { months, giftTo: giftTo || undefined }, true);
+        location.href = r.url;
+      } catch (e) { setMsg(out, e.message); }
+    }));
+    const signHint = h("p.panel-sub.center");
+
+    const status = h("div.sup-status");
+    const page = h("div.supporter-page", {},
+      thanks ? h("div.thanks", {}, h("b", { text: "Thank you! ♥" }), h("span", { text: " Your support is being added now. It shows in the game within a few minutes." })) : null,
+      h("section.sup-hero", {},
+        h("img.sup-hero-badge", { src: "badges/supporter-1y.png", alt: "" }),
+        h("div", {}, h("h1", { text: "Support OCTIVE" }),
+          h("p.sub", { text: "OCTIVE is free and made by one developer. Supporting keeps the servers running and gets you a few nice extras." }),
+          status)),
+      h("div.sup-grid", {},
+        h("section.panel.buy-panel", {},
+          h("h2", { text: "Choose your time" }),
+          h("p.panel-sub", { text: "$2.50 a month. Longer blocks cost less: 3+ months 10% off, 6+ 20%, 12+ 30%, 24 months 40%. One-time payment, nothing renews." }),
+          h("div.seg-row", {}, forMe, forGift), giftBox,
+          h("div.months-row", {}, monthsLabel, slider), quick,
+          h("div.price-box", {}, total, h("div", {}, each, save)),
+          buy, out, signHint,
+          h("p.fine", { text: "Payments are handled by Stripe; OCTIVE never sees your card. Time adds onto any time you already have. See the Terms for refunds." })),
+        h("section.panel.perk-panel", {},
+          h("h2", { text: "What you get" }),
+          h("ul.perks", {}, perks.map(([t, d]) => h("li", {}, h("b", { text: t }), h("span", { text: d })))))),
+      h("section.panel.milestones", {},
+        h("h2", { text: "Anniversary badges" }),
+        h("p.panel-sub", { text: "Earned from your total time as a supporter. Gaps never reset it." }),
+        h("div.sup-earned.big", {}, MILESTONE_ART.slice().reverse().map(([, key, label]) => h("figure", {}, h("img", { src: `badges/supporter-${key}.png`, alt: "" }), h("figcaption", { text: label }))))),
+      h("section.panel.wall", {}, h("h2", { text: "Supporters" }), h("div.wall-list", {}, h("p.panel-sub", { text: "Loading…" }))));
+    app.replaceChildren(page);
+    upd(); paintGift();
+
+    const paintMe = () => {
+      signHint.textContent = me ? `Signed in as ${me.name}.` : "";
+      if (!me) signHint.append(h("a", { href: "#/account" }, "Sign in"), " with your game account to buy.");
+      status.textContent = "";
+      const s = me && me.supporter;
+      if (s && (s.active || s.days > 0))
+        status.append(h("span.sup-pill", {}, h("img", { src: `badges/supporter-${milestoneArt(s.months || 0)[1]}.png`, alt: "" }), h("span", { text: s.lifetime ? "Lifetime supporter" : s.active ? `Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "medium" })}` : "Former supporter" })),
+          h("span.dim", { text: ` · ${monthsText(s.days)} in total` }));
+    };
+    paintMe();
+    if (!me && (store.get("octive.token", true) || store.get("octive.session")))
+      (async () => { try { if (!store.get("octive.token", true)) await refreshSession(); me = await callApi("me", undefined, true); updateAccountNav(); if (page.isConnected) { paintMe(); paintGift(); } } catch { /* signed out */ } })();
+    if (thanks && me) setTimeout(async () => { try { me = await callApi("me", undefined, true); if (page.isConnected) paintMe(); } catch { /* later */ } }, 4000);
+
+    // the supporter wall
+    (async () => {
+      const wall = page.querySelector(".wall-list");
+      try {
+        const r = await (await fetch(worker + "/support/all")).json();
+        if (!data) await load();
+        if (page.isConnected) paintGift();
+        const list = Object.entries(r.supporters || {}).filter(([, s]) => s.active).sort((a, b) => (b[1].days || 0) - (a[1].days || 0));
+        wall.textContent = "";
+        for (const [id, s] of list) {
+          const p = (data && data.players.find((x) => x.id === id)) || { id, name: "Supporter" };
+          const a = h("a.wall-item", { href: "#/u/" + encodeURIComponent(id) }, h("img", { src: `badges/supporter-${milestoneArt(s.months || 0)[1]}.png`, alt: "" }), h("span.wall-name"));
+          nameInto(a.querySelector(".wall-name"), { ...p, supporter: s });
+          wall.append(a);
+        }
+        if (!list.length) wall.append(h("p.panel-sub", { text: "Be the first." }));
+      } catch { wall.textContent = "The list couldn't be loaded."; }
+    })();
+  }
+
+  // ---------------------------------------------------------------- account: supporter panel and looks editor
+
+  function supporterPanel() {
+    const s = me.supporter || {};
+    if (!s.active) {
+      return section("Supporter", s.days > 0 ? `You supported OCTIVE for ${monthsText(s.days)}. Thank you! Your badges stay; support again to get the perks back.` : "Coloured name, banner, profile effects, animated picture and more.",
+        h("div.panel-actions", {}, h("a.btn.primary", { href: "#/supporter" }, "Become a supporter")));
+    }
+    const looks = me.looks || {};
+    const out = msg();
+    // coloured name
+    const nameInput = h("input", { type: "text", maxlength: 200, spellcheck: "false", placeholder: `e.g. #g${me.name}` });
+    nameInput.value = looks.nameStyle || "";
+    const namePrev = h("span.name-preview");
+    const updName = () => { if (nameInput.value) renderBio(namePrev, nameInput.value); else namePrev.textContent = me.name; };
+    nameInput.addEventListener("input", updName); updName();
+    const saveName = h("button.btn", { type: "button", onclick: () => busy(saveName, () => saveLooks({ nameStyle: nameInput.value }, out, "Name colours saved.")) }, "Save name");
+    // effect
+    const effSel = h("select", {}, Object.entries(EFFECT_NAMES).map(([k, v]) => h("option", { value: k, text: v })));
+    effSel.value = looks.effect || "none";
+    const effPrev = h("div.effect-preview", {}, effectLayer(effSel.value), h("span", { text: "Preview" }));
+    effSel.addEventListener("change", () => { effPrev.firstChild.replaceWith(effectLayer(effSel.value)); busy(saveName, () => saveLooks({ effect: effSel.value }, out, "Effect saved.")); });
+    // banner
+    const bannerIn = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", hidden: true });
+    const bannerPrev = h("div.banner-preview");
+    if (looks.banner) bannerPrev.style.backgroundImage = `url("${worker}/looks/banner/${encodeURIComponent(me.playerId)}?v=${looks.banner}")`;
+    const bannerBtn = h("button.btn", { type: "button", onclick: () => bannerIn.click() }, "Choose banner…");
+    const bannerDel = h("button.btn.ghost", { type: "button", onclick: () => busy(bannerDel, async () => { if (await saveLooks({ banner: "" }, out, "Banner removed.")) bannerPrev.style.backgroundImage = ""; }) }, "Remove");
+    bannerIn.addEventListener("change", async () => {
+      const file = bannerIn.files && bannerIn.files[0]; bannerIn.value = "";
+      if (!file) return;
+      await busy(bannerBtn, async () => {
+        try {
+          const bmp = await createImageBitmap(file);
+          const W = 1200, H = 400, cv = document.createElement("canvas"); cv.width = W; cv.height = H;
+          const scale = Math.max(W / bmp.width, H / bmp.height), sw = W / scale, sh = H / scale;
+          cv.getContext("2d").drawImage(bmp, (bmp.width - sw) / 2, (bmp.height - sh) / 2, sw, sh, 0, 0, W, H);
+          const b64 = cv.toDataURL("image/jpeg", 0.85).split(",")[1];
+          if (await saveLooks({ banner: b64 }, out, "Banner saved.")) bannerPrev.style.backgroundImage = `url("data:image/jpeg;base64,${b64}")`;
+        } catch { setMsg(out, "That picture couldn't be read."); }
+      });
+    });
+    // GIF picture
+    const gifIn = h("input", { type: "file", accept: "image/gif", hidden: true });
+    const gifPrev = h("div.pic-preview", {}, h("img", { alt: "", hidden: !looks.gif, src: looks.gif ? `${worker}/looks/gif/${encodeURIComponent(me.playerId)}?v=${looks.gif}` : undefined }));
+    const gifBtn = h("button.btn", { type: "button", onclick: () => gifIn.click() }, "Choose GIF…");
+    const gifDel = h("button.btn.ghost", { type: "button", onclick: () => busy(gifDel, async () => { if (await saveLooks({ gif: "" }, out, "Animated picture removed.")) gifPrev.querySelector("img").hidden = true; }) }, "Remove");
+    gifIn.addEventListener("change", async () => {
+      const file = gifIn.files && gifIn.files[0]; gifIn.value = "";
+      if (!file) return;
+      if (file.size > 2 * 1048576) return setMsg(out, "That GIF is too big (2 MB at most).");
+      await busy(gifBtn, async () => {
+        const buf = new Uint8Array(await file.arrayBuffer());
+        let bin = ""; for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+        const b64 = btoa(bin);
+        if (await saveLooks({ gif: b64 }, out, "Animated picture saved.")) { const img = gifPrev.querySelector("img"); img.src = "data:image/gif;base64," + b64; img.hidden = false; }
+      });
+    });
+    return section(s.lifetime ? "Supporter · lifetime" : "Supporter", s.lifetime ? `Thank you! You've supported OCTIVE for ${monthsText(s.days)}.` : `Thank you! Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "long" })} · ${monthsText(s.days)} in total.`,
+      field("Coloured name", nameInput, "Bio codes, and it has to spell your name exactly: #g rainbow, #c red, #l bold, #RRGGBB any colour."),
+      h("div.name-preview-box", {}, namePrev), h("div.panel-actions", {}, saveName),
+      field("Profile effect", effSel), effPrev,
+      h("span.field-label", { text: "Banner" }), bannerPrev, h("div.panel-actions", {}, bannerBtn, looks.banner ? bannerDel : null, bannerIn),
+      h("span.field-label", { text: "Animated picture (GIF, up to 2 MB)" }), h("div.pic-row", {}, gifPrev, gifBtn, looks.gif ? gifDel : null, gifIn),
+      out,
+      h("div.panel-actions", {}, h("a.btn", { href: "#/supporter" }, "Add more time")));
+  }
+
+  async function saveLooks(body, out, okText) {
+    try {
+      const r = await callApi("/support/looks", body, true);
+      me.looks = r.looks;
+      setMsg(out, okText + " It shows in the game within a few minutes.", true);
+      return true;
+    } catch (e) { setMsg(out, e.message); return false; }
+  }
+
+  // "Viewing Website": while the site is open and signed in
+  function pingSeen() {
+    if (!worker || document.hidden || !(store.get("octive.token", true) || store.get("octive.session"))) return;
+    callApi("seen", {}, true).catch(() => {});
+  }
+
   function page() {
     const hash = location.hash || "#/";
     if (/^#\/u\//.test(hash)) return "player";
@@ -853,6 +1260,7 @@
     else if (pg === "download") download();
     else if (pg === "account") account();
     else if (pg === "reset") resetPage();
+    else if (pg === "supporter") supporterPage();
     else home();
     if (fromHashChange) window.scrollTo(0, 0);
   }
@@ -863,6 +1271,10 @@
   // stay signed in: show the name in the menu
   if (worker && (store.get("octive.token", true) || store.get("octive.session")) && page() !== "account")
     callApi("me", undefined, true).then((m) => { me = m; updateAccountNav(); }).catch(() => {});
+  // "Viewing Website" for others while signed in here
+  setTimeout(pingSeen, 3000);
+  setInterval(pingSeen, 120_000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) pingSeen(); });
   // keep online status fresh while the page is open
   setInterval(() => { const q = document.querySelector("[data-search]"); if (!document.hidden && !(q && q.value) && window.scrollY < 200 && ["home", "rankings", "player"].includes(page())) load(); }, 90_000);
 })();
