@@ -248,6 +248,7 @@
     const p = data.players.find((x) => x.id === id);
     if (!p) {
       app.innerHTML = '<a class="back" href="#/rankings">← All players</a><p class="empty">That player isn\'t in the ranking (yet).</p>';
+      setTimeout(giftPopup, 400);
       return;
     }
     const view = clone("tpl-player");
@@ -292,6 +293,7 @@
     }
     app.replaceChildren(view);
     document.title = `${p.name} · OCTIVE Rankings`;
+    setTimeout(giftPopup, 400);
     window.scrollTo(0, 0);
   }
 
@@ -638,6 +640,8 @@
     panels.push(discordPanel(), emailPanel(), passwordPanel());
     app.replaceChildren(head, h("div.panels", {}, panels));
     document.title = `${me.name} · OCTIVE`;
+    if (me.gifts && me.gifts.length) panels[0].before?.(h("button.gift-banner", { type: "button", onclick: () => giftPopup() }, `♥ You have ${me.gifts.length === 1 ? "a supporter gift" : me.gifts.length + " supporter gifts"} to claim`));
+    setTimeout(giftPopup, 400);
   }
 
   async function saveProfile(body, out, okText) {
@@ -1107,13 +1111,13 @@
       setMsg(out, "");
       try {
         const r = await callApi("/support/grant", { playerId: giftTo, months }, true);
-        setMsg(out, `Gave ${months === 1 ? "1 month" : months + " months"} of supporter to ${r.name || "the player"} for free. They now have ${monthsText(r.status.days)} in total, until ${new Date(r.status.until).toLocaleDateString(undefined, { dateStyle: "medium" })}.`, true);
+        setMsg(out, `Sent ${months === 1 ? "1 month" : months + " months"} of supporter to ${r.name || "the player"} for free. They'll get a pop-up to claim it on their profile.`, true);
       } catch (e) { setMsg(out, e.message); }
     }));
 
     const status = h("div.sup-status");
     const page = h("div.supporter-page", {},
-      thanks ? h("div.thanks", {}, h("b", { text: "Thank you! ♥" }), h("span", { text: " Your support is being added now. It shows in the game within a few minutes." })) : null,
+      thanks ? h("div.thanks", {}, h("b", { text: "Thank you! ♥" }), h("span", { text: " Your support is being added now and shows in the game within a few minutes. Gifts wait for the player to claim them on their profile." })) : null,
       h("section.sup-hero", {},
         h("img.sup-hero-badge", { src: "badges/supporter-1y.png", alt: "" }),
         h("div", {}, h("h1", { text: "Support OCTIVE" }),
@@ -1256,6 +1260,51 @@
     callApi("seen", {}, true).catch(() => {});
   }
 
+  // ---------------------------------------------------------------- gifts wait to be claimed (pop-up on your own profile)
+  let giftPopupOpen = false;
+  function giftPopup() {
+    if (giftPopupOpen || !me || !(me.gifts && me.gifts.length)) return;
+    const own = page() === "account" || location.hash === "#/u/" + encodeURIComponent(me.playerId) || location.hash === "#/u/" + me.playerId;
+    if (!own) return;
+    giftPopupOpen = true;
+    const gifts = me.gifts;
+    const total = gifts.reduce((n, g) => n + g.months, 0);
+    const out = msg();
+    const close = () => { giftPopupOpen = false; layer.remove(); document.removeEventListener("keydown", onKey); };
+    const onKey = (e) => { if (e.key === "Escape") close(); };
+    const claim = h("button.btn.primary.wide.buy", { type: "button" }, gifts.length === 1 ? "Claim gift" : `Claim all ${gifts.length} gifts`);
+    const later = h("button.btn.ghost.wide", { type: "button", onclick: close }, "Later");
+    const art = h("img.gift-art", { src: `badges/supporter-${milestoneArt(Math.floor(((me.supporter && me.supporter.days) || 0) / 30.4375) + total)[1]}.png`, alt: "" });
+    const box = h("div.gift-modal", { role: "dialog", "aria-modal": "true", "aria-label": "Supporter gift" },
+      effectLayer("sparkles"),
+      art,
+      h("h2", { text: gifts.length === 1 ? "You got a gift!" : `You got ${gifts.length} gifts!` }),
+      h("ul.gift-items", {}, gifts.map((g) => h("li", {},
+        h("b", { text: g.fromName || "Someone" }),
+        h("span", { text: ` gifted you ${g.months === 1 ? "1 month" : g.months + " months"} of OCTIVE supporter` }),
+        g.at ? h("span.dim", { text: " · " + new Date(g.at).toLocaleDateString(undefined, { dateStyle: "medium" }) }) : null))),
+      h("p.panel-sub", { text: `Claiming adds ${total === 1 ? "1 month" : total + " months"} to your supporter time, starting now.` }),
+      out, claim, later);
+    claim.addEventListener("click", () => busy(claim, async () => {
+      setMsg(out, "");
+      try {
+        const r = await callApi("/support/claim", {}, true);
+        me.gifts = r.gifts || [];
+        me.supporter = r.status;
+        box.querySelector("h2").textContent = "Claimed! ♥";
+        box.querySelector(".gift-items").replaceWith(h("p", { text: `You're a supporter until ${new Date(r.status.until).toLocaleDateString(undefined, { dateStyle: "long" })}. Set up your coloured name, banner and effect on the Account page.` }));
+        claim.remove();
+        later.textContent = "Close";
+        later.onclick = () => { close(); route(); };
+        if (data) load();
+      } catch (e) { setMsg(out, e.message); }
+    }));
+    const layer = h("div.modal-layer", { onclick: (e) => { if (e.target === layer) close(); } }, box);
+    document.body.append(layer);
+    document.addEventListener("keydown", onKey);
+    setTimeout(() => claim.focus(), 30);
+  }
+
   function page() {
     const hash = location.hash || "#/";
     if (/^#\/u\//.test(hash)) return "player";
@@ -1282,7 +1331,7 @@
   load();
   // stay signed in: show the name in the menu
   if (worker && (store.get("octive.token", true) || store.get("octive.session")) && page() !== "account")
-    callApi("me", undefined, true).then((m) => { me = m; updateAccountNav(); }).catch(() => {});
+    callApi("me", undefined, true).then((m) => { me = m; updateAccountNav(); giftPopup(); }).catch(() => {});
   // "Viewing Website" for others while signed in here
   setTimeout(pingSeen, 3000);
   setInterval(pingSeen, 120_000);

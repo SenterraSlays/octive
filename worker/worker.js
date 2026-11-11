@@ -473,6 +473,7 @@ async function me(env, who) {
     pendingEmail: rec.pending && rec.pending.exp > Date.now() ? rec.pending.email : null,
     discord: rec.discord ? { name: rec.discord.name || "", at: rec.discord.at || null } : null,
     supporter: supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId),
+    gifts: await pendingGifts(env, who.playerId),
     looks: await r2json(env, `looks/${who.playerId}.json`, {}),
   };
 }
@@ -1171,6 +1172,24 @@ async function stripeSignatureOk(env, header, body) {
 }
 
 /** Adds bought months to a player's record (once per checkout session). */
+/** Gifts wait in gifts/<playerId>.json until the player claims them on the website. */
+async function addGift(env, playerId, gift) {
+  const key = `gifts/${playerId}.json`;
+  const g = await r2json(env, key, { pending: [] });
+  g.pending ||= [];
+  if (g.pending.some((x) => x.id === gift.id)) return;
+  const rec = await r2json(env, `supporters/${playerId}.json`, null);
+  if (rec?.purchases?.some((p) => p.session === gift.id)) return; // already claimed
+  let fromName = "";
+  try { const ov = moderation.overrides[gift.from] || {}; fromName = ov.name || (await publicItems(config(env), gift.from, ["card"])).card?.name || ""; } catch { /* unknown */ }
+  g.pending.push({ ...gift, fromName, at: new Date().toISOString() });
+  await r2put(env, key, g);
+}
+async function pendingGifts(env, playerId) {
+  const g = await r2json(env, `gifts/${playerId}.json`, { pending: [] });
+  return (g.pending || []).map((x) => ({ id: x.id, from: x.from, fromName: x.fromName || "Someone", months: x.months, free: !!x.free, at: x.at }));
+}
+
 async function grantMonths(env, playerId, months, session) {
   const key = `supporters/${playerId}.json`;
   const rec = await r2json(env, key, { periods: [], purchases: [] });
@@ -1202,7 +1221,10 @@ async function supportRoutes(request, env, url, ctx) {
     if (ev.type === "checkout.session.completed" || ev.type === "checkout.session.async_payment_succeeded") {
       const s = ev.data.object;
       const id = s.metadata?.playerId, months = Number(s.metadata?.months);
-      if (s.payment_status === "paid" && id && months >= 1 && months <= MAX_MONTHS) await grantMonths(env, id, months, s);
+      if (s.payment_status === "paid" && id && months >= 1 && months <= MAX_MONTHS) {
+        if (s.metadata?.gift === "1") await addGift(env, id, { id: s.id, from: s.metadata?.buyer || "", months, amount: s.amount_total, currency: s.currency, free: false });
+        else await grantMonths(env, id, months, s);
+      }
     }
     return new Response("ok");
   }
@@ -1252,9 +1274,27 @@ async function supportRoutes(request, env, url, ctx) {
     if (!/^[A-Za-z0-9_-]{8,64}$/.test(target)) fail(400, "That player can't be found.");
     const card = (await publicItems(config(env), target, ["card"])).card;
     if (!card || moderation.bans[target]) fail(400, "That player can't be found (they need to have played online once).");
-    const id = "free-" + crypto.randomUUID();
-    const rec = await grantMonths(env, target, months, { id, amount_total: 0, currency: "usd", metadata: { gift: "1", buyer: who.playerId } });
-    return reply({ ok: true, name: card.name || "", status: supportStatus(rec, target) });
+    await addGift(env, target, { id: "free-" + crypto.randomUUID(), from: who.playerId, months, amount: 0, currency: "usd", free: true });
+    return reply({ ok: true, name: card.name || "", pending: true });
+  }
+  if (path === "/support/gifts") {
+    const who = await signedIn(request, env);
+    return reply({ gifts: await pendingGifts(env, who.playerId) });
+  }
+  if (path === "/support/claim") {
+    // a gift (paid or free) starts when its player claims it on the website
+    const b = await bodyOf(request);
+    const who = await signedIn(request, env);
+    const key = `gifts/${who.playerId}.json`;
+    const g = await r2json(env, key, { pending: [] });
+    const list = g.pending || [];
+    const want = b.id ? list.filter((x) => x.id === String(b.id)) : list;
+    if (!want.length) fail(404, "That gift was already claimed.");
+    let rec = null;
+    for (const x of want) rec = await grantMonths(env, who.playerId, x.months, { id: x.id, amount_total: x.amount, currency: x.currency, metadata: { gift: "1", buyer: x.from } });
+    g.pending = list.filter((x) => !want.includes(x));
+    await r2put(env, key, g);
+    return reply({ ok: true, claimed: want.length, months: want.reduce((n, x) => n + x.months, 0), status: supportStatus(rec, who.playerId), gifts: g.pending });
   }
   if (path === "/support/me") {
     const who = await signedIn(request, env);
