@@ -21,7 +21,8 @@ const TOP = 50;                    // players shown
 const BOARD_TTL = 60_000;          // ranking refresh
 const CARD_TTL = 3 * 60_000;       // public card + online status refresh
 const CARD_FETCH_BUDGET = 40;      // cards fetched per request (Cloudflare free plan: 50 subrequests)
-const ONLINE_MS = 5 * 60_000;      // "online" when the game wrote its heartbeat this recently
+const ONLINE_MS = 5 * 60_000;
+const PP_VERSION = 3;              // the game's PP formula (Performance.Version); older totals are listed after      // "online" when the game wrote its heartbeat this recently
 const DEVELOPERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE"]; // same list as the game's PlayerRoles
 
 let board = null, boardAt = 0, boardPromise = null;
@@ -168,10 +169,14 @@ async function buildBoard(env) {
       online: seen > 0 && now - seen < ONLINE_MS,
       lastSeen: seen > 0 ? new Date(seen).toISOString() : null,
       platform: c.platform || "",
+      ppVersion: Number(meta.pv) || 2,
       status: seen > 0 && now - seen < ONLINE_MS ? platformStatus(c.platform) : null,
       avatarHash,
     };
   });
+  // totals from before the PP rework (games older than 1.3.3) go after the recalculated ones
+  players.sort((a, b) => ((b.ppVersion >= PP_VERSION) - (a.ppVersion >= PP_VERSION)) || b.pp - a.pp);
+  players.forEach((p, i) => { p.rank = i + 1; });
   return { updated: new Date(now).toISOString(), leaderboard: LEADERBOARD, total: players.length, online: players.filter((p) => p.online).length, players };
 }
 

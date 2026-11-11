@@ -235,6 +235,11 @@
         r.querySelector(".lvl").textContent = "Lv" + (p.level || 1);
         r.querySelector(".plays").textContent = fmt0.format(p.playCount || 0);
         r.querySelector(".pp").textContent = fmt0.format(p.pp || 0) + "pp";
+        if ((p.ppVersion || 2) < 3) {
+          r.classList.add("pp-old");
+          r.querySelector(".pp").title = "PP from before the PP rework. It updates the next time this player opens OCTIVE.";
+          r.querySelector(".pp").append(h("span.pp-old-tag", { text: "before rework" }));
+        }
         rows.appendChild(r);
       }
     }

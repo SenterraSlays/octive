@@ -565,3 +565,5 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
 .row .sup-pill.rank img { width: 18px; height: 18px; }
 @media (max-width: 640px) { .row .sup-pill.rank span { display: none; } }
 .ach-more { margin: 12px auto 0; display: block; }
+.row.pp-old .pp { color: var(--faint); }
+.pp-old-tag { display: block; font-size: 9px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
