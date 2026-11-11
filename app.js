@@ -456,12 +456,11 @@
       h("p.dl-desc", { text: desc }), ...rest);
     const svg = (paths) => { const s = document.createElement("span"); s.innerHTML = `<svg viewBox="0 0 24 24">${paths}</svg>`; return s.firstChild; };
     const winBtn = h("a.btn.primary.wide", { href: worker + "/releases/OCTIVE-Installer.exe" }, "Download the installer");
-    const winZip = h("a.dl-alt", { href: "#" }, "");
     const apkBtn = h("a.btn.primary.wide", { href: "#" }, "Download the APK");
     const winSize = h("span.dl-size"), apkSize = h("span.dl-size");
     const win = card("win" + (!isAndroid ? ".suggested" : ""), "Windows", svg('<path d="M3 5.5l7.5-1v7H3zM11.5 4.4L21 3v8.5h-9.5zM3 12.5h7.5v7L3 18.5zM11.5 12.5H21V21l-9.5-1.4z"/>'),
       "Windows 10 and 11", "The installer downloads the newest version, puts OCTIVE in your Start menu and starts it. The game updates itself after that.",
-      winBtn, h("div.dl-foot", {}, winSize, winZip),
+      winBtn, h("div.dl-foot", {}, winSize),
       h("p.dl-note", { text: "Windows may say it protected your PC, because the installer is new. Click More info, then Run anyway." }));
     const android = card("android" + (isAndroid ? ".suggested" : ""), "Android", svg('<path d="M7 9h10v8a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1z"/><path d="M7 8a5 5 0 0 1 10 0z"/><path d="M9 18v3M15 18v3M4.5 10v5M19.5 10v5M8.5 4L7 2M15.5 4L17 2"/>'),
       "Phones and tablets", "Android 8 or newer (64-bit). Open the APK after it downloads; you may need to allow your browser to install apps.",
@@ -483,7 +482,6 @@
       if (!m || !page.isConnected) return;
       if (m.windows) {
         winSize.textContent = `Version ${m.version} · ${mb(m.windows.size)} download`;
-        winZip.textContent = "or get the .zip"; winZip.href = worker + "/releases/" + m.windows.file;
       }
       if (m.android) { apkBtn.href = worker + "/releases/" + m.android.file; apkSize.textContent = `Version ${m.version} · ${mb(m.android.size)}`; }
       if (m.notes) {
