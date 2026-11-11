@@ -30,9 +30,21 @@
   // the game's level curve: level 1 → 2 takes 10,000 xp, every level after takes 7% more
   const xpFor = (lv) => lv <= 1 ? 0 : Math.round(100000 * (Math.pow(1.07, lv - 1) - 1) / 0.07);
 
-  if (DOWNLOAD_URL) { const d = document.getElementById("download-link"); d.href = DOWNLOAD_URL; d.hidden = false; }
-
   const worker = WORKER_URL.replace(/\/+$/, "");
+
+  // Download: the Android APK on phones and tablets, otherwise the Windows installer (it always installs the
+  // newest version, so the link never changes)
+  (function setupDownload() {
+    const d = document.getElementById("download-link");
+    if (DOWNLOAD_URL) { d.href = DOWNLOAD_URL; d.hidden = false; return; }
+    if (!worker) return;
+    const android = /Android/i.test(navigator.userAgent);
+    if (!android) { d.href = worker + "/releases/OCTIVE-Installer.exe"; d.title = "Windows installer"; d.hidden = false; return; }
+    fetch(worker + "/releases/latest.json", { cache: "no-cache" }).then(r => r.ok ? r.json() : null).then(m => {
+      if (!m || !m.android) return;
+      d.href = worker + "/releases/" + m.android.file; d.title = "Android APK (OCTIVE " + m.version + ")"; d.hidden = false;
+    }).catch(() => {});
+  })();
 
   async function load() {
     let error = null;

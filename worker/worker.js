@@ -202,7 +202,7 @@ async function avatar(env, playerId, hash) {
 // ---------------------------------------------------------------- game updates
 // The game checks /releases/latest.json and downloads the files it names from the R2 bucket bound as
 // RELEASES (Worker → Settings → Bindings → R2 bucket, variable name RELEASES).
-const RELEASE_TYPES = { json: "application/json; charset=utf-8", zip: "application/zip", apk: "application/vnd.android.package-archive" };
+const RELEASE_TYPES = { json: "application/json; charset=utf-8", zip: "application/zip", apk: "application/vnd.android.package-archive", exe: "application/vnd.microsoft.portable-executable" };
 
 async function release(env, key, request) {
   if (!env.RELEASES) return cors(new Response("Updates aren't set up: bind the R2 bucket as RELEASES.", { status: 503 }));
@@ -213,7 +213,9 @@ async function release(env, key, request) {
   const h = new Headers();
   h.set("Content-Type", RELEASE_TYPES[ext] || "application/octet-stream");
   // latest.json changes with every release; the builds themselves are versioned and never change
-  h.set("Cache-Control", key === "latest.json" ? "no-cache, max-age=0" : "public, max-age=31536000, immutable");
+  // (the installer keeps one name and is replaced when it changes)
+  const mutable = key === "latest.json" || key === "OCTIVE-Installer.exe";
+  h.set("Cache-Control", mutable ? "no-cache, max-age=0" : "public, max-age=31536000, immutable");
   if (ext !== "json") h.set("Content-Disposition", `attachment; filename="${key}"`);
   h.set("ETag", obj.httpEtag);
   if (obj.range && range) {
