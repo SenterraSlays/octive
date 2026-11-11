@@ -409,6 +409,7 @@
         h("p.lead", { text: "OCTIVE is a vertical scrolling rhythm game for 1 to 20 keys. Bring your osu!mania library, play with friends online and earn performance points on a global ranking." }),
         h("div.cta", {},
           h("a.btn.primary", { href: "#/download" }, "Download free"),
+          h("a.btn.play", { href: "play/" }, "▶ Play in browser"),
           h("a.btn", { href: "#/rankings" }, "See the rankings")),
         version),
       h("div.home-art", {}, playfield(), emblemSvg()));
@@ -468,13 +469,19 @@
     const linux = card("linux.soon", "Linux", svg('<path d="M12 3c-2 0-3 1.8-3 4 0 1.4.3 2.3-.6 3.6C7.2 12.3 6 14 6 16c0 1 .3 1.7.8 2.2M12 3c2 0 3 1.8 3 4 0 1.4-.3 2.3.6 3.6C16.8 12.3 18 14 18 16c0 1-.3 1.7-.8 2.2"/><path d="M5 19c1.5-.5 2.5-1 3.5 0s2.5 1.5 3.5 1.5 2.5-.5 3.5-1.5 2-.5 3.5 0"/>'),
       "Coming soon", "A Linux version is planned. Until then, the Windows version may run through Proton or Wine.",
       h("span.btn.wide.disabled", { "aria-disabled": "true" }, "Coming soon"));
+    const web = h("article.dl.web", {},
+      h("div.dl-head", {}, h("span.dl-icon", {}, svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 5.7 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-5.7-3.8-9S9.5 5.7 12 3z"/>')),
+        h("div", {}, h("span.dl-os", { text: "Browser" }), h("h3", { text: "Play right now" }))),
+      h("p.dl-desc", { text: "No download: play in Chrome, Edge or Firefox. Import .oct or osu! (.osz / .osu) beatmaps; they stay saved in your browser. Same account, scores and friends as the apps." }),
+      h("a.btn.primary.wide", { href: "play/" }, "▶ Play in browser"),
+      h("p.dl-note", { text: "Timing is tighter in the Windows and Android apps. Controllers work too." }));
     const mac = card("mac.unsupported", "macOS", svg('<path d="M16 3c-1 .2-2.2 1-2.6 2.2-.3.8-.2 1.6-.2 1.6s1.2.1 2.1-.9c.8-.9.9-2.1.7-2.9z"/><path d="M12.5 7.5c-1 0-2-.6-3-.6C7.4 6.9 5 8.6 5 12.3 5 16 7.4 21 9.3 21c1 0 1.6-.6 2.9-.6 1.3 0 1.7.6 2.9.6 1.4 0 2.8-2.4 3.4-4-2-.9-2.6-3.6-.9-5.2.4-.4.9-.7 1.3-.9-.9-1.3-2.2-2-3.5-2-1.2 0-2 .6-2.9.6z"/>'),
       "Not supported", "OCTIVE doesn't run on Macs, and there are no plans for a macOS version right now.",
       h("span.btn.wide.disabled", { "aria-disabled": "true" }, "Not available"));
     const notes = h("section.release-notes", { hidden: true });
     const page = h("div.download-page", {},
       h("section.page-head", {}, h("h1", { text: "Download OCTIVE" }), h("p.sub", { text: "Free on Windows and Android. Your account, scores and friends work on both." })),
-      h("div.dl-grid", {}, win, android, linux, mac),
+      h("div.dl-grid", {}, win, android, web, linux, mac),
       notes);
     app.replaceChildren(page);
     document.title = "Download · OCTIVE";
@@ -621,7 +628,7 @@
     if (!me.hasCard) panels.push(h("div.notice", { text: "Your profile appears online after your first play in the game while signed in. Until then it can't be edited here." }));
     if (me.hasCard && !me.banned) panels.push(picturePanel(), bioPanel());
     if (me.hasCard && !me.banned && me.creator) panels.push(socialsPanel());
-    panels.push(emailPanel(), passwordPanel());
+    panels.push(discordPanel(), emailPanel(), passwordPanel());
     app.replaceChildren(head, h("div.panels", {}, panels));
     document.title = `${me.name} · OCTIVE`;
   }
@@ -704,6 +711,36 @@
       h("div.social-form", {}, rows), h("div.panel-actions", {}, btn), out);
     panel.classList.add("creator-panel");
     return panel;
+  }
+
+  function discordPanel() {
+    const out = msg();
+    const box = h("div");
+    const render = () => {
+      box.textContent = "";
+      if (me.discord) {
+        const un = h("button.btn.ghost", { type: "button", onclick: () => busy(un, async () => {
+          try { me = await callApi("discord/unlink", {}, true); setMsg(out, "Discord unlinked.", true); render(); } catch (e) { setMsg(out, e.message); }
+        }) }, "Unlink");
+        box.append(h("div.email-row", {}, h("span.email-ok", { text: "✓" }), h("b", { text: me.discord.name || "Linked" }), h("span.field-hint", { text: "Discord linked" }), un));
+        return;
+      }
+      const codeBox = h("div.link-code", { hidden: true });
+      const get = h("button.btn.primary", { type: "button", onclick: () => busy(get, async () => {
+        try {
+          const r = await callApi("discord/code", {}, true);
+          codeBox.replaceChildren(
+            h("span.field-label", { text: "In Discord, type" }),
+            h("code.link-cmd", { text: `/link code:${r.code}` }),
+            h("span.field-hint", { text: "The code works for 10 minutes. Then refresh this page." }));
+          codeBox.hidden = false;
+          try { await navigator.clipboard.writeText(`/link code:${r.code}`); setMsg(out, "Copied the command. Paste it in any channel with the OCTIVE app.", true); } catch { /* no clipboard */ }
+        } catch (e) { setMsg(out, e.message); }
+      }) }, "Link Discord");
+      box.append(h("div.panel-actions", { style: "justify-content:flex-start" }, get), codeBox);
+    };
+    render();
+    return section("Discord", "Link your Discord so /profile in the OCTIVE Discord shows your stats. You get a code here, then use /link in Discord.", box, out);
   }
 
   function emailPanel() {

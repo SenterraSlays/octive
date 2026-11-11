@@ -400,3 +400,13 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
 .legal-summary { background: var(--surface); border: 1px solid #8b7bff44; border-radius: 14px; padding: 14px 18px; }
 .legal-links { margin-top: 36px; color: var(--faint); }
 .foot a:hover { color: var(--text); }
+
+/* play in the browser */
+.btn.play { background: linear-gradient(135deg, #2ec4d6, #3fd8e6); border-color: transparent; color: #071016; box-shadow: 0 6px 24px #3fd8e644; }
+.btn.play:hover { filter: brightness(1.08); box-shadow: 0 8px 30px #3fd8e677; }
+.dl.web { grid-column: 1 / -1; border-color: #3fd8e666; background: linear-gradient(135deg, #10202a99, #12152299); }
+.dl.web .dl-icon svg { stroke: var(--accent-2); }
+
+/* discord link code */
+.link-code { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border-radius: 10px; background: #5865f214; border: 1px solid #5865f255; }
+.link-cmd { font-family: ui-monospace, Consolas, monospace; font-size: 18px; font-weight: 700; color: #c9cdfb; user-select: all; }

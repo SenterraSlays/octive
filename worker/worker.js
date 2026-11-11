@@ -3,6 +3,7 @@
 //   GET /leaderboard            the global PP ranking with each player's public card (JSON)
 //   GET /avatar/<playerId>?v=…  a player's public avatar (JPG)
 //   GET /releases/<file>         game updates from the R2 bucket bound as RELEASES (latest.json + builds)
+//   POST /discord                Discord slash commands (/profile, /leaderboard, /online, /download, /link, /unlink)
 //   /account/...                 website sign-in, profile editing, email linking and password resets
 //                                (see "accounts" below; email needs BREVO_API_KEY + MAIL_FROM)
 // Secrets (Worker → Settings → Variables and Secrets): UGS_KEY_ID, UGS_SECRET_KEY, UGS_PROJECT_ID,
@@ -466,6 +467,7 @@ async function me(env, who) {
     email: rec.email ? rec.email : null,
     emailVerified: !!rec.verified,
     pendingEmail: rec.pending && rec.pending.exp > Date.now() ? rec.pending.email : null,
+    discord: rec.discord ? { name: rec.discord.name || "", at: rec.discord.at || null } : null,
   };
 }
 
@@ -592,6 +594,26 @@ async function account(request, env, route) {
       await saveRecord(env, who.playerId, rec);
       return reply(await me(env, who));
     }
+    case "discord/code": {
+      // a one-time code for /link in Discord (10 minutes)
+      await bodyOf(request);
+      const who = await signedIn(request, env);
+      const abc = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+      const bytes = crypto.getRandomValues(new Uint8Array(8));
+      const code = [...bytes].map((b) => abc[b % abc.length]).join("");
+      const exp = Date.now() + 10 * 60_000;
+      await env.RELEASES.put(`discord-codes/${code}.json`, JSON.stringify({ playerId: who.playerId, exp }), { httpMetadata: { contentType: "application/json" } });
+      return reply({ code, exp });
+    }
+    case "discord/unlink": {
+      await bodyOf(request);
+      const who = await signedIn(request, env);
+      const rec = await record(env, who.playerId);
+      if (rec.discord?.id) await env.RELEASES.delete(`discord/${rec.discord.id}.json`);
+      delete rec.discord;
+      await saveRecord(env, who.playerId, rec);
+      return reply(await me(env, who));
+    }
     case "reset/start": {
       const b = await bodyOf(request);
       const username = String(b.username || "").trim().toLowerCase();
@@ -654,10 +676,268 @@ async function findPlayer(env, username) {
   return null;
 }
 
+// ---------------------------------------------------------------- browser version
+// The web build lives in R2 under web/<version>/ (Build/… and StreamingAssets/…, uploaded by
+// Tools/publish_release.py). Unity's Brotli files are sent as they are with Content-Encoding: br, so the
+// browser decompresses them; the page on GitHub Pages (play/) loads them from here.
+const WEB_TYPES = { js: "application/javascript", wasm: "application/wasm", data: "application/octet-stream", json: "application/json", txt: "text/plain; charset=utf-8", oct: "application/octet-stream" };
+
+async function webFile(env, version, path, request) {
+  if (!env.RELEASES) return cors(new Response("Not set up", { status: 503 }));
+  const obj = await env.RELEASES.get(`web/${version}/${path}`);
+  if (!obj) return cors(new Response("Not found", { status: 404 }));
+  const h = new Headers();
+  let name = path.split("/").pop();
+  const br = name.endsWith(".br");
+  if (br) { name = name.slice(0, -3); h.set("Content-Encoding", "br"); }
+  const ext = name.split(".").pop().toLowerCase();
+  h.set("Content-Type", WEB_TYPES[ext] || "application/octet-stream");
+  h.set("Cache-Control", "public, max-age=31536000, immutable"); // every version has its own folder
+  h.set("ETag", obj.httpEtag);
+  // CORS headers set here: re-wrapping the response (cors()) would drop encodeBody and compress it twice
+  h.set("Access-Control-Allow-Origin", "*");
+  h.set("Content-Length", String(obj.size));
+  return new Response(obj.body, { headers: h, encodeBody: br ? "manual" : "automatic" });
+}
+
+// ---------------------------------------------------------------- Discord app (slash commands)
+// Discord sends slash commands here (Developer Portal → Interactions Endpoint URL = <worker>/discord).
+// Every request is checked against the application's public key. Commands: /profile, /leaderboard,
+// /online, /download, /link, /unlink (registered by Tools/discord_commands.py).
+// Linking: the website's Account page makes a one-time code; /link code:<code> ties the Discord user to
+// that OCTIVE account (R2: discord/<discordId>.json and the account record's "discord").
+
+const DISCORD_APP_ID = "1569883934827745330";
+const DISCORD_PUBLIC_KEY = "57eae870ba2f5c8833c8c2df8ee0552e5a2d034eb3409d2a747545921c491e6b";
+const SITE = "https://senterraslays.github.io/octive-rankings/";
+const WORKER_BASE = "https://octive-rankings-api.lunalazum18.workers.dev";
+const EPHEMERAL = 64;
+const BADGE_EMOJI = { DEV: "🛠️ DEV", MOD: "🛡️ MOD", CREATOR: "🎬 CREATOR", VIP: "⭐ VIP", TESTER: "🧪 TESTER" };
+
+function hexBytes(hex) { const b = new Uint8Array(hex.length / 2); for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16); return b; }
+
+async function discordVerified(request, body) {
+  const sig = request.headers.get("X-Signature-Ed25519"), ts = request.headers.get("X-Signature-Timestamp");
+  if (!sig || !ts || !/^[0-9a-f]{128}$/i.test(sig)) return false;
+  try {
+    const key = await crypto.subtle.importKey("raw", hexBytes(DISCORD_PUBLIC_KEY), { name: "Ed25519" }, false, ["verify"]);
+    return await crypto.subtle.verify({ name: "Ed25519" }, key, hexBytes(sig), new TextEncoder().encode(ts + body));
+  } catch { return false; }
+}
+
+const dReply = (data) => new Response(JSON.stringify({ type: 4, data }), { headers: { "Content-Type": "application/json" } });
+const fmtN = (n, d = 0) => Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const stripBio = (s) => String(s || "").replace(/#\[[0-9a-fA-F]{6}\]|#[0-9a-fA-F]{6}(?![0-9a-fA-F])|#[0-9a-fA-FlonmkgrLONMKGR]/g, "").replace(/##/g, "#").trim();
+
+function playTimeText(ms) { const m = Math.floor((ms || 0) / 60000); return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`; }
+function agoText(iso) {
+  const s = (Date.now() - Date.parse(iso)) / 1000;
+  if (s < 120) return "just now"; if (s < 3600) return Math.floor(s / 60) + " minutes ago";
+  if (s < 86400) return Math.floor(s / 3600) + " hours ago"; return Math.floor(s / 86400) + " days ago";
+}
+
+/** A player's profile as the site shows it: from the ranking when they're in it, else their public card. */
+async function profileOf(env, playerId) {
+  let board = null;
+  try { board = await leaderboard(env); } catch { /* card only */ }
+  const ranked = board?.players?.find((p) => p.id === playerId);
+  if (ranked) return ranked;
+  const items = await publicItems(config(env), playerId, ["card", "seen"]);
+  const card = items.card;
+  if (!card || moderation.bans[playerId]) return null;
+  const seen = items.seen ? Date.parse(items.seen) : 0;
+  const ov = moderation.overrides[playerId] || {};
+  return {
+    id: playerId, rank: card.rank || 0, pp: card.pp || 0, name: ov.name || card.name || "Player", accuracy: card.accuracy || 0,
+    level: card.level || 1, levelProgress: card.levelProgress || 0, playCount: card.playCount || 0, maxCombo: card.maxCombo || 0,
+    fullCombos: card.fullCombos || 0, playTimeMs: card.playTimeMs || 0, totalScore: card.totalScore || 0, bio: card.bio || "",
+    badges: badgesOf(playerId), online: seen > 0 && Date.now() - seen < ONLINE_MS, lastSeen: seen ? new Date(seen).toISOString() : null,
+    avatarHash: ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : (card.avatar || ""),
+  };
+}
+
+function profileEmbed(p) {
+  const badges = (p.badges || []).map((b) => BADGE_EMOJI[b] || b).join("  ");
+  const color = (p.badges || []).includes("DEV") ? 0xB69BFF : (p.badges || []).includes("CREATOR") ? 0xFF2133 : 0x7C6CFF;
+  const bio = stripBio(p.bio);
+  const e = {
+    title: p.name,
+    url: `${SITE}#/u/${encodeURIComponent(p.id)}`,
+    color,
+    description: [badges, bio ? `> ${bio.slice(0, 300).replace(/\n/g, "\n> ")}` : null].filter(Boolean).join("\n") || undefined,
+    fields: [
+      { name: "Rank", value: p.rank ? `#${fmtN(p.rank)}` : "Unranked", inline: true },
+      { name: "Performance", value: `${fmtN(p.pp)}pp`, inline: true },
+      { name: "Accuracy", value: `${fmtN(p.accuracy, 2)}%`, inline: true },
+      { name: "Level", value: `Lv${p.level} (${Math.round((p.levelProgress || 0) * 100)}%)`, inline: true },
+      { name: "Plays", value: fmtN(p.playCount), inline: true },
+      { name: "Max combo", value: p.maxCombo ? `${fmtN(p.maxCombo)}x` : "—", inline: true },
+      { name: "Full combos", value: fmtN(p.fullCombos), inline: true },
+      { name: "Play time", value: playTimeText(p.playTimeMs), inline: true },
+      { name: "Status", value: p.online ? "🟢 Online now" : p.lastSeen ? `Last online ${agoText(p.lastSeen)}` : "Offline", inline: true },
+    ],
+    footer: { text: "OCTIVE · senterraslays.github.io/octive-rankings" },
+  };
+  if (p.avatarHash) e.thumbnail = { url: `${WORKER_BASE}/avatar/${encodeURIComponent(p.id)}?v=${encodeURIComponent(p.avatarHash)}` };
+  return e;
+}
+
+async function linkedPlayer(env, discordId) {
+  if (!env.RELEASES) return null;
+  const o = await env.RELEASES.get(`discord/${discordId}.json`);
+  if (!o) return null;
+  try { return (await o.json()).playerId || null; } catch { return null; }
+}
+
+const opt = (data, name) => (data.options || []).find((o) => o.name === name)?.value;
+
+async function discordCommand(env, it) {
+  const data = it.data || {};
+  const user = it.member?.user || it.user || {};
+  switch (data.name) {
+    case "profile": {
+      const name = opt(data, "player"), mention = opt(data, "user");
+      let id = null;
+      if (name) {
+        const board = await leaderboard(env);
+        const q = String(name).trim().toLowerCase();
+        const p = board.players.find((x) => (x.name || "").toLowerCase() === q) || board.players.find((x) => (x.name || "").toLowerCase().includes(q));
+        if (!p) return { content: `Nobody called **${String(name).slice(0, 40)}** is on the ranking. Players who aren't ranked can be found when they've linked Discord: \`/profile user:@them\`.`, flags: EPHEMERAL };
+        id = p.id;
+      } else {
+        const who = mention || user.id;
+        id = await linkedPlayer(env, who);
+        if (!id) return {
+          content: who === user.id
+            ? `Your Discord isn't linked to an OCTIVE account yet. Sign in at ${SITE}#/account, press **Link Discord**, then use \`/link\` with the code.`
+            : `<@${who}> hasn't linked an OCTIVE account.`,
+          flags: EPHEMERAL, allowed_mentions: { parse: [] },
+        };
+      }
+      const p = await profileOf(env, id);
+      if (!p) return { content: "That profile isn't available (no plays online yet).", flags: EPHEMERAL };
+      return { embeds: [profileEmbed(p)], allowed_mentions: { parse: [] } };
+    }
+    case "leaderboard": {
+      const page = Math.max(1, Math.min(5, Number(opt(data, "page") || 1)));
+      const board = await leaderboard(env);
+      const rows = board.players.slice((page - 1) * 10, page * 10);
+      if (!rows.length) return { content: "No ranked players on that page yet.", flags: EPHEMERAL };
+      const medal = (r) => (r === 1 ? "🥇" : r === 2 ? "🥈" : r === 3 ? "🥉" : `\`#${r}\``);
+      return {
+        embeds: [{
+          title: "OCTIVE Performance Ranking", url: `${SITE}#/rankings`, color: 0x7C6CFF,
+          description: rows.map((p) => `${medal(p.rank)} **${p.name.replace(/[*_`~|]/g, "")}** — ${fmtN(p.pp)}pp · ${fmtN(p.accuracy, 2)}% · Lv${p.level}${p.online ? " 🟢" : ""}`).join("\n"),
+          footer: { text: `Page ${page} · ${board.total} ranked · ${board.online} online` },
+        }],
+        allowed_mentions: { parse: [] },
+      };
+    }
+    case "online": {
+      const board = await leaderboard(env);
+      const on = board.players.filter((p) => p.online);
+      return {
+        embeds: [{
+          title: `${on.length} player${on.length === 1 ? "" : "s"} online`, color: 0x3DDC84, url: `${SITE}#/rankings`,
+          description: on.length ? on.slice(0, 30).map((p) => `🟢 **${p.name.replace(/[*_`~|]/g, "")}** · #${p.rank} · ${fmtN(p.pp)}pp`).join("\n") : "Nobody on the ranking is online right now.",
+        }],
+        allowed_mentions: { parse: [] },
+      };
+    }
+    case "download": {
+      let m = null;
+      try { const o = await env.RELEASES.get("latest.json"); m = o ? await o.json() : null; } catch { /* none */ }
+      return {
+        embeds: [{
+          title: m ? `Download OCTIVE ${m.version}` : "Download OCTIVE", url: `${SITE}#/download`, color: 0x7C6CFF,
+          description: [
+            `🪟 **Windows:** [installer](${WORKER_BASE}/releases/OCTIVE-Installer.exe) (always installs the newest version)`,
+            m?.android ? `🤖 **Android:** [APK](${WORKER_BASE}/releases/${m.android.file})` : null,
+            m?.web ? `🌐 **Browser:** [play now](${SITE}play/)` : null,
+            `\nThe game updates itself. More at ${SITE}#/download`,
+          ].filter(Boolean).join("\n"),
+          footer: m?.notes ? { text: ("What's new: " + m.notes).slice(0, 2000) } : undefined,
+        }],
+      };
+    }
+    case "link": {
+      const code = String(opt(data, "code") || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+      if (code.length !== 8) return { content: `That code doesn't look right. Get one at ${SITE}#/account → **Link Discord**.`, flags: EPHEMERAL };
+      const o = await env.RELEASES.get(`discord-codes/${code}.json`);
+      const c = o ? await o.json() : null;
+      if (!c || c.exp < Date.now()) return { content: `That code isn't valid or ran out (codes work for 10 minutes). Make a new one at ${SITE}#/account.`, flags: EPHEMERAL };
+      await env.RELEASES.delete(`discord-codes/${code}.json`);
+      const old = await linkedPlayer(env, user.id);
+      if (old && old !== c.playerId) {
+        const orec = await record(env, old); delete orec.discord; await saveRecord(env, old, orec);
+      }
+      const rec = await record(env, c.playerId);
+      if (rec.discord && rec.discord.id !== user.id) await env.RELEASES.delete(`discord/${rec.discord.id}.json`);
+      rec.discord = { id: user.id, name: user.global_name || user.username || "", at: new Date().toISOString() };
+      await saveRecord(env, c.playerId, rec);
+      await env.RELEASES.put(`discord/${user.id}.json`, JSON.stringify({ playerId: c.playerId, at: rec.discord.at }), { httpMetadata: { contentType: "application/json" } });
+      let name = "your account";
+      try { const p = await profileOf(env, c.playerId); if (p) name = `**${p.name}**`; } catch { /* fine */ }
+      return { content: `✅ Linked to ${name}. Try \`/profile\`!`, flags: EPHEMERAL };
+    }
+    case "unlink": {
+      const id = await linkedPlayer(env, user.id);
+      if (!id) return { content: "Your Discord isn't linked to an OCTIVE account.", flags: EPHEMERAL };
+      await env.RELEASES.delete(`discord/${user.id}.json`);
+      const rec = await record(env, id); delete rec.discord; await saveRecord(env, id, rec);
+      return { content: "Unlinked. Your OCTIVE account and Discord aren't connected any more.", flags: EPHEMERAL };
+    }
+    default:
+      return { content: "I don't know that command (yet).", flags: EPHEMERAL };
+  }
+}
+
+async function discordInteraction(request, env, ctx) {
+  const body = await request.text();
+  if (!(await discordVerified(request, body))) return new Response("invalid request signature", { status: 401 });
+  const it = JSON.parse(body);
+  if (it.type === 1) return new Response(JSON.stringify({ type: 1 }), { headers: { "Content-Type": "application/json" } }); // PING
+  if (it.type !== 2) return dReply({ content: "Not supported.", flags: EPHEMERAL });
+  // answer straight away when the result is ready within ~2.5 s (Discord allows 3 s); otherwise answer
+  // "thinking…" and edit the reply when it's done (the ranking can be slow on a cold start)
+  const ephemeral = ["link", "unlink"].includes(it.data?.name);
+  const result = discordCommand(env, it).catch((e) => {
+    console.log("discord command failed", e && e.stack || e);
+    return { content: "Something went wrong: " + String(e.message || e).slice(0, 300) };
+  });
+  const quick = await Promise.race([result, new Promise((r) => setTimeout(() => r(null), 2500))]);
+  if (quick) {
+    if (ephemeral) quick.flags = EPHEMERAL;
+    return dReply(quick);
+  }
+  const work = (async () => {
+    const msg = await result;
+    // the "thinking…" message's visibility was chosen when deferring; an edit can't change it
+    delete msg.flags;
+    const res = await fetch(`https://discord.com/api/v10/webhooks/${DISCORD_APP_ID}/${it.token}/messages/@original`, {
+      method: "PATCH", headers: { "Content-Type": "application/json", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive-rankings, 1.0)" }, body: JSON.stringify(msg),
+    });
+    if (!res.ok) {
+      console.log("discord edit failed", res.status, (await res.text()).slice(0, 500));
+      // last try: plain text, so the command never hangs on "thinking"
+      await fetch(`https://discord.com/api/v10/webhooks/${DISCORD_APP_ID}/${it.token}/messages/@original`, {
+        method: "PATCH", headers: { "Content-Type": "application/json", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive-rankings, 1.0)" },
+        body: JSON.stringify({ content: msg.content || "Something went wrong showing that. Try again in a moment.", embeds: [] }),
+      });
+    }
+  })();
+  ctx.waitUntil(work);
+  return new Response(JSON.stringify({ type: 5, data: ephemeral ? { flags: EPHEMERAL } : {} }), { headers: { "Content-Type": "application/json" } });
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
+    if (url.pathname === "/discord" && request.method === "POST") {
+      try { return await discordInteraction(request, env, ctx); }
+      catch (e) { return new Response("error: " + e.message, { status: 500 }); }
+    }
     if (url.pathname.startsWith("/account/")) {
       try { return await account(request, env, url.pathname.slice(9)); }
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
@@ -667,6 +947,8 @@ export default {
       if (url.pathname === "/" || url.pathname === "/leaderboard") return json(await leaderboard(env), 30);
       const m = url.pathname.match(/^\/avatar\/([A-Za-z0-9_-]{1,64})$/);
       if (m) return await avatar(env, m[1], url.searchParams.get("v"));
+      const w = url.pathname.match(/^\/web\/(\d{1,3}\.\d{1,3}\.\d{1,3})\/((?:Build|StreamingAssets)\/[A-Za-z0-9._\/-]{1,200})$/);
+      if (w && !w[2].includes("..")) return await webFile(env, w[1], w[2], request);
       const r = url.pathname.match(/^\/releases\/([A-Za-z0-9._-]{1,120})$/);
       if (r) return await release(env, r[1], request);
       return cors(new Response("Not found", { status: 404 }));

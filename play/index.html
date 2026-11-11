@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>Play OCTIVE in your browser</title>
+  <meta name="description" content="Play OCTIVE, the free vertical scrolling rhythm game, right in your browser. Import .oct and osu! beatmaps; they stay saved in this browser.">
+  <link rel="icon" href="../logo.svg" type="image/svg+xml">
+  <style>
+    :root { --bg: #07080e; --text: #eef0ff; --dim: #9aa0bd; --faint: #5d6380; --accent: #8b7bff; --accent-2: #4fd6e8; --line: #ffffff14; color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+    #stage { position: fixed; inset: 0; }
+    #game { width: 100%; height: 100%; display: block; background: #000; outline: none; }
+    /* page buttons: hidden while playing; move the mouse to the top edge to show them */
+    .bar { position: fixed; top: 8px; left: 50%; transform: translate(-50%, -60px); display: flex; gap: 8px; z-index: 5; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
+    body.show-bar .bar, .bar:focus-within, body.loading .bar { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+    .bar a, .bar button { height: 34px; padding: 0 12px; border-radius: 9px; border: 1px solid #ffffff24; background: #0b0d16cc; color: var(--text); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; display: inline-flex; align-items: center; text-decoration: none; backdrop-filter: blur(8px); }
+    .bar a:hover, .bar button:hover { border-color: var(--accent); }
+    #loading { position: fixed; inset: 0; display: grid; place-items: center; z-index: 10; background: radial-gradient(900px 500px at 50% 30%, #2a1f6644, transparent 60%), var(--bg); transition: opacity .5s; }
+    #loading.gone { opacity: 0; pointer-events: none; }
+    .box { width: min(420px, 88vw); display: flex; flex-direction: column; align-items: center; gap: 16px; text-align: center; }
+    .box img { width: 120px; height: 120px; filter: drop-shadow(0 0 24px #7c6cff66); animation: spin 18s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .word { font-weight: 800; letter-spacing: .4em; font-size: 22px; margin-right: -.4em; }
+    .track { width: 100%; height: 8px; border-radius: 4px; background: #ffffff10; overflow: hidden; }
+    .fill { height: 100%; width: 0; border-radius: 4px; background: linear-gradient(90deg, #8b7bff, #4fd6e8); transition: width .2s; }
+    .status { color: var(--dim); font-size: 14px; min-height: 1.4em; }
+    .hint { color: var(--faint); font-size: 12px; line-height: 1.6; }
+    .error { color: #ff7a8f; font-size: 15px; line-height: 1.6; }
+    .error a { color: var(--accent); }
+    @media (prefers-reduced-motion: reduce) { .box img { animation: none; } }
+  </style>
+</head>
+<body class="loading">
+  <div id="stage"><canvas id="game" tabindex="-1" aria-label="OCTIVE"></canvas></div>
+  <div class="bar">
+    <a href="../#/">← Website</a>
+    <button type="button" id="fullscreen">Fullscreen</button>
+  </div>
+  <div id="loading" role="status" aria-live="polite">
+    <div class="box">
+      <img src="../logo.svg" alt="">
+      <div class="word">OCTIVE</div>
+      <div class="track"><div class="fill" id="fill"></div></div>
+      <div class="status" id="status">Finding the latest version…</div>
+      <div class="hint">Playing in the browser: import .oct or osu! (.osz / .osu) beatmaps from Song Select; they stay saved in this browser. For the best timing, use the <a href="../#/download" style="color:#8b7bff">Windows or Android app</a>.</div>
+    </div>
+  </div>
+
+  <script>
+  (() => {
+    "use strict";
+    const WORKER = "https://octive-rankings-api.lunalazum18.workers.dev";
+    const canvas = document.getElementById("game");
+    const fill = document.getElementById("fill");
+    const status = document.getElementById("status");
+    const loading = document.getElementById("loading");
+
+    function fail(html) {
+      status.className = "error";
+      status.innerHTML = html;
+      fill.parentElement.hidden = true;
+    }
+
+    document.getElementById("fullscreen").addEventListener("click", () => {
+      const el = document.documentElement;
+      if (document.fullscreenElement) document.exitFullscreen();
+      else (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+      canvas.focus();
+    });
+    canvas.addEventListener("pointerdown", () => canvas.focus());
+    let barTimer = 0;
+    window.addEventListener("mousemove", (e) => {
+      if (e.clientY > 56) return;
+      document.body.classList.add("show-bar");
+      clearTimeout(barTimer);
+      barTimer = setTimeout(() => document.body.classList.remove("show-bar"), 2500);
+    });
+
+    // imported songs and scores live in this browser's storage: ask the browser to keep it
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+
+    if (!window.WebAssembly) { fail('Your browser can\'t run OCTIVE (no WebAssembly). Try a current Chrome, Edge or Firefox, or <a href="../#/download">download the game</a>.'); return; }
+
+    fetch(WORKER + "/releases/latest.json", { cache: "no-cache" })
+      .then((r) => r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
+      .then((m) => {
+        if (!m.web) { fail('The browser version isn\'t out yet. <a href="../#/download">Download OCTIVE</a> for Windows or Android instead.'); return; }
+        const w = m.web, base = `${WORKER}/web/${w.version}`;
+        document.title = `OCTIVE ${w.version} · Play in your browser`;
+        status.textContent = `Loading OCTIVE ${w.version}…`;
+        const script = document.createElement("script");
+        script.src = `${base}/Build/${w.loader}`;
+        script.onerror = () => fail('The game couldn\'t be loaded. Check your connection and <a href="">try again</a>.');
+        script.onload = () => {
+          const config = {
+            dataUrl: `${base}/Build/${w.data}`,
+            frameworkUrl: `${base}/Build/${w.framework}`,
+            codeUrl: `${base}/Build/${w.code}`,
+            streamingAssetsUrl: `${base}/StreamingAssets`,
+            companyName: "Hazelwood",
+            productName: "OCTIVE",
+            productVersion: w.version,
+            matchWebGLToCanvasSize: true,
+            autoSyncPersistentDataPath: true, // imported songs, scores and settings are saved as they change
+            devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2),
+          };
+          createUnityInstance(canvas, config, (p) => {
+            fill.style.width = Math.round(p * 100) + "%";
+            status.textContent = p < 0.9 ? `Downloading… ${Math.round(p * 100)}%` + (w.size ? ` of ${(w.size / 1048576).toFixed(0)} MB` : "") : "Starting…";
+          }).then(() => {
+            loading.classList.add("gone");
+            document.body.classList.remove("loading");
+            canvas.focus();
+          }).catch((e) => fail("OCTIVE couldn't start: " + String(e && e.message || e).replace(/</g, "&lt;")));
+        };
+        document.body.appendChild(script);
+      })
+      .catch(() => fail('Couldn\'t reach the OCTIVE server. Check your connection and <a href="">try again</a>.'));
+  })();
+  </script>
+</body>
+</html>
