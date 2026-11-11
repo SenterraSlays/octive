@@ -160,6 +160,7 @@ async function buildBoard(env) {
       maxCombo: card.maxCombo ?? 0,
       playTimeMs: card.playTimeMs ?? 0,
       bio: typeof card.bio === "string" ? card.bio : "",
+      achievements: card.achievements && typeof card.achievements === "object" ? card.achievements : {},
       devFriend: !!card.devFriend,
       role: DEVELOPERS.includes(e.playerId) ? "DEV" : (badgesOf(e.playerId)[0] || moderation.roles[e.playerId] || null),
       badges: badgesOf(e.playerId),
@@ -763,7 +764,7 @@ async function profileOf(env, playerId) {
   return {
     id: playerId, rank: card.rank || 0, pp: card.pp || 0, name: ov.name || card.name || "Player", accuracy: card.accuracy || 0,
     level: card.level || 1, levelProgress: card.levelProgress || 0, playCount: card.playCount || 0, maxCombo: card.maxCombo || 0,
-    fullCombos: card.fullCombos || 0, playTimeMs: card.playTimeMs || 0, totalScore: card.totalScore || 0, bio: card.bio || "",
+    fullCombos: card.fullCombos || 0, playTimeMs: card.playTimeMs || 0, totalScore: card.totalScore || 0, bio: card.bio || "", achievements: card.achievements || {},
     badges: badgesOf(playerId), online: seen > 0 && Date.now() - seen < ONLINE_MS, lastSeen: seen ? new Date(seen).toISOString() : null,
     platform: items.platform || "", status: seen > 0 && Date.now() - seen < ONLINE_MS ? platformStatus(items.platform) : null,
     avatarHash: ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : (card.avatar || ""),

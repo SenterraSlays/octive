@@ -230,7 +230,7 @@
         nameInto(r.querySelector(".name"), p);
         setAvatar(r.querySelector(".avatar"), p);
         setRole(r, r.querySelector(".badge"), p);
-        if (isSupporter(p)) { r.classList.add("supporter"); r.querySelector(".player").append(supporterPill(p, true)); }
+        if (isSupporter(p)) { r.classList.add("supporter"); const pill = supporterPill(p); pill.classList.add("rank"); r.querySelector(".player").append(pill); }
         r.querySelector(".acc").textContent = fmt2.format(p.accuracy || 0) + "%";
         r.querySelector(".lvl").textContent = "Lv" + (p.level || 1);
         r.querySelector(".plays").textContent = fmt0.format(p.playCount || 0);
@@ -287,6 +287,7 @@
     }
     const sup = supporterSection(p);
     if (sup) view.querySelector(".tiles").after(sup);
+    view.querySelector(".tiles").parentNode.append(achievementsSection(p));
     if ((p.badges || []).includes("CREATOR") && p.socials) {
       const box = view.querySelector(".social-links");
       if (box && renderSocials(box, p.socials) > 0) view.querySelector(".socials").hidden = false;
@@ -613,34 +614,58 @@
     return h("section.panel", {}, h("h2", { text: title }), sub ? h("p.panel-sub", { text: sub }) : null, ...kids);
   }
 
-  function profilePage() {
+  let accountTab = "supporter";
+  function accountHead() {
     const p = { id: me.playerId, name: me.name, badges: me.badges, role: me.badges[0] || null,
-      avatar: me.avatarHash ? `${worker}/avatar/${encodeURIComponent(me.playerId)}?v=${encodeURIComponent(me.avatarHash)}` : null };
+      avatar: me.avatarHash ? `${worker}/avatar/${encodeURIComponent(me.playerId)}?v=${encodeURIComponent(me.avatarHash)}` : null,
+      supporter: me.supporter && me.supporter.active ? { ...me.supporter, ...(me.looks || {}) } : null };
     const c = me.card || {};
+    const status = [me.username ? "@" + me.username : null, c.version ? "last played on v" + c.version : null].filter(Boolean).join(" · ");
     const head = h("article.card.me-card", {},
       h("div.card-avatar", {}, h("img", { alt: "", hidden: true }), h("span.initial")),
       h("div.card-body", {},
         h("div.card-name-row", {}, h("h1.card-name", { text: me.name }), h("span.badge", { hidden: true })),
-        h("div.card-status", { text: `@${me.username}` + (c.version ? ` · last played on v${c.version}` : "") }),
+        status ? h("div.card-status", { text: status }) : null,
         me.hasCard ? h("dl.card-stats", {},
           h("div", {}, h("dt", { text: "Performance" }), h("dd", { text: fmt0.format(c.pp) + "pp" })),
           h("div", {}, h("dt", { text: "Accuracy" }), h("dd", { text: fmt2.format(c.accuracy) + "%" })),
           h("div", {}, h("dt", { text: "Level" }), h("dd", { text: "Lv" + c.level })),
-          h("div", {}, h("dt", { text: "Plays" }), h("dd", { text: fmt0.format(c.playCount) }))) : h("p.panel-sub", { text: "Play a chart in the game while signed in and your stats show up here." }),
-        h("div.me-actions", {},
-          me.hasCard && !me.banned ? h("a.btn", { href: "#/u/" + encodeURIComponent(me.playerId) }, "View public profile") : null,
-          h("button.btn.ghost", { type: "button", onclick: signOut }, "Sign out"))));
+          h("div", {}, h("dt", { text: "Plays" }), h("dd", { text: fmt0.format(c.playCount) }))) : h("p.panel-sub", { text: "Play a chart in the game while signed in and your stats show up here." })),
+      h("div.me-actions", {},
+        me.hasCard && !me.banned ? h("a.btn", { href: "#/u/" + encodeURIComponent(me.playerId) }, "Public profile") : null,
+        h("button.btn.ghost", { type: "button", onclick: signOut }, "Sign out")));
     setAvatar(head.querySelector(".card-avatar"), p);
     setRole(head, head.querySelector(".badge"), p);
-    const panels = [];
-    if (me.banned) panels.push(h("div.notice", { text: "This account is banned, so it can't be changed or appear in the ranking." }));
-    if (!me.hasCard) panels.push(h("div.notice", { text: "Your profile appears online after your first play in the game while signed in. Until then it can't be edited here." }));
-    if (me.hasCard && !me.banned) panels.push(supporterPanel(), picturePanel(), bioPanel());
-    if (me.hasCard && !me.banned && me.creator) panels.push(socialsPanel());
-    panels.push(discordPanel(), emailPanel(), passwordPanel());
-    app.replaceChildren(head, h("div.panels", {}, panels));
+    decorateCard(head, p);
+    return head;
+  }
+
+  function profilePage() {
+    const head = accountHead();
+    // one section at a time, picked from the side (a row of tabs on phones)
+    const editable = me.hasCard && !me.banned;
+    const tabs = [
+      editable && ["supporter", "♥ Supporter", supporterPanel],
+      editable && ["profile", "Picture & bio", () => h("div.split", {}, picturePanel(), bioPanel())],
+      editable && me.creator && ["socials", "Socials", socialsPanel],
+      ["discord", "Discord", discordPanel],
+      ["security", "Email & password", () => h("div.split", {}, emailPanel(), passwordPanel())],
+    ].filter(Boolean);
+    if (!tabs.some((t) => t[0] === accountTab)) accountTab = tabs[0][0];
+    const nav = h("nav.acc-nav", { "aria-label": "Account sections" });
+    const body = h("div.acc-body");
+    const show = () => {
+      nav.replaceChildren(...tabs.map(([id, label]) => h("button.acc-tab" + (id === accountTab ? ".on" : ""), { type: "button", onclick: () => { accountTab = id; show(); } }, label)));
+      const t = tabs.find((x) => x[0] === accountTab);
+      body.replaceChildren(t[2]());
+    };
+    show();
+    const notices = [];
+    if (me.banned) notices.push(h("div.notice", { text: "This account is banned, so it can't be changed or appear in the ranking." }));
+    if (!me.hasCard) notices.push(h("div.notice", { text: "Your profile appears online after your first play in the game while signed in. Until then it can't be edited here." }));
+    if (me.gifts && me.gifts.length) notices.push(h("button.gift-banner", { type: "button", onclick: () => giftPopup() }, `♥ You have ${me.gifts.length === 1 ? "a supporter gift" : me.gifts.length + " supporter gifts"} to claim`));
+    app.replaceChildren(head, ...notices, h("div.acc-layout", {}, nav, body));
     document.title = `${me.name} · OCTIVE`;
-    if (me.gifts && me.gifts.length) panels[0].before?.(h("button.gift-banner", { type: "button", onclick: () => giftPopup() }, `♥ You have ${me.gifts.length === 1 ? "a supporter gift" : me.gifts.length + " supporter gifts"} to claim`));
     setTimeout(giftPopup, 400);
   }
 
@@ -1236,13 +1261,22 @@
       });
     });
     return section(s.lifetime ? "Supporter · lifetime" : "Supporter", s.lifetime ? `Thank you! You've supported OCTIVE for ${monthsText(s.days)}.` : `Thank you! Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "long" })} · ${monthsText(s.days)} in total.`,
-      field("Coloured name", nameInput, "Bio codes, and it has to spell your name exactly: #g rainbow, #c red, #l bold, #RRGGBB any colour."),
-      h("div.name-preview-box", {}, namePrev), h("div.panel-actions", {}, saveName),
-      field("Profile effect", effSel), effPrev,
-      h("span.field-label", { text: "Banner" }), bannerPrev, h("div.panel-actions", {}, bannerBtn, looks.banner ? bannerDel : null, bannerIn),
-      h("span.field-label", { text: "Animated picture (GIF, up to 2 MB)" }), h("div.pic-row", {}, gifPrev, gifBtn, looks.gif ? gifDel : null, gifIn),
+      h("div.sup-edit", {},
+        h("div.sup-col", {},
+          field("Coloured name", nameInput, "Bio codes that spell your name exactly: #g rainbow, #c red, #l bold, #RRGGBB."),
+          h("div.name-row", {}, h("div.name-preview-box", {}, namePrev), saveName),
+          field("Profile effect", effSel), effPrev),
+        h("div.sup-col", {},
+          h("span.field-label", { text: "Banner" }), bannerPrev, h("div.panel-actions.left", {}, bannerBtn, looks.banner ? bannerDel : null, bannerIn),
+          h("span.field-label", { text: "Animated picture (GIF, up to 2 MB)" }), h("div.pic-row", {}, gifPrev, gifBtn, looks.gif ? gifDel : null, gifIn))),
       out,
       h("div.panel-actions", {}, h("a.btn", { href: "#/supporter" }, "Add more time")));
+  }
+
+  /** Redraws the Account page's header card with the latest looks. */
+  function refreshHead() {
+    const old = document.querySelector(".me-card");
+    if (old && me) old.replaceWith(accountHead());
   }
 
   async function saveLooks(body, out, okText) {
@@ -1250,6 +1284,7 @@
       const r = await callApi("/support/looks", body, true);
       me.looks = r.looks;
       setMsg(out, okText + " It shows in the game within a few minutes.", true);
+      refreshHead();
       return true;
     } catch (e) { setMsg(out, e.message); return false; }
   }
@@ -1258,6 +1293,59 @@
   function pingSeen() {
     if (!worker || document.hidden || !(store.get("octive.token", true) || store.get("octive.session"))) return;
     callApi("seen", {}, true).catch(() => {});
+  }
+
+  // ---------------------------------------------------------------- achievements (public, from the player's card)
+  let achDefs = null;
+  const loadAchDefs = () => achDefs ??= fetch("data/achievements.json?v=1.3.2").then((r) => r.json()).catch(() => []);
+  const ACH_COLOURS = { Milestones: "#8b7bff", Skill: "#4fd6e8", Supporter: "#ff6fae", "OCTIVE Remixes": "#f2c14e" };
+  const ACH_ICONS = { Milestones: "★", Skill: "✔", Supporter: "♥", "OCTIVE Remixes": "♪" };
+
+  function achievementsSection(p) {
+    const box = h("section.ach-section", {}, h("p.panel-sub", { text: "Loading achievements…" }));
+    loadAchDefs().then((defs) => {
+      const got = p.achievements || {};
+      const hasData = Object.keys(got).length > 0;
+      const count = defs.filter((d) => got[d.id]).length;
+      let tab = "All", all = false;
+      const groups = ["All", ...new Set(defs.map((d) => d.group))];
+      const grid = h("div.ach-grid");
+      const tabs = h("div.ach-tabs");
+      const more = h("button.btn.ghost.ach-more", { type: "button", onclick: () => { all = true; paint(); } });
+      const paint = () => {
+        tabs.replaceChildren(...groups.map((g) => {
+          const list = g === "All" ? defs : defs.filter((d) => d.group === g);
+          const n = list.filter((d) => got[d.id]).length;
+          const b = h("button.ach-tab" + (g === tab ? ".on" : ""), { type: "button", style: g === tab ? `--c:${ACH_COLOURS[g] || "#f2c14e"}` : "", onclick: () => { tab = g; all = false; paint(); } },
+            h("span", { text: (ACH_ICONS[g] ? ACH_ICONS[g] + " " : "") + g }), h("b", { text: `${n}/${list.length}` }));
+          return b;
+        }));
+        const list = (tab === "All" ? defs : defs.filter((d) => d.group === tab)).slice()
+          .sort((a, b) => (got[b.id] ? 1 : 0) - (got[a.id] ? 1 : 0) || (got[b.id] || "").localeCompare(got[a.id] || ""));
+        const shown = all ? list : list.slice(0, 12);
+        more.hidden = all || list.length <= 12;
+        more.textContent = `Show all ${list.length}`;
+        grid.replaceChildren(...shown.map((d) => {
+          const when = got[d.id];
+          const hide = !when && d.secret;
+          return h("div.ach-card" + (when ? ".got" : ""), { style: `--c:${ACH_COLOURS[d.group] || "#f2c14e"}`, title: hide ? "Secret achievement" : d.desc },
+            h("span.ach-icon", { text: when ? (ACH_ICONS[d.group] || "★") : "🔒" }),
+            h("div.ach-text", {},
+              h("b", { text: hide ? "Secret achievement" : d.title }),
+              h("span", { text: hide ? "Keep playing to find out." : d.desc }),
+              when ? h("span.ach-date", { text: "Unlocked " + new Date(when).toLocaleDateString(undefined, { dateStyle: "medium" }) }) : null));
+        }));
+      };
+      box.replaceChildren(
+        h("div.ach-head", {},
+          h("h2", { text: "Achievements" }),
+          h("span.ach-count", { text: `${count} / ${defs.length}` }),
+          h("div.bar.ach-bar", {}, h("div.fill", { style: `width:${defs.length ? Math.round(count / defs.length * 100) : 0}%` }))),
+        hasData ? null : h("p.panel-sub", { text: "Achievements show here once this player plays on version 1.3.2 or newer." }),
+        tabs, grid, more);
+      paint();
+    });
+    return box;
   }
 
   // ---------------------------------------------------------------- gifts wait to be claimed (pop-up on your own profile)
