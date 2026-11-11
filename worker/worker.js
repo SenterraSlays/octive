@@ -1241,6 +1241,21 @@ async function supportRoutes(request, env, url, ctx) {
     });
     return reply({ url: s.url });
   }
+  if (path === "/support/grant") {
+    // the developer (Senterra) gives supporter time for free
+    const b = await bodyOf(request);
+    const who = await signedIn(request, env);
+    if (who.playerId !== OWNER) fail(403, "Only the OCTIVE developer can gift supporter for free.");
+    const months = Math.round(Number(b.months));
+    if (!(months >= 1 && months <= 120)) fail(400, "Choose 1 to 120 months.");
+    const target = String(b.playerId || "");
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(target)) fail(400, "That player can't be found.");
+    const card = (await publicItems(config(env), target, ["card"])).card;
+    if (!card || moderation.bans[target]) fail(400, "That player can't be found (they need to have played online once).");
+    const id = "free-" + crypto.randomUUID();
+    const rec = await grantMonths(env, target, months, { id, amount_total: 0, currency: "usd", metadata: { gift: "1", buyer: who.playerId } });
+    return reply({ ok: true, name: card.name || "", status: supportStatus(rec, target) });
+  }
   if (path === "/support/me") {
     const who = await signedIn(request, env);
     const rec = await r2json(env, `supporters/${who.playerId}.json`, null);

@@ -491,3 +491,5 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
 .name-preview-box { padding: 12px 14px; border-radius: 10px; background: var(--row); border: 1px solid var(--line); font-size: 22px; font-weight: 700; margin: 6px 0; }
 .effect-preview { position: relative; height: 110px; border-radius: 12px; overflow: hidden; background: linear-gradient(135deg, #151829, #0c0e18); border: 1px solid var(--line); margin: 6px 0 14px; display: grid; place-items: center; color: var(--faint); font-size: 12px; }
 .banner-preview { aspect-ratio: 3 / 1; border-radius: 12px; background: var(--row) center / cover no-repeat; border: 1px solid var(--line); margin: 6px 0; }
+.btn.free-gift { margin-top: 8px; border-color: #ff6fae88; color: var(--pink); }
+.btn.free-gift:hover { background: #ff6fae18; }

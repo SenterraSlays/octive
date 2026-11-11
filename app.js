@@ -1073,6 +1073,7 @@
           h("button.link", { type: "button", onclick: () => { giftTo = ""; paintGift(); giftSearch.focus(); } }, "change"));
       } else if (giftTo === "") giftChosen.append(h("span", { text: "Who should get it?" }));
       giftSearch.hidden = !!giftTo; giftList.hidden = !!giftTo;
+      freeBtn.hidden = !(me && me.playerId === ROLE_OWNER && giftTo);
     };
     const searchGift = () => {
       giftList.textContent = "";
@@ -1080,7 +1081,9 @@
       if (!term || !data) return;
       for (const p of data.players.filter((x) => (x.name || "").toLowerCase().includes(term) && (!me || x.id !== me.playerId)).slice(0, 8))
         giftList.append(h("button.gift-pick", { type: "button", onclick: () => { giftTo = p.id; paintGift(); } }, h("span", { text: p.name }), h("span.dim", { text: "#" + fmt0.format(p.rank) })));
-      if (!giftList.children.length) giftList.append(h("p.panel-sub", { text: "Nobody by that name in the ranking. You can also gift from a player's profile in the game." }));
+      if (/^[A-Za-z0-9_-]{20,64}$/.test(giftSearch.value.trim()))
+        giftList.append(h("button.gift-pick", { type: "button", onclick: () => { giftTo = giftSearch.value.trim(); paintGift(); } }, h("span", { text: "Use this player ID" }), h("span.dim", { text: giftSearch.value.trim().slice(0, 10) + "…" })));
+      if (!giftList.children.length) giftList.append(h("p.panel-sub", { text: "Nobody by that name in the ranking. You can also gift from a player's profile in the game, or paste their player ID." }));
     };
     giftSearch.addEventListener("input", searchGift);
     forMe.addEventListener("click", () => { giftTo = null; paintGift(); });
@@ -1098,6 +1101,15 @@
       } catch (e) { setMsg(out, e.message); }
     }));
     const signHint = h("p.panel-sub.center");
+    // the developer can gift supporter time for free
+    const freeBtn = h("button.btn.wide.free-gift", { type: "button", hidden: true }, "♥ Gift for free (developer)");
+    freeBtn.addEventListener("click", () => busy(freeBtn, async () => {
+      setMsg(out, "");
+      try {
+        const r = await callApi("/support/grant", { playerId: giftTo, months }, true);
+        setMsg(out, `Gave ${months === 1 ? "1 month" : months + " months"} of supporter to ${r.name || "the player"} for free. They now have ${monthsText(r.status.days)} in total, until ${new Date(r.status.until).toLocaleDateString(undefined, { dateStyle: "medium" })}.`, true);
+      } catch (e) { setMsg(out, e.message); }
+    }));
 
     const status = h("div.sup-status");
     const page = h("div.supporter-page", {},
@@ -1114,7 +1126,7 @@
           h("div.seg-row", {}, forMe, forGift), giftBox,
           h("div.months-row", {}, monthsLabel, slider), quick,
           h("div.price-box", {}, total, h("div", {}, each, save)),
-          buy, out, signHint,
+          buy, freeBtn, out, signHint,
           h("p.fine", { text: "Payments are handled by Stripe; OCTIVE never sees your card. Time adds onto any time you already have. See the Terms for refunds." })),
         h("section.panel.perk-panel", {},
           h("h2", { text: "What you get" }),
