@@ -265,10 +265,10 @@ function reply(body, status = 200) {
   }));
 }
 
-async function bodyOf(request) {
+async function bodyOf(request, max = 400_000) {
   if (request.method !== "POST") fail(405, "Use POST.");
   const text = await request.text();
-  if (text.length > 400_000) fail(413, "That's too big.");
+  if (text.length > max) fail(413, "That's too big.");
   try { return text ? JSON.parse(text) : {}; } catch { fail(400, "The request wasn't valid JSON."); }
 }
 
@@ -1069,6 +1069,7 @@ function withWeb(p, web) {
 const MONTH_MS = 30.4375 * 86_400_000;
 const PRICE_CENTS = 250;
 const MAX_MONTHS = 24;
+const GIF_MAX = 8 * 1048576; // supporters' animated pictures
 const LIFETIME_SUPPORTERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE"]; // Senterra
 const OWNER = "PlwcYVKV9y7NBFWfUaC263XpCFbE"; // everyone follows the developer
 const MILESTONES = [[0, "new"], [1, "1 month"], [3, "3 months"], [6, "6 months"], [12, "1 year"], [24, "2 years"], [36, "3 years"], [48, "4 years"], [60, "5 years"], [120, "10 years"]];
@@ -1303,9 +1304,27 @@ async function supportRoutes(request, env, url, ctx) {
     const looks = await r2json(env, `looks/${who.playerId}.json`, {});
     return reply({ ...supportStatus(rec, who.playerId), looks, history: (rec?.purchases || []).map((p) => ({ at: p.at, months: p.months, amount: p.amount, currency: p.currency })) });
   }
+  if (path === "/support/gif") {
+    // a supporter's animated picture, sent as the raw file (up to 8 MB; base64 JSON would be too slow)
+    if (request.method !== "POST") fail(405, "Use POST.");
+    const who = await signedIn(request, env);
+    const st = supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId);
+    if (!st.active) fail(403, "This is a supporter perk.");
+    const len = Number(request.headers.get("Content-Length") || 0);
+    if (len > GIF_MAX) fail(413, "That GIF is too big (8 MB at most).");
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.length > GIF_MAX) fail(413, "That GIF is too big (8 MB at most).");
+    if (bytes.length < 20 || !(bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46)) fail(400, "That isn't a GIF.");
+    await env.RELEASES.put(`looks/gif/${who.playerId}.gif`, bytes, { httpMetadata: { contentType: "image/gif" } });
+    const looks = await r2json(env, `looks/${who.playerId}.json`, {});
+    looks.gif = Date.now().toString(36) + bytes.length.toString(36); // a version for caches
+    await r2put(env, `looks/${who.playerId}.json`, looks);
+    supportIndex = null;
+    return reply({ ok: true, looks });
+  }
   if (path === "/support/looks") {
     // supporters: name colours (bio codes), profile effect, banner picture, animated GIF profile picture
-    const b = await bodyOf(request);
+    const b = await bodyOf(request, 2_500_000);
     const who = await signedIn(request, env);
     const st = supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId);
     if (!st.active) fail(403, "This is a supporter perk.");
@@ -1335,7 +1354,7 @@ async function supportRoutes(request, env, url, ctx) {
     if (b.gif !== undefined) {
       if (!b.gif) { looks.gif = ""; await env.RELEASES.delete(`looks/gif/${who.playerId}.gif`); }
       else {
-        if (!/^[A-Za-z0-9+/=]{100,2800000}$/.test(String(b.gif))) fail(400, "That GIF is too big (2 MB at most).");
+        if (!/^[A-Za-z0-9+/=]{100,2400000}$/.test(String(b.gif))) fail(400, "That GIF is too big here; upload it with the GIF button.");
         const bytes = b64Bytes(String(b.gif));
         if (!(bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46)) fail(400, "That isn't a GIF.");
         await env.RELEASES.put(`looks/gif/${who.playerId}.gif`, bytes, { httpMetadata: { contentType: "image/gif" } });

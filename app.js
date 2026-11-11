@@ -1061,7 +1061,7 @@
       ["Account banner", "A banner picture across the top of your profile, in the game and on the website."],
       ["Coloured name", "Colour and style your name with the same codes as bios: rainbow, bold, any colour."],
       ["Profile effects", "Sparkles, snow, hearts, embers, stars, aurora or rain over your profile card."],
-      ["Animated picture", "A GIF profile picture that's animated everywhere it shows."],
+      ["Animated picture", "A GIF profile picture (up to 8 MB) that's animated everywhere it shows."],
       ["Name changes any time", "No waiting between name changes."],
       ["Leaderboard border", "A pink supporter border on your leaderboard rows."],
       ["Lifetime statistics", "Your total time supporting shows on your profile and never resets, even with gaps."],
@@ -1252,12 +1252,21 @@
     gifIn.addEventListener("change", async () => {
       const file = gifIn.files && gifIn.files[0]; gifIn.value = "";
       if (!file) return;
-      if (file.size > 2 * 1048576) return setMsg(out, "That GIF is too big (2 MB at most).");
+      if (file.size > 8 * 1048576) return setMsg(out, `That GIF is ${(file.size / 1048576).toFixed(1)} MB; 8 MB at most.`);
       await busy(gifBtn, async () => {
-        const buf = new Uint8Array(await file.arrayBuffer());
-        let bin = ""; for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-        const b64 = btoa(bin);
-        if (await saveLooks({ gif: b64 }, out, "Animated picture saved.")) { const img = gifPrev.querySelector("img"); img.src = "data:image/gif;base64," + b64; img.hidden = false; }
+        setMsg(out, "Uploading…", true);
+        // the raw file (not base64 JSON), with the sign-in refreshed once if it ran out
+        const send = () => fetch(worker + "/support/gif", { method: "POST", headers: { "Content-Type": "image/gif", Authorization: "Bearer " + (store.get("octive.token", true) || "") }, body: file });
+        try {
+          let res = await send();
+          if (res.status === 401 && await refreshSession()) res = await send();
+          const r = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(r.error || "Upload failed (" + res.status + ").");
+          me.looks = r.looks;
+          setMsg(out, "Animated picture saved. It shows in the game within a few minutes.", true);
+          const img = gifPrev.querySelector("img"); img.src = URL.createObjectURL(file); img.hidden = false;
+          refreshHead();
+        } catch (e) { setMsg(out, e.message); }
       });
     });
     return section(s.lifetime ? "Supporter · lifetime" : "Supporter", s.lifetime ? `Thank you! You've supported OCTIVE for ${monthsText(s.days)}.` : `Thank you! Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "long" })} · ${monthsText(s.days)} in total.`,
@@ -1268,7 +1277,7 @@
           field("Profile effect", effSel), effPrev),
         h("div.sup-col", {},
           h("span.field-label", { text: "Banner" }), bannerPrev, h("div.panel-actions.left", {}, bannerBtn, looks.banner ? bannerDel : null, bannerIn),
-          h("span.field-label", { text: "Animated picture (GIF, up to 2 MB)" }), h("div.pic-row", {}, gifPrev, gifBtn, looks.gif ? gifDel : null, gifIn))),
+          h("span.field-label", { text: "Animated picture (GIF, up to 8 MB)" }), h("div.pic-row", {}, gifPrev, gifBtn, looks.gif ? gifDel : null, gifIn))),
       out,
       h("div.panel-actions", {}, h("a.btn", { href: "#/supporter" }, "Add more time")));
   }
