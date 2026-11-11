@@ -1,0 +1,14 @@
+# Deploys the rankings + updates Worker:  npx wrangler deploy --keep-vars   (from this folder)
+# Secrets (UGS_KEY_ID, UGS_SECRET_KEY, UGS_PROJECT_ID, UGS_ENVIRONMENT_ID) live in Cloudflare and are kept on deploy.
+# Email for account codes (website): secret BREVO_API_KEY and variable MAIL_FROM (a sender verified in Brevo):
+#   npx wrangler secret put BREVO_API_KEY      npx wrangler secret put MAIL_FROM
+name = "octive-rankings-api"
+main = "worker.js"
+compatibility_date = "2026-11-10"
+workers_dev = true
+preview_urls = false
+
+# game updates (Tools/publish_release.py uploads here; the Worker serves /releases/...)
+[[r2_buckets]]
+binding = "RELEASES"
+bucket_name = "octive-releases"

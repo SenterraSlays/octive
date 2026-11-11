@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OCTIVE Rankings</title>
+  <title>OCTIVE</title>
   <meta name="description" content="Global performance ranking for OCTIVE, the vertical scrolling rhythm game.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=1.2.0">
+  <link rel="stylesheet" href="style.css?v=1.2.1">
   <link rel="icon" href="logo.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="logo-512.png">
 </head>
@@ -19,8 +19,10 @@
       <span>OCTIVE</span>
     </a>
     <nav>
-      <a href="#/" data-nav="rankings">Rankings</a>
-      <a id="download-link" href="#" hidden>Download</a>
+      <a href="#/" data-nav="home">Home</a>
+      <a href="#/rankings" data-nav="rankings">Rankings</a>
+      <a href="#/download" data-nav="download">Download</a>
+      <a href="#/account" data-nav="account" class="nav-account">Sign in</a>
     </nav>
     <span class="updated" id="updated"></span>
   </header>
@@ -28,8 +30,8 @@
   <main id="app" aria-live="polite"></main>
 
   <footer class="foot">
-    <span>Live rankings from the game's online accounts.</span>
-    <span>Performance points: best play per chart, weighted 100%, 95%, 90%…</span>
+    <span>OCTIVE · a free vertical scrolling rhythm game</span>
+    <span><a href="#/download">Download</a> · <a href="#/rankings">Rankings</a> · <a href="#/account">Account</a></span>
   </footer>
 
   <template id="tpl-rankings">
@@ -78,7 +80,7 @@
   </template>
 
   <template id="tpl-player">
-    <a class="back" href="#/">← All players</a>
+    <a class="back" href="#/rankings">← All players</a>
     <article class="card">
       <span class="card-rank"></span>
       <div class="card-avatar"><img alt="" hidden><span class="initial"></span><span class="dot" hidden></span></div>
@@ -109,6 +111,6 @@
     <section class="socials" hidden><h2>Socials</h2><div class="social-links"></div></section>
   </template>
 
-  <script src="app.js?v=1.2.0"></script>
+  <script src="app.js?v=1.2.1"></script>
 </body>
 </html>
