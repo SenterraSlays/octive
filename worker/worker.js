@@ -17,7 +17,7 @@
 // pictures, badges) is read here too, so banned players disappear from the site as well.
 
 const LEADERBOARD = "global-pp";
-const TOP = 50;                    // players shown
+const TOP = 100;                   // players shown
 const BOARD_TTL = 60_000;          // ranking refresh
 const CARD_TTL = 3 * 60_000;       // public card + online status refresh
 const CARD_FETCH_BUDGET = 40;      // cards fetched per request (Cloudflare free plan: 50 subrequests)
