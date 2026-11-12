@@ -748,6 +748,23 @@ async function discordVerified(request, body) {
 
 const dReply = (data) => new Response(JSON.stringify({ type: 4, data }), { headers: { "Content-Type": "application/json" } });
 const fmtN = (n, d = 0) => Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+/** Gives the visible letters of a coloured name the capitals of the real name ("#ff0000senterra" -> "#ff0000Senterra"). */
+function fixNameCase(style, name) {
+  const code = /##|#\[[0-9a-fA-F]{6}\]|#[0-9a-fA-F]{6}|#[0-9a-fA-FlonmkgrLONMKGR]/y;
+  let out = "", k = 0;
+  for (let i = 0; i < style.length;) {
+    code.lastIndex = i;
+    const m = code.exec(style);
+    if (m) {
+      if (m[0] === "##") { out += "##"; k++; } else out += m[0];
+      i += m[0].length;
+      continue;
+    }
+    out += k < name.length && style[i].toLowerCase() === name[k].toLowerCase() ? name[k] : style[i];
+    k++; i++;
+  }
+  return out;
+}
 const stripBio = (s) => String(s || "").replace(/#\[[0-9a-fA-F]{6}\]|#[0-9a-fA-F]{6}|#[0-9a-fA-FlonmkgrLONMKGR]/g, "").replace(/##/g, "#").trim();
 
 function playTimeText(ms) { const m = Math.floor((ms || 0) / 60000); return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`; }
@@ -1478,11 +1495,13 @@ async function supportRoutes(request, env, url, ctx) {
     if (!st.active) fail(403, "This is a supporter perk.");
     const looks = await r2json(env, `looks/${who.playerId}.json`, {});
     if (b.nameStyle !== undefined) {
-      const style = String(b.nameStyle || "").slice(0, 200);
+      let style = String(b.nameStyle || "").slice(0, 200);
       const plain = stripBio(style);
       const card = (await publicItems(config(env), who.playerId, ["card"])).card || {};
       const name = String(card.name || who.username || "");
-      if (style && plain !== name) fail(400, `The coloured name has to spell your name exactly ("${name}").`);
+      // capitals don't have to match: they're taken from the real name
+      if (style && plain !== name && plain.toLowerCase() === name.toLowerCase()) style = fixNameCase(style, name);
+      if (style && stripBio(style) !== name) fail(400, `The coloured name has to spell your name ("${name}"). Got "${plain}".`);
       looks.nameStyle = style;
     }
     if (b.effect !== undefined) {

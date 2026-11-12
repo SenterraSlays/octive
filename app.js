@@ -1364,7 +1364,7 @@
         : `Thank you! Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "long" })} · ${monthsText(s.days)} in total.`,
       h("div.sup-edit", {},
         h("div.sup-col", {},
-          field("Coloured name", nameInput, "Bio codes that spell your name exactly: #g rainbow, #c red, #l bold, #RRGGBB."),
+          field("Coloured name", nameInput, "Codes, then the letters of your name: #g rainbow, #c red, #l bold, #RRGGBB (like #ffb3baS#ffdfbae…). Capitals are matched to your name when you save."),
           h("div.name-row", {}, h("div.name-preview-box", {}, namePrev), saveName),
           field("Profile effect", effSel), effPrev),
         h("div.sup-col", {},
@@ -1384,6 +1384,12 @@
     try {
       const r = await callApi("/support/looks", body, true);
       me.looks = r.looks;
+      // the server matches the name's capitals: show what was saved
+      if (body.nameStyle !== undefined && r.looks && typeof r.looks.nameStyle === "string") {
+        const box = document.querySelector(".name-preview-box");
+        const input = box && box.closest(".sup-col") ? box.closest(".sup-col").querySelector("input[type=text]") : null;
+        if (input && input.value !== r.looks.nameStyle) { input.value = r.looks.nameStyle; input.dispatchEvent(new Event("input")); }
+      }
       setMsg(out, okText + " It shows in the game within a few minutes.", true);
       refreshHead();
       return true;
