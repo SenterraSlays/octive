@@ -232,6 +232,17 @@
         setAvatar(r.querySelector(".avatar"), p);
         setRole(r, r.querySelector(".badge"), p);
         if (isSupporter(p)) { r.classList.add("supporter"); const pill = supporterPill(p); pill.classList.add("rank"); r.querySelector(".player").append(pill); }
+        // name and badges together; on phones the badges go on their own line under the name
+        {
+          const player = r.querySelector(".player"), nameEl = r.querySelector(".name");
+          const who = h("span.who"), tags = h("span.tags");
+          nameEl.replaceWith(who);
+          who.append(nameEl, tags);
+          for (const el of [...player.children]) if (el.matches(".badge, .sup-pill")) tags.append(el);
+          const gp = gifterPill(p);
+          if (gp) tags.append(gp);
+          if (![...tags.children].some((el) => !el.hidden)) tags.remove();
+        }
         r.querySelector(".acc").textContent = fmt2.format(p.accuracy || 0) + "%";
         r.querySelector(".lvl").textContent = "Lv" + (p.level || 1);
         r.querySelector(".plays").textContent = fmt0.format(p.playCount || 0);
@@ -920,7 +931,12 @@
   const STATUS_TEXT = { desktop: "Online Desktop", mobile: "Online Mobile", web: "Online Website", site: "Viewing Website" };
   /** "Online Desktop", "Viewing Website", "Last online 3 hours ago"… */
   function statusText(p) {
-    if (p.online) return STATUS_TEXT[p.status] || "Online";
+    if (p.online) {
+      // test builds report "desktop-dev" etc.: "Online Desktop - Playing DEV Build"
+      const dev = /-dev$/.test(p.status || "");
+      const base = STATUS_TEXT[(p.status || "").replace(/-dev$/, "")] || "Online";
+      return dev ? base + " - Playing DEV Build" : base;
+    }
     return p.lastSeen ? "Last online " + ago(p.lastSeen) : "Offline";
   }
 
@@ -930,6 +946,19 @@
   const usd = (cents) => "$" + (cents / 100).toFixed(2);
   const MILESTONE_ART = [[36, "3y", "36 months"], [12, "1y", "12 months"], [6, "6m", "6 months"], [3, "3m", "3 months"], [1, "1m", "1 month"], [0, "new", "New supporter"]];
   const milestoneArt = (months) => (MILESTONE_ART.find(([m]) => months >= m) || MILESTONE_ART[MILESTONE_ART.length - 1]);
+  // gifter badges: months of supporter bought for other players
+  const GIFTER_ART = [[36, "star", "Star Gifter", "36+"], [24, "platinum", "Platinum Gifter", "24–35"], [12, "gold", "Gold Gifter", "12–23"], [6, "silver", "Silver Gifter", "6–11"], [3, "bronze", "Bronze Gifter", "3–5"], [1, "starter", "Gift Starter", "1–2"]];
+  const gifterArt = (months) => GIFTER_ART.find(([m]) => months >= m) || null;
+  const giftedOf = (p) => (p && (p.gifted || (p.supporter && p.supporter.gifted))) || 0;
+  const supporterNoOf = (p) => { const n = p && (p.supporterNo != null ? p.supporterNo : p.supporter && p.supporter.number); return n == null ? null : n; };
+  const supporterNoText = (n) => "Supporter #" + String(n).padStart(4, "0");
+
+  function gifterPill(p) {
+    const g = giftedOf(p), art = gifterArt(g);
+    if (!art) return null;
+    return h("span.sup-pill.small.gifter", { title: `${art[2]} · ${monthsGiftedText(g)} gifted to other players` }, h("img", { src: `badges/gifter-${art[1]}.png`, alt: art[2] }));
+  }
+  const monthsGiftedText = (m) => `${fmt0.format(m)} month${m === 1 ? "" : "s"}`;
   const EFFECT_NAMES = { none: "None", sparkles: "Sparkles", snow: "Snow", hearts: "Hearts", embers: "Embers", stars: "Stars", aurora: "Aurora", rain: "Rain" };
   const monthsText = (days) => { const m = Math.floor((days || 0) / 30.4375); return m >= 12 ? `${Math.floor(m / 12)} year${m >= 24 ? "s" : ""}${m % 12 ? ` ${m % 12} month${m % 12 === 1 ? "" : "s"}` : ""}` : m >= 1 ? `${m} month${m === 1 ? "" : "s"}` : `${Math.max(0, Math.floor(days || 0))} day${Math.floor(days) === 1 ? "" : "s"}`; };
   const isSupporter = (p) => !!(p && p.supporter && p.supporter.active);
@@ -1015,7 +1044,8 @@
 
   /** Supporter decoration on a profile card: banner, effect, pill, coloured name. */
   function decorateCard(card, p) {
-    if (!isSupporter(p)) return;
+    const gp = gifterPill(p), row0 = card.querySelector(".card-name-row");
+    if (!isSupporter(p)) { if (gp && row0) row0.append(gp); return; }
     const s = p.supporter;
     card.classList.add("supporter");
     if (s.banner && worker) {
@@ -1026,24 +1056,32 @@
     const nameEl = card.querySelector(".card-name");
     if (nameEl) nameInto(nameEl, p);
     const row = card.querySelector(".card-name-row");
-    if (row) row.append(supporterPill(p));
+    if (row) { row.append(supporterPill(p)); if (gp) row.append(gp); }
   }
 
   /** Lifetime supporter statistics and the anniversary badges earned. */
   function supporterSection(p) {
-    const s = p.supporter;
-    if (!s || (!s.active && !(s.days > 0))) return null;
-    const earned = MILESTONE_ART.slice().reverse().filter(([m]) => (s.months || 0) >= m);
+    const s = p.supporter, gifted = giftedOf(p), no = supporterNoOf(p);
+    const isSup = s && (s.active || s.days > 0);
+    if (!isSup && !gifted && no == null) return null;
+    const earned = isSup ? MILESTONE_ART.slice().reverse().filter(([m]) => (s.months || 0) >= m) : [];
+    const gifts = GIFTER_ART.slice().reverse().filter(([m]) => gifted >= m);
+    const title = !isSup ? "OCTIVE gifter" : s.lifetime ? "Lifetime supporter" : s.booster ? "OCTIVE supporter · Server Booster" : s.active ? "OCTIVE supporter" : "Former supporter";
     return h("section.sup-section", {},
-      h("h2", { text: s.lifetime ? "Lifetime supporter" : s.booster ? "OCTIVE supporter · Server Booster" : s.active ? "OCTIVE supporter" : "Former supporter" }),
-      h("div.tiles", {},
+      h("div.sup-title", {}, h("h2", { text: title }), no != null ? h("span.sup-no", { title: "Every supporter's number, in the order they first supported OCTIVE", text: supporterNoText(no) }) : null),
+      isSup ? null : h("div.tiles", {},
+        h("div.tile", {}, h("span", { text: "Months gifted to others" }), h("b", { text: monthsGiftedText(gifted) }))),
+      !isSup ? null : h("div.tiles", {},
         h("div.tile", {}, h("span", { text: "Supported for" }), h("b", { text: monthsText(s.days) })),
         h("div.tile", {}, h("span", { text: "Since" }), h("b", { text: s.since ? new Date(s.since).toLocaleDateString(undefined, { month: "short", year: "numeric" }) : "—" })),
         s.lifetime ? h("div.tile", {}, h("span", { text: "Until" }), h("b", { text: "Forever" }))
           : s.booster ? h("div.tile", {}, h("span", { text: "Until" }), h("b", { text: "Server Booster" }))
           : s.active && s.until ? h("div.tile", {}, h("span", { text: "Until" }), h("b", { text: new Date(s.until).toLocaleDateString(undefined, { dateStyle: "medium" }) })) : null,
-        h("div.tile", {}, h("span", { text: "Months bought" }), h("b", { text: fmt0.format(s.totalMonthsBought || 0) }))),
-      h("div.sup-earned", {}, earned.map(([, key, label]) => h("figure", {}, h("img", { src: `badges/supporter-${key}.png`, alt: "" }), h("figcaption", { text: label })))));
+        h("div.tile", {}, h("span", { text: "Months bought" }), h("b", { text: fmt0.format(s.totalMonthsBought || 0) })),
+        h("div.tile", {}, h("span", { text: "Months gifted to others" }), h("b", { text: monthsGiftedText(gifted) }))),
+      h("div.sup-earned", {},
+        earned.map(([, key, label]) => h("figure", {}, h("img", { src: `badges/supporter-${key}.png`, alt: "" }), h("figcaption", { text: label }))),
+        gifts.map(([, key, label]) => h("figure", { title: `${monthsGiftedText(gifted)} gifted to other players` }, h("img", { src: `badges/gifter-${key}.png`, alt: "" }), h("figcaption", { text: label })))));
   }
 
   /** Followers / following, a Follow button and Gift supporter. */
@@ -1253,6 +1291,10 @@
         h("h2", { text: "Anniversary badges" }),
         h("p.panel-sub", { text: "Earned from your total time as a supporter. Gaps never reset it." }),
         h("div.sup-earned.big", {}, MILESTONE_ART.slice().reverse().map(([, key, label]) => h("figure", {}, h("img", { src: `badges/supporter-${key}.png`, alt: "" }), h("figcaption", { text: label }))))),
+      h("section.panel.milestones", {},
+        h("h2", { text: "Gifter badges" }),
+        h("p.panel-sub", { text: "Earned by gifting supporter to other players: every month you gift counts. Everyone who buys supporter also gets a Supporter number (#0001, #0002…) in the order they first supported OCTIVE." }),
+        h("div.sup-earned.big", {}, GIFTER_ART.slice().reverse().map(([, key, label, range]) => h("figure", {}, h("img", { src: `badges/gifter-${key}.png`, alt: "" }), h("figcaption", { text: `${label} · ${range} months` }))))),
       h("section.panel.wall", {}, h("h2", { text: "Supporters" }), h("div.wall-list", {}, h("p.panel-sub", { text: "Loading…" }))));
     app.replaceChildren(page);
     upd(); paintGift();
@@ -1538,7 +1580,7 @@
       ["An osu! song won't play", "Some osu! maps have audio that's really an MP4 file with an .mp3 name. OCTIVE 1.4 plays these on Windows. If a song still fails, re-import it or report it in the Discord."],
       ["osu! maps scroll strangely", "Turn off osu! scroll speed changes in Settings → Gameplay for a constant speed, like osu!'s constant speed option."],
       ["Where are my files?", "Settings → Profile & data shows the data folder (songs, replays, skins and settings) with an Open folder button."],
-      ["Something else?", "Ask in the OCTIVE Discord server or open an issue at github.com/SenterraSlays/octive-rankings/issues."],
+      ["Something else?", "Ask in the OCTIVE Discord server or open an issue at github.com/SenterraSlays/octive/issues."],
     ]],
   ];
 

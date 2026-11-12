@@ -232,7 +232,7 @@ async function release(env, key, request) {
   // (the installer keeps one name and is replaced when it changes)
   const mutable = key === "latest.json" || key === "OCTIVE-Installer.exe";
   h.set("Cache-Control", mutable ? "no-cache, max-age=0" : "public, max-age=31536000, immutable");
-  if (ext !== "json") h.set("Content-Disposition", `attachment; filename="${key}"`);
+  if (ext !== "json") h.set("Content-Disposition", `attachment; filename="${key.split("/").pop()}"`);
   h.set("ETag", obj.httpEtag);
   if (obj.range && range) {
     const off = obj.range.offset ?? 0, len = obj.range.length ?? obj.size - off;
@@ -730,7 +730,7 @@ async function webFile(env, version, path, request) {
 
 const DISCORD_APP_ID = "1569883934827745330";
 const DISCORD_PUBLIC_KEY = "57eae870ba2f5c8833c8c2df8ee0552e5a2d034eb3409d2a747545921c491e6b";
-const SITE = "https://senterraslays.github.io/octive-rankings/";
+const SITE = "https://senterraslays.github.io/octive/";
 const WORKER_BASE = "https://octive-rankings-api.lunalazum18.workers.dev";
 const EPHEMERAL = 64;
 const BADGE_EMOJI = { DEV: "🛠️ DEV", MOD: "🛡️ MOD", CREATOR: "🎬 CREATOR", CHARTER: "🎼 CHARTER", VIP: "⭐ VIP", TESTER: "🧪 TESTER" };
@@ -815,7 +815,7 @@ function profileEmbed(p) {
       { name: "Play time", value: playTimeText(p.playTimeMs), inline: true },
       { name: "Status", value: p.online ? "🟢 " + statusText(p) : p.lastSeen ? `Last online ${agoText(p.lastSeen)}` : "Offline", inline: true },
     ],
-    footer: { text: "OCTIVE · senterraslays.github.io/octive-rankings" },
+    footer: { text: "OCTIVE · senterraslays.github.io/octive" },
   };
   if (p.avatarHash) e.thumbnail = { url: `${WORKER_BASE}/avatar/${encodeURIComponent(p.id)}?v=${encodeURIComponent(p.avatarHash)}` };
   return e;
@@ -984,13 +984,13 @@ async function discordInteraction(request, env, ctx) {
     // the "thinking…" message's visibility was chosen when deferring; an edit can't change it
     delete msg.flags;
     const res = await fetch(`https://discord.com/api/v10/webhooks/${DISCORD_APP_ID}/${it.token}/messages/@original`, {
-      method: "PATCH", headers: { "Content-Type": "application/json", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive-rankings, 1.0)" }, body: JSON.stringify(msg),
+      method: "PATCH", headers: { "Content-Type": "application/json", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" }, body: JSON.stringify(msg),
     });
     if (!res.ok) {
       console.log("discord edit failed", res.status, (await res.text()).slice(0, 500));
       // last try: plain text, so the command never hangs on "thinking"
       await fetch(`https://discord.com/api/v10/webhooks/${DISCORD_APP_ID}/${it.token}/messages/@original`, {
-        method: "PATCH", headers: { "Content-Type": "application/json", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive-rankings, 1.0)" },
+        method: "PATCH", headers: { "Content-Type": "application/json", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" },
         body: JSON.stringify({ content: msg.content || "Something went wrong showing that. Try again in a moment.", embeds: [] }),
       });
     }
@@ -1085,7 +1085,8 @@ async function chartScores(request, env, url) {
 
 // ---------------------------------------------------------------- what a player is on
 /** The game's "platform" tag: desktop, mobile or web (the browser build). */
-function platformStatus(tag) { return tag === "desktop" || tag === "mobile" || tag === "web" ? tag : "game"; }
+// "desktop", "mobile", "web", and the same with "-dev" for test builds ("Online Desktop - Playing DEV Build")
+function platformStatus(tag) { return /^(desktop|mobile|web)(-dev)?$/.test(tag || "") ? tag : "game"; }
 const WEB_MS = 4 * 60_000; // "Viewing Website" while the site pinged this recently
 let webIndex = null, webIndexAt = 0;
 /** Signed-in website visitors: webseen/<playerId> objects, by upload time (cached 30 s). */
@@ -1267,11 +1268,35 @@ function supportStatus(rec, playerId, boost) {
 }
 
 let supportIndex = null, supportIndexAt = 0;
+/** Months each player gifted to others (paid gifts, claimed or waiting) and Supporter numbers. */
+let giftedIndex = {}, numberIndex = {};
+
+/**
+ * Supporter numbers: everyone who has bought supporter (for themselves or as a gift) gets one, in the order
+ * of their first purchase, and keeps it (supporter-ids.json). The developer is Supporter #0000.
+ */
+async function assignNumbers(env, firstBuy) {
+  const book = await r2json(env, "supporter-ids.json", { next: 1, ids: {} });
+  book.ids ||= {}; book.next ||= 1;
+  book.ids[OWNER] = 0;
+  const fresh = Object.entries(firstBuy).filter(([id]) => !(id in book.ids)).sort((a, b) => a[1] - b[1]);
+  for (const [id] of fresh) book.ids[id] = book.next++;
+  if (fresh.length || book.ids[OWNER] !== 0) await r2put(env, "supporter-ids.json", book);
+  return book.ids;
+}
+
 /** Every supporter (active or with time on record) and their looks, cached a minute. */
 async function supporters(env) {
   if (supportIndex && Date.now() - supportIndexAt < 60_000) return supportIndex;
   const out = {};
   const ids = new Set(LIFETIME_SUPPORTERS);
+  const gifted = {}, firstBuy = {};
+  const bought = (id, at, months, gift) => {
+    if (!id || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return;
+    const t = Date.parse(at) || Date.now();
+    if (!(id in firstBuy) || t < firstBuy[id]) firstBuy[id] = t;
+    if (gift) gifted[id] = (gifted[id] || 0) + (months || 0);
+  };
   let cursor;
   do {
     const list = await env.RELEASES.list({ prefix: "supporters/", cursor });
@@ -1284,16 +1309,38 @@ async function supporters(env) {
     for (const o of list.objects) { const id = o.key.slice(9, -5); ids.add(id); boosts[id] = true; }
     cursor = list.truncated ? list.cursor : undefined;
   } while (cursor);
+  // gifts bought but not claimed yet
+  do {
+    const list = await env.RELEASES.list({ prefix: "gifts/", cursor });
+    await Promise.all(list.objects.map(async (o) => {
+      const g = await r2json(env, o.key, { pending: [] });
+      for (const x of g.pending || []) if (!x.free && x.amount > 0) bought(x.from, x.at, x.months, true);
+    }));
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
   await Promise.all([...ids].map(async (id) => {
     const rec = await r2json(env, `supporters/${id}.json`, null);
+    for (const p of rec?.purchases || []) {
+      if (!(p.amount > 0)) continue; // free gifts from the developer aren't purchases
+      if (p.gift) bought(p.gift, p.at, p.months, true);
+      else bought(id, p.at, p.months, false);
+    }
     const boost = boosts[id] ? await r2json(env, `boosters/${id}.json`, null) : null;
     const st = supportStatus(rec, id, boost);
     if (!st.active && st.days <= 0) return;
     const looks = st.active ? await r2json(env, `looks/${id}.json`, {}) : {};
     out[id] = { ...st, nameStyle: looks.nameStyle || "", effect: looks.effect || "none", banner: looks.banner || "", gif: looks.gif || "" };
   }));
+  try { numberIndex = await assignNumbers(env, firstBuy); } catch (e) { console.log("supporter numbers", e && e.message); }
+  giftedIndex = gifted;
+  for (const [id, st] of Object.entries(out)) { st.gifted = gifted[id] || 0; if (id in numberIndex) st.number = numberIndex[id]; }
   supportIndex = out; supportIndexAt = Date.now();
   return out;
+}
+
+/** What the website shows for any player: months gifted to others and their Supporter number. */
+function giftInfo(id) {
+  return { gifted: giftedIndex[id] || 0, supporterNo: id in numberIndex ? numberIndex[id] : null };
 }
 
 /** Following: everyone follows the developer (can't be undone); anyone else can be followed. */
@@ -1378,7 +1425,7 @@ async function supportRoutes(request, env, url, ctx) {
     for (let m = 1; m <= MAX_MONTHS; m++) tiers.push({ months: m, cents: priceFor(m), discount: discountFor(m) });
     return reply({ monthly: PRICE_CENTS, currency: "usd", tiers, effects: EFFECTS });
   }
-  if (path === "/support/all") return reply({ supporters: await supporters(env), owner: OWNER });
+  if (path === "/support/all") { const all = await supporters(env); return reply({ supporters: all, owner: OWNER, gifted: giftedIndex, numbers: numberIndex }); }
   if (path === "/stripe/webhook" && request.method === "POST") {
     const body = await request.text();
     if (!(await stripeSignatureOk(env, request.headers.get("Stripe-Signature"), body))) return new Response("bad signature", { status: 400 });
@@ -1817,6 +1864,28 @@ async function dmRoutes(request, env, url) {
   fail(404, "Not found.");
 }
 
+// ---------------------------------------------------------------- test builds (testers only)
+// Tools/publish_release.py --test N uploads test/OCTIVE-<v>-test<N>-windows.zip / -android.apk and test.json;
+// only testers (the TESTER badge) and developers can read them. The browser test build lives under
+// web/t-<random id>/, an address only test.json gives out.
+let testersCheckedAt = 0;
+async function isTester(request, env) {
+  if (Date.now() - testersCheckedAt > 5 * 60_000) { testersCheckedAt = Date.now(); try { await loadModeration(config(env)); } catch { /* keep the old lists */ } }
+  const who = await signedIn(request, env);
+  const badges = badgesOf(who.playerId);
+  return badges.includes("TESTER") || badges.includes("DEV") || who.playerId === OWNER;
+}
+
+async function testRelease(request, env, key) {
+  try {
+    if (!(await isTester(request, env))) return reply({ error: "Test builds are for testers." }, 403);
+  } catch (e) { return reply({ error: e.expose ? e.message : "Sign in first." }, e.status || 401); }
+  const res = await release(env, key, request);
+  const h = new Headers(res.headers);
+  h.set("Cache-Control", "private, no-store");
+  return new Response(res.body, { status: res.status, headers: h });
+}
+
 export default {
   // every 6 hours: who still boosts the Discord server (wrangler.toml [triggers] crons)
   async scheduled(event, env, ctx) {
@@ -1853,14 +1922,17 @@ export default {
         let sup = {}, web = {};
         try { sup = await supporters(env); } catch { /* none */ }
         try { web = await webVisitors(env); } catch { /* none */ }
-        const players = board.players.map((p) => withWeb({ ...p, supporter: sup[p.id] || null }, web));
+        const players = board.players.map((p) => withWeb({ ...p, supporter: sup[p.id] || null, ...giftInfo(p.id) }, web));
         return json({ ...board, online: players.filter((p) => p.online).length, players }, 30);
       }
       const m = url.pathname.match(/^\/avatar\/([A-Za-z0-9_-]{1,64})$/);
       if (m) return await avatar(env, m[1], url.searchParams.get("v"));
       // /web/<version>/[~<build stamp>/]Build/... — the stamp only makes browsers fetch a re-uploaded build
-      const w = url.pathname.match(/^\/web\/(\d{1,3}\.\d{1,3}\.\d{1,3})\/(?:~[A-Za-z0-9-]{1,40}\/)?((?:Build|StreamingAssets)\/[A-Za-z0-9._\/-]{1,200})$/);
+      const w = url.pathname.match(/^\/web\/(\d{1,3}\.\d{1,3}\.\d{1,3}|t-[a-f0-9]{24})\/(?:~[A-Za-z0-9-]{1,40}\/)?((?:Build|StreamingAssets)\/[A-Za-z0-9._\/-]{1,200})$/);
       if (w && !w[2].includes("..")) return await webFile(env, w[1], w[2], request);
+      if (url.pathname === "/releases/test.json") return await testRelease(request, env, "test.json");
+      const tf = url.pathname.match(/^\/releases\/test\/([A-Za-z0-9._-]{1,120})$/);
+      if (tf) return await testRelease(request, env, `test/${tf[1]}`);
       const r = url.pathname.match(/^\/releases\/([A-Za-z0-9._-]{1,120})$/);
       if (r) return await release(env, r[1], request);
       return cors(new Response("Not found", { status: 404 }));

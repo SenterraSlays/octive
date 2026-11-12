@@ -83,13 +83,40 @@
 
     if (!window.WebAssembly) { fail('Your browser can\'t run OCTIVE (no WebAssembly). Try a current Chrome, Edge or Firefox, or <a href="../#/download">download the game</a>.'); return; }
 
-    fetch(WORKER + "/releases/latest.json", { cache: "no-cache" })
-      .then((r) => r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status)))
-      .then((m) => {
+    // Testers (signed in on the website) can load the test build instead, the same choice as the app's
+    // "Swap to Test Build" button (the game saves it in octive.webChannel and reloads this page).
+    function store(kind, key, value) {
+      try { const st = kind === "s" ? sessionStorage : localStorage; if (value === undefined) return st.getItem(key); st.setItem(key, value); } catch { return null; }
+    }
+    async function testerManifest() {
+      if (store("l", "octive.webChannel") !== "test") return null;
+      const session = store("l", "octive.session");
+      if (!session) return null;
+      try {
+        const r = await fetch(WORKER + "/account/refresh", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sessionToken: session }) });
+        if (!r.ok) return null;
+        const a = await r.json();
+        if (!a.token) return null;
+        if (a.sessionToken) store("l", "octive.session", a.sessionToken);
+        store("s", "octive.token", a.token);
+        const t = await fetch(WORKER + "/releases/test.json?t=" + Date.now(), { headers: { Authorization: "Bearer " + a.token }, cache: "no-store" });
+        if (!t.ok) return null;
+        const m = await t.json();
+        return m && m.web ? m : null;
+      } catch { return null; }
+    }
+
+    Promise.all([
+      fetch(WORKER + "/releases/latest.json", { cache: "no-cache" }).then((r) => r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))),
+      testerManifest(),
+    ])
+      .then(([latest, test]) => {
+        const m = test || latest;
+        const label = test ? `${test.version}-test${test.test}` : (m.web && m.web.version);
         if (!m.web) { fail('The browser version isn\'t out yet. <a href="../#/download">Download OCTIVE</a> for Windows or Android instead.'); return; }
         const w = m.web, base = `${WORKER}/web/${w.version}/~${w.build || String(m.published || "").replace(/[^0-9]/g, "")}`;
-        document.title = `OCTIVE ${w.version} · Play in your browser`;
-        status.textContent = `Loading OCTIVE ${w.version}…`;
+        document.title = `OCTIVE ${label} · Play in your browser`;
+        status.textContent = test ? `Loading test build ${label}…` : `Loading OCTIVE ${label}…`;
         const script = document.createElement("script");
         script.src = `${base}/Build/${w.loader}`;
         script.onerror = () => fail('The game couldn\'t be loaded. Check your connection and <a href="">try again</a>.');
@@ -101,7 +128,7 @@
             streamingAssetsUrl: `${base}/StreamingAssets`,
             companyName: "Hazelwood",
             productName: "OCTIVE",
-            productVersion: w.version,
+            productVersion: test ? label : w.version,
             matchWebGLToCanvasSize: true,
             autoSyncPersistentDataPath: true, // imported songs, scores and settings are saved as they change
             devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2),

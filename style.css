@@ -85,7 +85,11 @@ main { width: 100%; max-width: 1100px; margin: 0 auto; padding: 28px 16px 40px; 
 .row[data-place="1"] .rank { color: var(--gold); }
 .row[data-place="2"] .rank { color: var(--silver); }
 .row[data-place="3"] .rank { color: var(--bronze); }
-.player { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.player { display: flex; align-items: center; gap: 12px; min-width: 0; overflow: hidden; }
+.who { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
+.who .name { flex: 0 1 auto; min-width: 2.5em; }
+.tags { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1 auto; overflow: hidden; }
+.tags .sup-pill.rank { margin-left: 0; }
 .avatar { width: 38px; height: 38px; border-radius: 8px; overflow: hidden; flex-shrink: 0; display: grid; place-items: center; background: #3b2f6e; }
 .avatar img, .card-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
 [hidden] { display: none !important; }
@@ -148,6 +152,19 @@ main { width: 100%; max-width: 1100px; margin: 0 auto; padding: 28px 16px 40px; 
 /* ---------------------------------------------------------------- small screens */
 @media (max-width: 720px) {
   .thead, .row { grid-template-columns: 44px minmax(0, 1fr) 72px 88px; padding: 0 12px; gap: 8px; }
+  /* phones: name on top, badges in a wrapping line under it, so nothing runs into the numbers */
+  .row { height: auto; min-height: 58px; padding-top: 8px; padding-bottom: 8px; }
+  .player { gap: 10px; }
+  .avatar { width: 34px; height: 34px; }
+  .who { flex-direction: column; align-items: flex-start; gap: 4px; }
+  .who .name { max-width: 100%; font-size: 14px; }
+  .tags { flex-wrap: wrap; gap: 4px; max-width: 100%; }
+  .tags .badge { font-size: 8px; padding: 1px 5px; letter-spacing: 0.08em; }
+  .tags .sup-pill.rank { padding: 0; border: 0; background: none; }
+  .tags .sup-pill.rank img, .tags .sup-pill.small img { width: 16px; height: 16px; }
+  .acc { font-size: 13px; }
+  .pp { font-size: 14px; }
+  .pp-old-tag { font-size: 8px; letter-spacing: 0.04em; }
   .hide-sm { display: none; }
   .thead { font-size: 10px; letter-spacing: 0.06em; }
   .hero-side { width: 100%; justify-content: space-between; }
@@ -439,6 +456,10 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
 
 .sup-section { margin-top: 18px; padding: 18px; border-radius: 16px; border: 1px solid #ff6fae44; background: linear-gradient(135deg, #ff6fae12, transparent 60%); }
 .sup-section h2 { margin: 0 0 4px; color: var(--pink); font-size: 18px; }
+.sup-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+.sup-title h2 { margin: 0; }
+.sup-no { padding: 3px 10px; border-radius: 999px; border: 1px solid #ff6fae66; background: #ff6fae14; color: var(--pink); font-size: 12px; font-weight: 800; letter-spacing: 0.05em; font-variant-numeric: tabular-nums; }
+.sup-pill.small.gifter img { background: #ffd36a33; box-shadow: 0 0 0 1px #ffd36a88; }
 .sup-earned { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 14px; }
 .sup-earned figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 4px; width: 84px; }
 .sup-earned img { width: 64px; height: 64px; }
@@ -607,7 +628,7 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
   .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .tile { padding: 10px 12px; }
   .tile b { font-size: 18px; }
-  .row { height: 52px; }
+  .row { height: auto; min-height: 52px; }
   .panel { padding: 16px; }
   .sup-hero { padding: 18px; gap: 14px; }
   .sup-hero-badge { width: 84px; height: 84px; }
@@ -691,4 +712,15 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
   .person { flex-wrap: wrap; }
   .people-actions { width: 100%; justify-content: flex-end; }
   .prof-tab { padding: 8px 10px; }
+}
+
+/* narrow phones: tighter ranking columns so names and badges get the room */
+@media (max-width: 480px) {
+  .thead, .row { grid-template-columns: 30px minmax(0, 1fr) 54px 72px; gap: 6px; padding-left: 10px; padding-right: 10px; }
+  .thead { letter-spacing: 0.02em; font-size: 9px; }
+  .rank { font-size: 13px; }
+  .avatar { width: 30px; height: 30px; border-radius: 7px; }
+  .player { gap: 8px; }
+  .acc { font-size: 12px; }
+  .pp { font-size: 13px; }
 }
