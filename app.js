@@ -1477,7 +1477,7 @@
 
   // ---------------------------------------------------------------- achievements (public, from the player's card)
   let achDefs = null;
-  const loadAchDefs = () => achDefs ??= fetch("data/achievements.json?v=1.3.2").then((r) => r.json()).catch(() => []);
+  const loadAchDefs = () => achDefs ??= fetch("data/achievements.json?v=1.4.0-2").then((r) => r.json()).catch(() => []);
   const ACH_COLOURS = { Milestones: "#8b7bff", Skill: "#4fd6e8", Supporter: "#ff6fae", "OCTIVE Remixes": "#f2c14e" };
   const ACH_ICONS = { Milestones: "★", Skill: "✔", Supporter: "♥", "OCTIVE Remixes": "♪" };
 

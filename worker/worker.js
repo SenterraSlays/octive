@@ -795,29 +795,71 @@ async function profileOf(env, playerId) {
   };
 }
 
-function profileEmbed(p) {
+// ---------------------------------------------------------------- the commands' look
+const C_ACCENT = 0x8B7BFF, C_PINK = 0xFF6FAE, C_GREEN = 0x3DDC84, C_GOLD = 0xF2C14E, C_DEV = 0xB69BFF, C_CREATOR = 0xFF2133;
+const FOOTER = { text: "OCTIVE · senterraslays.github.io/octive" };
+const clean = (s) => String(s || "").replace(/[*_`~|>\\]/g, "").slice(0, 60) || "Player";
+const unix = (iso) => Math.floor(Date.parse(iso) / 1000);
+const bar = (f, n = 12) => { const k = Math.max(0, Math.min(n, Math.round((f || 0) * n))); return "█".repeat(k) + "░".repeat(n - k); };
+const linkButton = (label, url, emoji) => ({ type: 2, style: 5, label, url, ...(emoji ? { emoji: { name: emoji } } : {}) });
+const row = (...buttons) => ({ type: 1, components: buttons.filter(Boolean).slice(0, 5) });
+const GIFTER_TIERS = [[36, "Star Gifter", "🌟"], [24, "Platinum Gifter", "💎"], [12, "Gold Gifter", "🥇"], [6, "Silver Gifter", "🥈"], [3, "Bronze Gifter", "🥉"], [1, "Gift Starter", "🎁"]];
+const gifterTier = (m) => GIFTER_TIERS.find(([n]) => m >= n) || null;
+const supNo = (n) => "#" + String(n).padStart(4, "0");
+
+function discordStatus(p) {
+  if (!p.online) return p.lastSeen ? `Last online <t:${unix(p.lastSeen)}:R>` : "Offline";
+  const dev = /-dev$/.test(p.status || "");
+  return "🟢 " + (STATUS_TEXT[(p.status || "").replace(/-dev$/, "")] || "Online") + (dev ? " · DEV build" : "");
+}
+
+/** The supporter line for a profile: tier, Supporter number, gifting. */
+function supporterLine(p, st) {
+  const parts = [];
+  if (st?.active) parts.push(st.lifetime ? "💖 Lifetime supporter" : st.booster ? "💖 Supporter · Server Booster" : `💖 Supporter (${fmtN(st.months)} month${st.months === 1 ? "" : "s"})`);
+  else if (st?.days > 0) parts.push("🤍 Former supporter");
+  if (p.supporterNo != null) parts.push(`Supporter ${supNo(p.supporterNo)}`);
+  const g = gifterTier(p.gifted || 0);
+  if (g) parts.push(`${g[2]} ${g[1]} · ${fmtN(p.gifted)} month${p.gifted === 1 ? "" : "s"} gifted`);
+  return parts.join("  ·  ");
+}
+
+let achCache = null, achAt = 0;
+async function achievementDefs() {
+  if (achCache && Date.now() - achAt < 3600_000) return achCache;
+  try { const r = await fetch(SITE + "data/achievements.json"); if (r.ok) { achCache = await r.json(); achAt = Date.now(); } } catch { /* keep the old */ }
+  return achCache || [];
+}
+
+function profileEmbed(p, st, achTotal) {
   const badges = (p.badges || []).map((b) => BADGE_EMOJI[b] || b).join("  ");
-  const color = (p.badges || []).includes("DEV") ? 0xB69BFF : (p.badges || []).includes("CREATOR") ? 0xFF2133 : 0x7C6CFF;
+  const color = (p.badges || []).includes("DEV") ? C_DEV : st?.active ? C_PINK : (p.badges || []).includes("CREATOR") ? C_CREATOR : C_ACCENT;
   const bio = stripBio(p.bio);
+  const sup = supporterLine(p, st);
+  const got = Object.keys(p.achievements || {}).length;
   const e = {
-    title: p.name,
+    author: { name: p.rank ? `#${fmtN(p.rank)} on the OCTIVE ranking` : "OCTIVE player" },
+    title: clean(p.name),
     url: `${SITE}#/u/${encodeURIComponent(p.id)}`,
     color,
-    description: [badges, bio ? `> ${bio.slice(0, 300).replace(/\n/g, "\n> ")}` : null].filter(Boolean).join("\n") || undefined,
+    description: [badges || null, sup || null, bio ? `> ${bio.slice(0, 280).replace(/\n/g, "\n> ")}` : null].filter(Boolean).join("\n") || undefined,
     fields: [
-      { name: "Rank", value: p.rank ? `#${fmtN(p.rank)}` : "Unranked", inline: true },
-      { name: "Performance", value: `${fmtN(p.pp)}pp`, inline: true },
+      { name: "Performance", value: `**${fmtN(p.pp)} PR**`, inline: true },
       { name: "Accuracy", value: `${fmtN(p.accuracy, 2)}%`, inline: true },
-      { name: "Level", value: `Lv${p.level} (${Math.round((p.levelProgress || 0) * 100)}%)`, inline: true },
+      { name: "Level", value: `Lv${p.level}`, inline: true },
+      { name: `Progress to Lv${(p.level || 1) + 1}`, value: `\`${bar(p.levelProgress)}\` ${Math.round((p.levelProgress || 0) * 100)}%`, inline: false },
       { name: "Plays", value: fmtN(p.playCount), inline: true },
-      { name: "Max combo", value: p.maxCombo ? `${fmtN(p.maxCombo)}x` : "—", inline: true },
       { name: "Full combos", value: fmtN(p.fullCombos), inline: true },
+      { name: "Max combo", value: p.maxCombo ? `${fmtN(p.maxCombo)}x` : "—", inline: true },
       { name: "Play time", value: playTimeText(p.playTimeMs), inline: true },
-      { name: "Status", value: p.online ? "🟢 " + statusText(p) : p.lastSeen ? `Last online ${agoText(p.lastSeen)}` : "Offline", inline: true },
+      { name: "Achievements", value: achTotal ? `${got} / ${achTotal}` : fmtN(got), inline: true },
+      { name: "Status", value: discordStatus(p), inline: true },
     ],
-    footer: { text: "OCTIVE · senterraslays.github.io/octive" },
+    footer: FOOTER,
   };
-  if (p.avatarHash) e.thumbnail = { url: `${WORKER_BASE}/avatar/${encodeURIComponent(p.id)}?v=${encodeURIComponent(p.avatarHash)}` };
+  if (st?.gif) e.thumbnail = { url: `${WORKER_BASE}/looks/gif/${encodeURIComponent(p.id)}?v=${encodeURIComponent(st.gif)}` };
+  else if (p.avatarHash) e.thumbnail = { url: `${WORKER_BASE}/avatar/${encodeURIComponent(p.id)}?v=${encodeURIComponent(p.avatarHash)}` };
+  if (st?.active && st.banner) e.image = { url: `${WORKER_BASE}/looks/banner/${encodeURIComponent(p.id)}?v=${encodeURIComponent(st.banner)}` };
   return e;
 }
 
@@ -829,82 +871,306 @@ async function linkedPlayer(env, discordId) {
 }
 
 const opt = (data, name) => (data.options || []).find((o) => o.name === name)?.value;
+const notLinked = (who, self) => ({
+  content: self
+    ? `Your Discord isn't linked to an OCTIVE account yet. Sign in at ${SITE}#/account?tab=preferences, press **Link Discord**, then use \`/link\` with the code.`
+    : `<@${who}> hasn't linked an OCTIVE account.`,
+  flags: EPHEMERAL, allowed_mentions: { parse: [] },
+});
+
+/** A ranked player by name: exact first, then the start of a name, then anywhere in it. */
+async function findByName(env, name) {
+  const board = await leaderboard(env);
+  const q = String(name).trim().toLowerCase();
+  const byId = board.players.find((x) => x.id === name);
+  if (byId) return byId;
+  return board.players.find((x) => (x.name || "").toLowerCase() === q)
+    || board.players.find((x) => (x.name || "").toLowerCase().startsWith(q))
+    || board.players.find((x) => (x.name || "").toLowerCase().includes(q)) || null;
+}
+
+/**
+ * Who a command is about: a player name (option), a Discord user (option) who linked their account, or
+ * the caller. Returns { id } or { error: reply }.
+ */
+async function target(env, data, user, nameOpt = "player", userOpt = "user") {
+  const name = opt(data, nameOpt), mention = opt(data, userOpt);
+  if (name) {
+    const p = await findByName(env, name);
+    if (!p) return { error: { content: `Nobody called **${clean(name)}** is on the ranking. Unranked players can be found once they've linked Discord: \`/profile user:@them\`.`, flags: EPHEMERAL } };
+    return { id: p.id };
+  }
+  const who = mention || user.id;
+  const id = await linkedPlayer(env, who);
+  if (!id) return { error: notLinked(who, who === user.id) };
+  return { id };
+}
+
+async function withSupport(env, p) {
+  let st = null;
+  try { st = (await supporters(env))[p.id] || null; } catch { /* none */ }
+  const gi = giftInfo(p.id);
+  return { p: { ...p, gifted: p.gifted ?? gi.gifted, supporterNo: p.supporterNo ?? gi.supporterNo }, st };
+}
+
+// ---------------------------------------------------------------- leaderboard pages (with buttons)
+const LB_PAGES = 10;
+async function leaderboardMessage(env, page, callerId) {
+  const board = await leaderboard(env);
+  const pages = Math.max(1, Math.min(LB_PAGES, Math.ceil(board.players.length / 10)));
+  page = Math.max(1, Math.min(pages, page));
+  const rows = board.players.slice((page - 1) * 10, page * 10);
+  const mine = callerId ? await linkedPlayer(env, callerId) : null;
+  const medal = (r) => (r === 1 ? "🥇" : r === 2 ? "🥈" : r === 3 ? "🥉" : `\`#${String(r).padStart(2, " ")}\``);
+  const lines = rows.map((p) => {
+    const me = p.id === mine;
+    const name = me ? `__**${clean(p.name)}**__` : `**${clean(p.name)}**`;
+    return `${medal(p.rank)} ${name}${p.online ? " 🟢" : ""}\n　 ${fmtN(p.pp)} PR · ${fmtN(p.accuracy, 2)}% · Lv${p.level}`;
+  });
+  const meRow = mine && !rows.some((p) => p.id === mine) ? board.players.find((p) => p.id === mine) : null;
+  if (meRow) lines.push(`\n**You:** #${fmtN(meRow.rank)} · ${fmtN(meRow.pp)} PR · ${fmtN(meRow.accuracy, 2)}%`);
+  return {
+    embeds: [{
+      title: "🏆 OCTIVE Performance Ranking", url: `${SITE}#/rankings`, color: C_ACCENT,
+      description: lines.join("\n") || "No ranked players yet.",
+      footer: { text: `Page ${page} of ${pages} · ${fmtN(board.total)} ranked · ${fmtN(board.online)} online` },
+    }],
+    components: [row(
+      { type: 2, style: 2, label: "First", custom_id: "lb:1", disabled: page <= 1, emoji: { name: "⏮️" } },
+      { type: 2, style: 1, label: "Previous", custom_id: `lb:${page - 1}`, disabled: page <= 1 },
+      { type: 2, style: 1, label: "Next", custom_id: `lb:${page + 1}`, disabled: page >= pages },
+      linkButton("Full ranking", `${SITE}#/rankings`),
+    )],
+    allowed_mentions: { parse: [] },
+  };
+}
+
+const HELP = [
+  ["/profile", "A player's profile: rank, PR, accuracy, level, supporter status (yours when you leave it empty)"],
+  ["/compare", "Two players side by side"],
+  ["/leaderboard", "The performance ranking, with page buttons"],
+  ["/online", "Who's playing OCTIVE right now"],
+  ["/achievements", "A player's achievements, by group"],
+  ["/supporter", "Supporter status, Supporter number and gifter badge"],
+  ["/stats", "OCTIVE in numbers"],
+  ["/download", "Get OCTIVE for Windows, Android or the browser"],
+  ["/link · /unlink", "Connect your Discord to your OCTIVE account"],
+  ["/update", "Re-check your supporter status, boost and role"],
+];
 
 async function discordCommand(env, it) {
   const data = it.data || {};
   const user = it.member?.user || it.user || {};
   switch (data.name) {
     case "profile": {
-      const name = opt(data, "player"), mention = opt(data, "user");
-      let id = null;
-      if (name) {
-        const board = await leaderboard(env);
-        const q = String(name).trim().toLowerCase();
-        const p = board.players.find((x) => (x.name || "").toLowerCase() === q) || board.players.find((x) => (x.name || "").toLowerCase().includes(q));
-        if (!p) return { content: `Nobody called **${String(name).slice(0, 40)}** is on the ranking. Players who aren't ranked can be found when they've linked Discord: \`/profile user:@them\`.`, flags: EPHEMERAL };
-        id = p.id;
-      } else {
-        const who = mention || user.id;
-        id = await linkedPlayer(env, who);
-        if (!id) return {
-          content: who === user.id
-            ? `Your Discord isn't linked to an OCTIVE account yet. Sign in at ${SITE}#/account, press **Link Discord**, then use \`/link\` with the code.`
-            : `<@${who}> hasn't linked an OCTIVE account.`,
-          flags: EPHEMERAL, allowed_mentions: { parse: [] },
-        };
-      }
-      const p = await profileOf(env, id);
-      if (!p) return { content: "That profile isn't available (no plays online yet).", flags: EPHEMERAL };
-      return { embeds: [profileEmbed(p)], allowed_mentions: { parse: [] } };
+      const t = await target(env, data, user);
+      if (t.error) return t.error;
+      const raw = await profileOf(env, t.id);
+      if (!raw) return { content: "That profile isn't available (no plays online yet).", flags: EPHEMERAL };
+      const { p, st } = await withSupport(env, raw);
+      const defs = await achievementDefs();
+      return {
+        embeds: [profileEmbed(p, st, defs.length)],
+        components: [row(
+          linkButton("View profile", `${SITE}#/u/${encodeURIComponent(p.id)}`, "👤"),
+          (it.member?.user?.id || it.user?.id) && !st?.lifetime ? linkButton("Gift supporter", `${SITE}#/supporter?gift=${encodeURIComponent(p.id)}`, "🎁") : null,
+        )],
+        allowed_mentions: { parse: [] },
+      };
     }
-    case "leaderboard": {
-      const page = Math.max(1, Math.min(5, Number(opt(data, "page") || 1)));
-      const board = await leaderboard(env);
-      const rows = board.players.slice((page - 1) * 10, page * 10);
-      if (!rows.length) return { content: "No ranked players on that page yet.", flags: EPHEMERAL };
-      const medal = (r) => (r === 1 ? "🥇" : r === 2 ? "🥈" : r === 3 ? "🥉" : `\`#${r}\``);
+    case "compare": {
+      const a = await target(env, data, user, "player", "user");
+      if (a.error) return a.error;
+      const otherName = opt(data, "with"), otherUser = opt(data, "with_user");
+      let bId = null;
+      if (otherName || otherUser) {
+        const b = await target(env, { options: [otherName ? { name: "player", value: otherName } : { name: "user", value: otherUser }] }, user);
+        if (b.error) return b.error;
+        bId = b.id;
+      } else {
+        bId = await linkedPlayer(env, user.id);
+        if (!bId) return notLinked(user.id, true);
+      }
+      if (a.id === bId) return { content: "Pick two different players.", flags: EPHEMERAL };
+      const [pa, pb] = await Promise.all([profileOf(env, a.id), profileOf(env, bId)]);
+      if (!pa || !pb) return { content: "One of those profiles isn't available yet.", flags: EPHEMERAL };
+      const stats = [
+        ["Rank", (p) => p.rank || 1e9, (p) => (p.rank ? "#" + fmtN(p.rank) : "—"), true],
+        ["Performance", (p) => p.pp, (p) => fmtN(p.pp) + " PR"],
+        ["Accuracy", (p) => p.accuracy, (p) => fmtN(p.accuracy, 2) + "%"],
+        ["Level", (p) => p.level + (p.levelProgress || 0), (p) => "Lv" + p.level],
+        ["Plays", (p) => p.playCount, (p) => fmtN(p.playCount)],
+        ["Full combos", (p) => p.fullCombos, (p) => fmtN(p.fullCombos)],
+        ["Max combo", (p) => p.maxCombo, (p) => fmtN(p.maxCombo) + "x"],
+        ["Play time", (p) => p.playTimeMs, (p) => playTimeText(p.playTimeMs)],
+        ["Total score", (p) => p.totalScore, (p) => fmtN(p.totalScore)],
+      ];
+      let wa = 0, wb = 0;
+      const left = [], right = [], names = [];
+      for (const [label, val, show, lowWins] of stats) {
+        const va = val(pa), vb = val(pb);
+        const aWins = lowWins ? va < vb : va > vb, bWins = lowWins ? vb < va : vb > va;
+        if (aWins) wa++; if (bWins) wb++;
+        names.push(label);
+        left.push((aWins ? "▲ " : "　") + show(pa));
+        right.push((bWins ? "▲ " : "　") + show(pb));
+      }
       return {
         embeds: [{
-          title: "OCTIVE Performance Ranking", url: `${SITE}#/rankings`, color: 0x7C6CFF,
-          description: rows.map((p) => `${medal(p.rank)} **${p.name.replace(/[*_`~|]/g, "")}** — ${fmtN(p.pp)}pp · ${fmtN(p.accuracy, 2)}% · Lv${p.level}${p.online ? " 🟢" : ""}`).join("\n"),
-          footer: { text: `Page ${page} · ${board.total} ranked · ${board.online} online` },
+          title: `⚔️ ${clean(pa.name)} vs ${clean(pb.name)}`, color: C_ACCENT, url: `${SITE}#/u/${encodeURIComponent(pa.id)}`,
+          description: wa === wb ? "Neck and neck!" : `**${clean(wa > wb ? pa.name : pb.name)}** leads ${Math.max(wa, wb)}–${Math.min(wa, wb)}.`,
+          fields: [
+            { name: "　", value: names.map((n) => `**${n}**`).join("\n"), inline: true },
+            { name: clean(pa.name), value: left.join("\n"), inline: true },
+            { name: clean(pb.name), value: right.join("\n"), inline: true },
+          ],
+          footer: FOOTER,
         }],
         allowed_mentions: { parse: [] },
       };
     }
+    case "leaderboard":
+      return leaderboardMessage(env, Number(opt(data, "page") || 1), user.id);
     case "online": {
       const board = await leaderboard(env);
-      const on = board.players.filter((p) => p.online);
+      let web = {};
+      try { web = await webVisitors(env); } catch { /* none */ }
+      const all = board.players.map((p) => withWeb(p, web)).filter((p) => p.online);
+      const groups = [["🖥️ Desktop", (s) => /^desktop/.test(s)], ["📱 Mobile", (s) => /^mobile/.test(s)], ["🌐 Browser", (s) => /^web/.test(s)], ["👀 On the website", (s) => s === "site"]];
+      const fields = [];
+      for (const [label, test] of groups) {
+        const list = all.filter((p) => test(p.status || ""));
+        if (list.length) fields.push({ name: `${label} — ${list.length}`, value: list.slice(0, 15).map((p) => `**${clean(p.name)}** · #${p.rank}${/-dev$/.test(p.status || "") ? " · 🧪" : ""}`).join("\n").slice(0, 1024), inline: true });
+      }
+      const rest = all.filter((p) => !groups.some(([, t]) => t(p.status || "")));
+      if (rest.length) fields.push({ name: `🎮 In game — ${rest.length}`, value: rest.slice(0, 15).map((p) => `**${clean(p.name)}** · #${p.rank}`).join("\n").slice(0, 1024), inline: true });
       return {
         embeds: [{
-          title: `${on.length} player${on.length === 1 ? "" : "s"} online`, color: 0x3DDC84, url: `${SITE}#/rankings`,
-          description: on.length ? on.slice(0, 30).map((p) => `🟢 **${p.name.replace(/[*_`~|]/g, "")}** · #${p.rank} · ${fmtN(p.pp)}pp`).join("\n") : "Nobody on the ranking is online right now.",
+          title: `🟢 ${all.length} player${all.length === 1 ? "" : "s"} online`, color: C_GREEN, url: `${SITE}#/rankings`,
+          description: all.length ? undefined : "Nobody on the ranking is online right now.",
+          fields, footer: { text: "🧪 = playing a DEV / test build" },
         }],
         allowed_mentions: { parse: [] },
       };
     }
+    case "achievements": {
+      const t = await target(env, data, user);
+      if (t.error) return t.error;
+      const p = await profileOf(env, t.id);
+      if (!p) return { content: "That profile isn't available yet.", flags: EPHEMERAL };
+      const defs = await achievementDefs();
+      const got = p.achievements || {};
+      const groups = [...new Set(defs.map((d) => d.group))];
+      const icon = { Milestones: "⭐", Skill: "✅", Supporter: "💖", "OCTIVE Remixes": "🎵" };
+      const fields = groups.map((g) => {
+        const list = defs.filter((d) => d.group === g);
+        const n = list.filter((d) => got[d.id]).length;
+        return { name: `${icon[g] || "🏅"} ${g}`, value: `\`${bar(list.length ? n / list.length : 0, 10)}\` ${n}/${list.length}`, inline: true };
+      });
+      const recent = Object.entries(got).sort((a, b) => Date.parse(b[1]) - Date.parse(a[1])).slice(0, 5)
+        .map(([id, at]) => { const d = defs.find((x) => x.id === id); return d ? `**${d.title}** — ${d.desc} · <t:${unix(at)}:R>` : null; }).filter(Boolean);
+      const total = defs.length, have = defs.filter((d) => got[d.id]).length;
+      return {
+        embeds: [{
+          title: `🏅 ${clean(p.name)}'s achievements`, url: `${SITE}#/u/${encodeURIComponent(p.id)}`, color: C_GOLD,
+          description: `**${have} of ${total}** unlocked (${total ? Math.round(have / total * 100) : 0}%)` + (recent.length ? `\n\n**Latest**\n${recent.join("\n")}` : ""),
+          fields, footer: FOOTER,
+        }],
+        allowed_mentions: { parse: [] },
+      };
+    }
+    case "supporter": {
+      const t = await target(env, data, user);
+      if (t.error) return t.error;
+      const raw = await profileOf(env, t.id);
+      if (!raw) return { content: "That profile isn't available yet.", flags: EPHEMERAL };
+      const { p, st } = await withSupport(env, raw);
+      const g = gifterTier(p.gifted || 0);
+      const fields = [];
+      if (st && (st.active || st.days > 0)) {
+        fields.push({ name: "Status", value: st.lifetime ? "Lifetime supporter" : st.booster ? "Supporter · Server Booster" : st.active ? "Supporter" : "Former supporter", inline: true });
+        fields.push({ name: "Supported for", value: `${fmtN(st.months)} month${st.months === 1 ? "" : "s"} (${fmtN(st.days)} days)`, inline: true });
+        if (st.since) fields.push({ name: "Since", value: `<t:${unix(st.since)}:D>`, inline: true });
+        if (!st.lifetime && st.active && st.until) fields.push({ name: "Until", value: `<t:${unix(st.until)}:D>`, inline: true });
+      }
+      if (p.supporterNo != null) fields.push({ name: "Supporter number", value: supNo(p.supporterNo), inline: true });
+      fields.push({ name: "Gifted to others", value: g ? `${g[2]} **${g[1]}** · ${fmtN(p.gifted)} month${p.gifted === 1 ? "" : "s"}` : "Nothing yet", inline: true });
+      const isSup = st?.active;
+      return {
+        embeds: [{
+          title: `💖 ${clean(p.name)}`, url: `${SITE}#/u/${encodeURIComponent(p.id)}`, color: isSup ? C_PINK : C_ACCENT,
+          description: isSup ? "Thank you for supporting OCTIVE!" : st?.days > 0 ? "A former OCTIVE supporter." : "Not an OCTIVE supporter (yet).",
+          fields, footer: { text: "Supporters get a badge, banner, name colours, profile effects and an animated picture" },
+          ...(st?.active && st.banner ? { image: { url: `${WORKER_BASE}/looks/banner/${encodeURIComponent(p.id)}?v=${encodeURIComponent(st.banner)}` } } : {}),
+        }],
+        components: [row(
+          linkButton("Become a supporter", `${SITE}#/supporter`, "💖"),
+          st?.lifetime ? null : linkButton(`Gift ${clean(p.name).slice(0, 30)}`, `${SITE}#/supporter?gift=${encodeURIComponent(p.id)}`, "🎁"),
+        )],
+        allowed_mentions: { parse: [] },
+      };
+    }
+    case "stats": {
+      const board = await leaderboard(env);
+      let sup = {}, m = null;
+      try { sup = await supporters(env); } catch { /* none */ }
+      try { const o = await env.RELEASES.get("latest.json"); m = o ? await o.json() : null; } catch { /* none */ }
+      const ps = board.players;
+      const sum = (f) => ps.reduce((n, p) => n + (f(p) || 0), 0);
+      const supporters = Object.values(sup).filter((s) => s.active).length;
+      const gifted = Object.values(giftedIndex).reduce((n, x) => n + x, 0);
+      return {
+        embeds: [{
+          title: "📊 OCTIVE in numbers", url: SITE, color: C_ACCENT,
+          fields: [
+            { name: "Ranked players", value: fmtN(board.total), inline: true },
+            { name: "Online now", value: fmtN(board.online), inline: true },
+            { name: "Supporters", value: fmtN(supporters), inline: true },
+            { name: "Songs played", value: fmtN(sum((p) => p.playCount)), inline: true },
+            { name: "Time played", value: playTimeText(sum((p) => p.playTimeMs)), inline: true },
+            { name: "Full combos", value: fmtN(sum((p) => p.fullCombos)), inline: true },
+            { name: "Months gifted", value: fmtN(gifted), inline: true },
+            { name: "Top player", value: ps[0] ? `**${clean(ps[0].name)}** · ${fmtN(ps[0].pp)} PR` : "—", inline: true },
+            { name: "Latest version", value: m ? `v${m.version}` + (m.published ? ` · <t:${unix(m.published)}:R>` : "") : "—", inline: true },
+          ],
+          footer: FOOTER,
+        }],
+        allowed_mentions: { parse: [] },
+      };
+    }
+    case "help":
+      return {
+        embeds: [{
+          title: "OCTIVE bot", url: SITE, color: C_ACCENT,
+          description: HELP.map(([c, d]) => `**${c}** — ${d}`).join("\n") + `\n\nMost commands take a player's name, or a Discord user who linked their account. Leave it empty for yourself once you've used \`/link\`.`,
+          footer: FOOTER,
+        }],
+        components: [row(linkButton("Website", SITE, "🌐"), linkButton("Download", `${SITE}#/download`, "⬇️"), linkButton("Link Discord", `${SITE}#/account?tab=preferences`, "🔗"))],
+        flags: EPHEMERAL,
+      };
     case "download": {
       let m = null;
       try { const o = await env.RELEASES.get("latest.json"); m = o ? await o.json() : null; } catch { /* none */ }
       return {
         embeds: [{
-          title: m ? `Download OCTIVE ${m.version}` : "Download OCTIVE", url: `${SITE}#/download`, color: 0x7C6CFF,
-          description: [
-            `🪟 **Windows:** [installer](${WORKER_BASE}/releases/OCTIVE-Installer.exe) (always installs the newest version)`,
-            m?.android ? `🤖 **Android:** [APK](${WORKER_BASE}/releases/${m.android.file})` : null,
-            m?.web ? `🌐 **Browser:** [play now](${SITE}play/)` : null,
-            `\nThe game updates itself. More at ${SITE}#/download`,
-          ].filter(Boolean).join("\n"),
-          footer: m?.notes ? { text: ("What's new: " + m.notes).slice(0, 2000) } : undefined,
+          title: m ? `⬇️ Download OCTIVE ${m.version}` : "⬇️ Download OCTIVE", url: `${SITE}#/download`, color: C_ACCENT,
+          description: "Free on Windows and Android, or play right in your browser. The game updates itself."
+            + (m?.notes ? `\n\n**What's new in ${m.version}**\n${String(m.notes).slice(0, 1500)}` : ""),
+          footer: m?.published ? { text: `Released ${new Date(m.published).toLocaleDateString("en-GB", { dateStyle: "long" })}` } : FOOTER,
         }],
+        components: [row(
+          linkButton("Windows", `${WORKER_BASE}/releases/OCTIVE-Installer.exe`, "🪟"),
+          m?.android ? linkButton("Android", `${WORKER_BASE}/releases/${m.android.file}`, "🤖") : null,
+          m?.web ? linkButton("Play in browser", `${SITE}play/`, "🌐") : null,
+        )],
       };
     }
     case "link": {
       const code = String(opt(data, "code") || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-      if (code.length !== 8) return { content: `That code doesn't look right. Get one at ${SITE}#/account → **Link Discord**.`, flags: EPHEMERAL };
+      if (code.length !== 8) return { content: `That code doesn't look right. Get one at ${SITE}#/account?tab=preferences → **Link Discord**.`, flags: EPHEMERAL };
       const o = await env.RELEASES.get(`discord-codes/${code}.json`);
       const c = o ? await o.json() : null;
-      if (!c || c.exp < Date.now()) return { content: `That code isn't valid or ran out (codes work for 10 minutes). Make a new one at ${SITE}#/account.`, flags: EPHEMERAL };
+      if (!c || c.exp < Date.now()) return { content: `That code isn't valid or ran out (codes work for 10 minutes). Make a new one at ${SITE}#/account?tab=preferences.`, flags: EPHEMERAL };
       await env.RELEASES.delete(`discord-codes/${code}.json`);
       const old = await linkedPlayer(env, user.id);
       if (old && old !== c.playerId) {
@@ -918,26 +1184,26 @@ async function discordCommand(env, it) {
       await env.RELEASES.put(`discord/${user.id}.json`, JSON.stringify({ playerId: c.playerId, at: rec.discord.at }), { httpMetadata: { contentType: "application/json" } });
       await syncSupporterRole(env, c.playerId, user.id, env.DISCORD_GUILD_ID && it.guild_id === env.DISCORD_GUILD_ID ? it.member : undefined);
       let name = "your account";
-      try { const p = await profileOf(env, c.playerId); if (p) name = `**${p.name}**`; } catch { /* fine */ }
-      return { content: `✅ Linked to ${name}. Try \`/profile\`!`, flags: EPHEMERAL };
+      try { const p = await profileOf(env, c.playerId); if (p) name = `**${clean(p.name)}**`; } catch { /* fine */ }
+      return { embeds: [{ color: C_GREEN, title: "✅ Linked", description: `Your Discord is now linked to ${name}.\nTry \`/profile\`, \`/achievements\` or \`/compare\`.` }], flags: EPHEMERAL };
     }
     case "update": {
       // re-checks the server boost and gives or takes the OCTIVE Supporter role right now
       const id = await linkedPlayer(env, user.id);
-      if (!id) return { content: `Your Discord isn't linked to an OCTIVE account yet. Sign in at ${SITE}#/account?tab=preferences, press **Link Discord**, then use \`/link\` with the code.`, flags: EPHEMERAL };
+      if (!id) return notLinked(user.id, true);
       const member = env.DISCORD_GUILD_ID && it.guild_id === env.DISCORD_GUILD_ID && it.member ? it.member : await memberOf(env, user.id);
       if (member) await setBooster(env, id, user.id, member.premium_since || null);
       supportIndex = null;
       const st = supportStatus(await r2json(env, `supporters/${id}.json`, null), id, await r2json(env, `boosters/${id}.json`, null));
       if (member) await syncSupporterRole(env, id, user.id, member);
       let name = "your account";
-      try { const p = await profileOf(env, id); if (p) name = `**${p.name}**`; } catch { /* fine */ }
+      try { const p = await profileOf(env, id); if (p) name = `**${clean(p.name)}**`; } catch { /* fine */ }
       const what = st.lifetime ? "a lifetime supporter"
-        : st.booster ? "a supporter while you boost the server" + (st.until ? ` (your paid time is paused and continues until ${new Date(st.until).toLocaleDateString("en-GB", { dateStyle: "medium" })} after)` : "")
-        : st.active ? `a supporter until ${new Date(st.until).toLocaleDateString("en-GB", { dateStyle: "medium" })}`
+        : st.booster ? "a supporter while you boost the server" + (st.until ? ` (your paid time is paused and continues until <t:${unix(st.until)}:D> after)` : "")
+        : st.active ? `a supporter until <t:${unix(st.until)}:D>`
         : "not a supporter right now";
-      const role = !env.DISCORD_SUPPORTER_ROLE_ID ? "" : !member ? " Join the OCTIVE Discord server to get the supporter role." : st.active ? " You have the **OCTIVE Supporter** role." : " The supporter role was removed.";
-      return { content: `🔄 Updated ${name}: you're ${what}.${role}`, flags: EPHEMERAL };
+      const role = !env.DISCORD_SUPPORTER_ROLE_ID ? "" : !member ? "\nJoin the OCTIVE Discord server to get the supporter role." : st.active ? "\nYou have the **OCTIVE Supporter** role." : "\nThe supporter role was removed.";
+      return { embeds: [{ color: st.active ? C_PINK : C_ACCENT, title: "🔄 Updated", description: `${name}: you're ${what}.${role}` }], flags: EPHEMERAL };
     }
     case "unlink": {
       const id = await linkedPlayer(env, user.id);
@@ -945,11 +1211,33 @@ async function discordCommand(env, it) {
       await syncSupporterRole(env, id, user.id, undefined, true);
       await env.RELEASES.delete(`discord/${user.id}.json`);
       const rec = await record(env, id); delete rec.discord; await saveRecord(env, id, rec);
-      return { content: "Unlinked. Your OCTIVE account and Discord aren't connected any more.", flags: EPHEMERAL };
+      return { embeds: [{ color: C_ACCENT, title: "Unlinked", description: "Your OCTIVE account and Discord aren't connected any more." }], flags: EPHEMERAL };
     }
     default:
-      return { content: "I don't know that command (yet).", flags: EPHEMERAL };
+      return { content: "I don't know that command (yet). Try `/help`.", flags: EPHEMERAL };
   }
+}
+
+/** Player-name suggestions while typing (any option called player or with). */
+async function discordAutocomplete(env, it) {
+  const focused = (it.data?.options || []).find((o) => o.focused);
+  const q = String(focused?.value || "").trim().toLowerCase();
+  let players = [];
+  try { players = (await leaderboard(env)).players; } catch { /* none */ }
+  const hits = (q ? players.filter((p) => (p.name || "").toLowerCase().includes(q)).sort((a, b) => ((b.name || "").toLowerCase().startsWith(q) ? 1 : 0) - ((a.name || "").toLowerCase().startsWith(q) ? 1 : 0) || a.rank - b.rank) : players)
+    .slice(0, 25).map((p) => ({ name: `${clean(p.name)} · #${p.rank} · ${fmtN(p.pp)} PR`.slice(0, 100), value: String(p.name).slice(0, 100) }));
+  return new Response(JSON.stringify({ type: 8, data: { choices: hits } }), { headers: { "Content-Type": "application/json" } });
+}
+
+/** Buttons on our messages: the leaderboard's pages. */
+async function discordComponent(env, it) {
+  const id = String(it.data?.custom_id || "");
+  const m = id.match(/^lb:(\d{1,2})$/);
+  if (m) {
+    const msg = await leaderboardMessage(env, Number(m[1]), (it.member?.user || it.user || {}).id);
+    return new Response(JSON.stringify({ type: 7, data: msg }), { headers: { "Content-Type": "application/json" } });
+  }
+  return dReply({ content: "That button doesn't work any more.", flags: EPHEMERAL });
 }
 
 async function discordInteraction(request, env, ctx) {
@@ -966,10 +1254,12 @@ async function discordInteraction(request, env, ctx) {
       }
     })().catch(() => {}));
   if (it.type === 1) return new Response(JSON.stringify({ type: 1 }), { headers: { "Content-Type": "application/json" } }); // PING
+  if (it.type === 4) return await discordAutocomplete(env, it); // name suggestions while typing
+  if (it.type === 3) return await discordComponent(env, it); // buttons
   if (it.type !== 2) return dReply({ content: "Not supported.", flags: EPHEMERAL });
   // answer straight away when the result is ready within ~2.5 s (Discord allows 3 s); otherwise answer
   // "thinking…" and edit the reply when it's done (the ranking can be slow on a cold start)
-  const ephemeral = ["link", "unlink"].includes(it.data?.name);
+  const ephemeral = ["link", "unlink", "update", "help"].includes(it.data?.name);
   const result = discordCommand(env, it).catch((e) => {
     console.log("discord command failed", e && e.stack || e);
     return { content: "Something went wrong: " + String(e.message || e).slice(0, 300) };
@@ -1103,7 +1393,11 @@ async function webVisitors(env) {
   return out;
 }
 const STATUS_TEXT = { desktop: "Online Desktop", mobile: "Online Mobile", web: "Online Website", site: "Viewing Website" };
-function statusText(p) { return p.online ? STATUS_TEXT[p.status] || "Online" : "Offline"; }
+function statusText(p) {
+  if (!p.online) return "Offline";
+  const dev = /-dev$/.test(p.status || "");
+  return (STATUS_TEXT[(p.status || "").replace(/-dev$/, "")] || "Online") + (dev ? " - Playing DEV Build" : "");
+}
 /** Playing beats browsing; someone appearing offline in the game isn't shown on the website either. */
 function withWeb(p, web) {
   if (p.online || p.platform === "hidden") return p;
