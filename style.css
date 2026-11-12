@@ -717,7 +717,8 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
 .prof-tab:hover { color: var(--text); }
 .prof-tab.active { color: var(--text); border-bottom-color: var(--accent); }
 .prof-overview > :first-child { margin-top: 0; }
-.people { display: flex; flex-direction: column; gap: 8px; }
+.people { display: flex; flex-direction: column; gap: 8px; max-height: min(70vh, 720px); overflow-y: auto; overscroll-behavior: contain; padding-right: 6px; scrollbar-width: thin; }
+.people-count { position: sticky; top: 0; z-index: 1; background: var(--bg); padding: 4px 0 6px; }
 .people-count { color: var(--faint); font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; margin: 0 0 4px; }
 .person { display: flex; align-items: center; gap: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 10px 14px; }
 .person:hover { border-color: #8b7bff55; }
