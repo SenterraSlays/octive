@@ -1637,6 +1637,73 @@
   }
 
 
+  // ---------------------------------------------------------------- #/updates: every release and its announcement
+  // releases/history.json is written by the release tool (full releases only, never test builds).
+
+  /** A bit of Markdown (the Discord announcement) as page elements: headings, bullets, bold, code, links. */
+  function markdown(text) {
+    const inline = (s) => {
+      const out = [];
+      const re = /(\*\*[^*]+\*\*|__[^_]+__|`[^`]+`|https?:\/\/[^\s)<>]+)/g;
+      let last = 0, m;
+      while ((m = re.exec(s))) {
+        if (m.index > last) out.push(s.slice(last, m.index));
+        const t = m[0];
+        if (t.startsWith("**") || t.startsWith("__")) out.push(h("strong", { text: t.slice(2, -2) }));
+        else if (t.startsWith("`")) out.push(h("code", { text: t.slice(1, -1) }));
+        else out.push(h("a", { href: t, target: "_blank", rel: "noopener", text: t.replace(/^https?:\/\//, "") }));
+        last = m.index + t.length;
+      }
+      if (last < s.length) out.push(s.slice(last));
+      return out;
+    };
+    const root = h("div.md");
+    let list = null;
+    for (const raw of String(text || "").split("\n")) {
+      const line = raw.trimEnd();
+      const bullet = line.match(/^\s*(?:[•\-*]|\d+\.)\s+(.*)$/);
+      if (bullet) { if (!list) { list = h("ul"); root.append(list); } list.append(h("li", {}, inline(bullet[1]))); continue; }
+      list = null;
+      if (!line.trim()) continue;
+      const hd = line.match(/^(#{1,3})\s+(.*)$/);
+      if (hd) root.append(h(hd[1].length === 1 ? "h3" : "h4", {}, inline(hd[2])));
+      else root.append(h("p", {}, inline(line)));
+    }
+    return root;
+  }
+
+  function updatesPage() {
+    document.title = "Updates · OCTIVE";
+    const list = h("div.updates-list", {}, h("p.empty", { text: "Loading the update history…" }));
+    app.replaceChildren(h("div.updates-page", {},
+      h("section.page-head", {}, h("h1", { text: "Update history" }), h("p.sub", { text: "Every OCTIVE release, newest first. The game updates itself when a new one comes out." })),
+      list));
+    fetch(worker + "/releases/history.json", { cache: "no-cache" }).then((r) => r.ok ? r.json() : []).catch(() => []).then((hist) => {
+      hist = (Array.isArray(hist) ? hist : []).filter((x) => x && x.version && !/test/i.test(x.version));
+      if (!hist.length) { list.replaceChildren(h("p.empty", { text: "The update history couldn't be loaded right now." })); return; }
+      list.replaceChildren(...hist.map((x, i) => {
+        const when = x.published ? new Date(x.published) : null;
+        const date = when && !isNaN(when) ? when.toLocaleString(undefined, { dateStyle: "long", timeStyle: "short" }) : "";
+        const body = x.announcement ? markdown(x.announcement) : h("div.md", {}, h("p", { text: x.notes || "" }));
+        const card = h("article.update" + (i === 0 ? ".latest" : ""), { id: "v" + x.version },
+          h("header.update-head", {},
+            h("div", {}, h("h2", {}, "OCTIVE ", h("span.update-ver", { text: x.version })), date ? h("time", { datetime: x.published, text: date }) : null),
+            i === 0 ? h("span.update-pill", { text: "Latest" }) : null),
+          body);
+        // long announcements fold until opened
+        if ((x.announcement || "").length > 1400) {
+          card.classList.add("folded");
+          const more = h("button.btn.update-more", { type: "button", text: "Show everything" });
+          more.addEventListener("click", () => { const f = card.classList.toggle("folded"); more.textContent = f ? "Show everything" : "Show less"; });
+          card.append(more);
+        }
+        return card;
+      }));
+      const anchor = location.hash.match(/^#\/updates\/(.+)$/);
+      if (anchor) document.getElementById("v" + anchor[1])?.scrollIntoView({ behavior: "smooth" });
+    });
+  }
+
   // ---------------------------------------------------------------- messages (the same ones as in the game)
   // #/messages lists conversations and friends; #/messages/<playerId> opens one. Messages live on the
   // Worker (/dm/*), so they reach friends who are offline and match the game on every device.
@@ -1812,6 +1879,7 @@
     else if (pg === "reset") resetPage();
     else if (pg === "supporter") supporterPage();
     else if (pg === "help") helpPage();
+    else if (pg === "updates") updatesPage();
     else if (pg === "messages") messagesPage();
     else home();
     if (fromHashChange) window.scrollTo(0, 0);

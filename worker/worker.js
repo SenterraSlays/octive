@@ -230,7 +230,7 @@ async function release(env, key, request) {
   h.set("Content-Type", RELEASE_TYPES[ext] || "application/octet-stream");
   // latest.json changes with every release; the builds themselves are versioned and never change
   // (the installer keeps one name and is replaced when it changes)
-  const mutable = key === "latest.json" || key === "OCTIVE-Installer.exe";
+  const mutable = key === "latest.json" || key === "history.json" || key === "OCTIVE-Installer.exe";
   h.set("Cache-Control", mutable ? "no-cache, max-age=0" : "public, max-age=31536000, immutable");
   if (ext !== "json") h.set("Content-Disposition", `attachment; filename="${key.split("/").pop()}"`);
   h.set("ETag", obj.httpEtag);
@@ -2462,7 +2462,7 @@ export default {
       if (url.pathname === "/releases/test-links") return await testLinks(request, env);
       const tf = url.pathname.match(/^\/releases\/test\/([A-Za-z0-9._-]{1,120})$/);
       if (tf) return await testRelease(request, env, `test/${tf[1]}`);
-      const r = url.pathname.match(/^\/releases\/(latest\.json|OCTIVE[A-Za-z0-9._-]{0,120})$/);
+      const r = url.pathname.match(/^\/releases\/(latest\.json|history\.json|OCTIVE[A-Za-z0-9._-]{0,120})$/);
       if (r) return await release(env, r[1], request);
       return cors(new Response("Not found", { status: 404 }));
     } catch (e) {
