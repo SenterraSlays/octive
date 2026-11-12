@@ -1990,6 +1990,147 @@ function dmTrim(box) {
   for (const id of ids.slice(DM_THREADS)) delete box.threads[id];
 }
 
+// ---------------------------------------------------------------- global chat (game <-> Discord #octive-chat)
+// One public room. Messages from the game are stored in R2 (chat/global.json, the newest CHAT_KEEP) and posted
+// to the Discord channel through a webhook (the player's name and picture). Discord messages are pulled into
+// the room when someone reads it (at most every CHAT_PULL_MS) with the bot. Set up by Tools/discord_chat_setup.py
+// (secrets DISCORD_CHAT_CHANNEL_ID and DISCORD_CHAT_WEBHOOK); without them the chat is game-only.
+const CHAT_KEY = "chat/global.json";
+const CHAT_KEEP = 200;
+const CHAT_MAX = 300;
+const CHAT_PULL_MS = 4000;
+let chatPulledAt = 0, chatPulling = null;
+const chatEmpty = () => ({ seq: 0, msgs: [], lastDiscord: null });
+
+/** Discord text as plain text for the game: mentions, channels, roles and custom emoji become readable. */
+function discordToText(m) {
+  let t = String(m.content || "");
+  for (const u of m.mentions || []) t = t.split(`<@${u.id}>`).join("@" + (u.global_name || u.username)).split(`<@!${u.id}>`).join("@" + (u.global_name || u.username));
+  t = t.replace(/<@!?\d+>/g, "@someone").replace(/<@&\d+>/g, "@role").replace(/<#\d+>/g, "#channel")
+    .replace(/<a?:(\w+):\d+>/g, ":$1:").replace(/<t:(\d+)(:\w)?>/g, (_, s) => new Date(Number(s) * 1000).toUTCString());
+  if (!t.trim() && (m.attachments || []).length) t = "[sent " + (m.attachments.length === 1 ? "a file" : m.attachments.length + " files") + "]";
+  if (!t.trim() && (m.sticker_items || []).length) t = "[sticker: " + m.sticker_items[0].name + "]";
+  return t.slice(0, CHAT_MAX);
+}
+
+const webhookId = (env) => (String(env.DISCORD_CHAT_WEBHOOK || "").match(/webhooks\/(\d+)\//) || [])[1] || null;
+
+/** New messages from the Discord channel into the room. */
+async function chatPull(env) {
+  if (!env.DISCORD_CHAT_CHANNEL_ID || !env.DISCORD_BOT_TOKEN) return;
+  if (Date.now() - chatPulledAt < CHAT_PULL_MS) return chatPulling;
+  chatPulledAt = Date.now();
+  chatPulling = (async () => {
+    const box = await r2json(env, CHAT_KEY, chatEmpty());
+    const after = box.lastDiscord ? `&after=${box.lastDiscord}` : "";
+    const res = await fetch(`https://discord.com/api/v10/channels/${env.DISCORD_CHAT_CHANNEL_ID}/messages?limit=50${after}`, {
+      headers: { Authorization: "Bot " + env.DISCORD_BOT_TOKEN, "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" },
+    });
+    if (!res.ok) { console.log("chat pull", res.status); return; }
+    const list = (await res.json()).filter((m) => m && m.id).sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+    if (!list.length) return;
+    const ours = webhookId(env);
+    await r2update(env, CHAT_KEY, chatEmpty, (b) => {
+      let changed = false;
+      for (const m of list) {
+        if (b.lastDiscord && BigInt(m.id) <= BigInt(b.lastDiscord)) continue;
+        b.lastDiscord = m.id; changed = true;
+        if (m.webhook_id && m.webhook_id === ours) continue; // our own copy of a game message
+        if (m.author?.bot || (m.type !== 0 && m.type !== 19)) continue; // bots and system messages
+        const text = discordToText(m);
+        if (!text.trim()) continue;
+        const a = m.author || {};
+        b.msgs.push({
+          seq: ++b.seq, id: "d" + m.id, at: m.timestamp || new Date().toISOString(), src: "discord", text,
+          from: { id: "discord:" + a.id, name: String(m.member?.nick || a.global_name || a.username || "Discord user").slice(0, 40), avatar: a.avatar ? `https://cdn.discordapp.com/avatars/${a.id}/${a.avatar}.png?size=64` : null },
+        });
+      }
+      if (!changed) return false;
+      if (b.msgs.length > CHAT_KEEP) b.msgs = b.msgs.slice(-CHAT_KEEP);
+    });
+  })().catch((e) => console.log("chat pull failed", e && e.message)).finally(() => { chatPulling = null; });
+  return chatPulling;
+}
+
+async function chatRoutes(request, env, url, ctx) {
+  const path = url.pathname;
+  if (path === "/chat/global" && request.method === "GET") {
+    await chatPull(env);
+    const after = Number(url.searchParams.get("after") || 0);
+    const box = await r2json(env, CHAT_KEY, chatEmpty());
+    const msgs = (box.msgs || []).filter((m) => m.seq > after && !moderation.bans[m.from?.id]);
+    return reply({ seq: box.seq || 0, msgs: after ? msgs : msgs.slice(-80), discord: !!env.DISCORD_CHAT_CHANNEL_ID, channel: env.DISCORD_CHAT_CHANNEL_ID || null, guild: env.DISCORD_GUILD_ID || null });
+  }
+  if (path === "/chat/send" && request.method === "POST") {
+    const b = await bodyOf(request);
+    const who = await signedIn(request, env);
+    const cfg = config(env);
+    await loadModeration(cfg);
+    if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+    let text = String(b.text || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/\n{3,}/g, "\n\n").trim();
+    if (!text) fail(400, "Type a message first.");
+    if (text.length > CHAT_MAX) fail(400, `Messages can be ${CHAT_MAX} characters at most.`);
+    // a little slow-down: 1 message every 1.5 s and 12 a minute per player
+    const rl = await r2json(env, `chat/rate/${who.playerId}.json`, { at: [] });
+    const now = Date.now();
+    rl.at = (rl.at || []).filter((t) => now - t < 60_000);
+    if (rl.at.length && now - rl.at[rl.at.length - 1] < 1500) fail(429, "Slow down a little.");
+    if (rl.at.length >= 12) fail(429, "You're sending a lot of messages. Wait a minute.");
+    rl.at.push(now);
+    await r2put(env, `chat/rate/${who.playerId}.json`, rl);
+    const card = (await publicItems(cfg, who.playerId, ["card"])).card || {};
+    const ov = moderation.overrides[who.playerId] || {};
+    const name = String(ov.name || card.name || who.username || "Player").slice(0, 40);
+    const avatarHash = ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : String(card.avatar || "");
+    const msg = {
+      id: "g" + crypto.randomUUID().replace(/-/g, "").slice(0, 16), at: new Date().toISOString(), src: "game", text,
+      from: { id: who.playerId, name, badges: badgesOf(who.playerId), avatar: avatarHash ? `${WORKER_BASE}/avatar/${encodeURIComponent(who.playerId)}?v=${encodeURIComponent(avatarHash)}` : null },
+    };
+    const box = await r2update(env, CHAT_KEY, chatEmpty, (bx) => {
+      msg.seq = ++bx.seq;
+      bx.msgs.push(msg);
+      if (bx.msgs.length > CHAT_KEEP) bx.msgs = bx.msgs.slice(-CHAT_KEEP);
+    });
+    // and into the Discord channel, as the player (no pings)
+    if (env.DISCORD_CHAT_WEBHOOK) ctx.waitUntil((async () => {
+      const badge = (msg.from.badges || []).includes("DEV") ? " 🛠️" : (msg.from.badges || []).includes("MOD") ? " 🛡️" : "";
+      const r = await fetch(env.DISCORD_CHAT_WEBHOOK + "?wait=true", {
+        method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" },
+        body: JSON.stringify({ content: text, username: `${name}${badge} · OCTIVE`.slice(0, 80), avatar_url: msg.from.avatar || `${SITE}logo-512.png`, allowed_mentions: { parse: [] } }),
+      });
+      if (!r.ok) { console.log("chat webhook", r.status, (await r.text()).slice(0, 200)); return; }
+      const posted = await r.json();
+      await r2update(env, CHAT_KEY, chatEmpty, (bx) => {
+        const m = bx.msgs.find((x) => x.id === msg.id);
+        if (!m) return false;
+        m.discordId = posted.id;
+        if (!bx.lastDiscord || BigInt(posted.id) > BigInt(bx.lastDiscord)) { /* pulled later and skipped as our own */ }
+      });
+    })().catch((e) => console.log("chat webhook failed", e && e.message)));
+    return reply({ ok: true, msg, seq: box.seq });
+  }
+  if (path === "/chat/delete" && request.method === "POST") {
+    // developers and moderators: remove a message (and its Discord copy)
+    const b = await bodyOf(request);
+    const who = await signedIn(request, env);
+    await loadModeration(config(env));
+    const badges = badgesOf(who.playerId);
+    if (!(badges.includes("DEV") || badges.includes("MOD") || who.playerId === OWNER)) fail(403, "Only moderators can remove messages.");
+    let removed = null;
+    await r2update(env, CHAT_KEY, chatEmpty, (bx) => {
+      const i = bx.msgs.findIndex((x) => x.id === String(b.id || ""));
+      if (i < 0) return false;
+      removed = bx.msgs.splice(i, 1)[0];
+    });
+    if (!removed) fail(404, "That message is already gone.");
+    if (removed.discordId && env.DISCORD_CHAT_WEBHOOK) ctx.waitUntil(fetch(`${env.DISCORD_CHAT_WEBHOOK}/messages/${removed.discordId}`, { method: "DELETE" }).catch(() => {}));
+    else if (removed.src === "discord" && env.DISCORD_BOT_TOKEN && env.DISCORD_CHAT_CHANNEL_ID)
+      ctx.waitUntil(fetch(`https://discord.com/api/v10/channels/${env.DISCORD_CHAT_CHANNEL_ID}/messages/${removed.id.slice(1)}`, { method: "DELETE", headers: { Authorization: "Bot " + env.DISCORD_BOT_TOKEN } }).catch(() => {}));
+    return reply({ ok: true });
+  }
+  fail(404, "Not found.");
+}
+
 async function dmRoutes(request, env, url) {
   const path = url.pathname;
   let m;
@@ -2237,6 +2378,10 @@ export default {
     }
     if (/^\/(support\/|stripe\/webhook$|looks\/|social\/|follow$)/.test(url.pathname)) {
       try { const r = await supportRoutes(request, env, url, ctx); if (r) return r; }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+    }
+    if (url.pathname.startsWith("/chat/")) {
+      try { return await chatRoutes(request, env, url, ctx); }
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/dm/")) {
