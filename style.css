@@ -86,10 +86,16 @@ main { width: 100%; max-width: 1100px; margin: 0 auto; padding: 28px 16px 40px; 
 .row[data-place="2"] .rank { color: var(--silver); }
 .row[data-place="3"] .rank { color: var(--bronze); }
 .player { display: flex; align-items: center; gap: 12px; min-width: 0; overflow: hidden; }
-.who { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
-.who .name { flex: 0 1 auto; min-width: 2.5em; }
-.tags { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1 auto; overflow: hidden; }
-.tags .sup-pill.rank { margin-left: 0; }
+/* ranking rows: the full name on top, the badges in a small line under it */
+.row:has(.tags) { height: auto; min-height: 58px; padding-top: 7px; padding-bottom: 7px; }
+.who { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; min-width: 0; flex: 1 1 auto; }
+.who .name { max-width: 100%; }
+.tags { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; max-width: 100%; }
+.tags .badge { font-size: 9px; padding: 1px 6px; letter-spacing: 0.1em; border-radius: 4px; }
+.row .tags .sup-pill.rank { margin: 0; padding: 0; border: 0; background: none; }
+.row .tags .sup-pill.rank span { display: none; }
+.row .tags .sup-pill.rank img, .row .tags .sup-pill.small img { width: 17px; height: 17px; }
+.row .tags .sup-pill.rank img { padding: 1px; border-radius: 50%; background: #ff6fae40; box-shadow: 0 0 0 1px #ff6fae88; }
 .avatar { width: 38px; height: 38px; border-radius: 8px; overflow: hidden; flex-shrink: 0; display: grid; place-items: center; background: #3b2f6e; }
 .avatar img, .card-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
 [hidden] { display: none !important; }
@@ -156,12 +162,8 @@ main { width: 100%; max-width: 1100px; margin: 0 auto; padding: 28px 16px 40px; 
   .row { height: auto; min-height: 58px; padding-top: 8px; padding-bottom: 8px; }
   .player { gap: 10px; }
   .avatar { width: 34px; height: 34px; }
-  .who { flex-direction: column; align-items: flex-start; gap: 4px; }
   .who .name { max-width: 100%; font-size: 14px; }
-  .tags { flex-wrap: wrap; gap: 4px; max-width: 100%; }
   .tags .badge { font-size: 8px; padding: 1px 5px; letter-spacing: 0.08em; }
-  .tags .sup-pill.rank { padding: 0; border: 0; background: none; }
-  .tags .sup-pill.rank img, .tags .sup-pill.small img { width: 16px; height: 16px; }
   .acc { font-size: 13px; }
   .pp { font-size: 14px; }
   .pp-old-tag { font-size: 8px; letter-spacing: 0.04em; }
