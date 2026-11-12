@@ -2015,6 +2015,33 @@ function discordToText(m) {
 
 const webhookId = (env) => (String(env.DISCORD_CHAT_WEBHOOK || "").match(/webhooks\/(\d+)\//) || [])[1] || null;
 
+/** How a player shows in the chat: their OCTIVE name, picture and badges (moderation overrides first). */
+async function chatIdentity(cfg, playerId, fallbackName) {
+  let card = {};
+  try { card = (await publicItems(cfg, playerId, ["card"])).card || {}; } catch { /* fallback */ }
+  const ov = moderation.overrides[playerId] || {};
+  const name = String(ov.name || card.name || fallbackName || "Player").slice(0, 40);
+  const avatarHash = ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : String(card.avatar || "");
+  return { id: playerId, name, badges: badgesOf(playerId), avatar: avatarHash ? `${WORKER_BASE}/avatar/${encodeURIComponent(playerId)}?v=${encodeURIComponent(avatarHash)}` : null };
+}
+
+/** Discord markdown as plain text (bold, code, timestamps, custom emoji). */
+const chatPlain = (t) => discordToText({ content: String(t || "") }).replace(/\*\*|__|~~|`/g, "").replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, "$1").trim();
+
+/** An OCTIVE command answer posted in the channel, short enough for the game's chat. */
+function commandCard(m) {
+  const name = m.interaction_metadata?.name || m.interaction?.name || "command";
+  const e = (m.embeds || [])[0] || null;
+  const title = e ? chatPlain(e.title || e.author?.name || "") : "";
+  let lines = [];
+  if (e) {
+    lines = chatPlain(e.description || "").split("\n").map((x) => x.trim()).filter((x) => x && x !== "\u3000");
+    for (const f of e.fields || []) if (lines.length < 6) lines.push(`${chatPlain(f.name)}: ${chatPlain(f.value).split("\n")[0]}`);
+  } else lines = chatPlain(m.content || "").split("\n").filter(Boolean);
+  lines = lines.slice(0, 6).map((x) => x.slice(0, 120));
+  return { name: String(name).split(" ")[0].slice(0, 32), title: title.slice(0, 100), lines, url: e?.url || null };
+}
+
 /** New messages from the Discord channel into the room. */
 async function chatPull(env) {
   if (!env.DISCORD_CHAT_CHANNEL_ID || !env.DISCORD_BOT_TOKEN) return;
@@ -2027,23 +2054,48 @@ async function chatPull(env) {
       headers: { Authorization: "Bot " + env.DISCORD_BOT_TOKEN, "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" },
     });
     if (!res.ok) { console.log("chat pull", res.status); return; }
-    const list = (await res.json()).filter((m) => m && m.id).sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+    let list = (await res.json()).filter((m) => m && m.id).sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+    // a command still "thinking": wait for its answer (but never longer than a minute)
+    const thinking = list.findIndex((m) => m.type === 20 && (Number(m.flags || 0) & 128) && Date.now() - Date.parse(m.timestamp) < 60_000);
+    if (thinking >= 0) list = list.slice(0, thinking);
     if (!list.length) return;
     const ours = webhookId(env);
+    const isCommand = (m) => m.type === 20 && (m.application_id === DISCORD_APP_ID || m.author?.id === DISCORD_APP_ID);
+    // Discord people who linked their OCTIVE account appear as their OCTIVE player
+    const who = new Map();
+    const cfg = config(env);
+    try { await loadModeration(cfg); } catch { /* badges may be missing */ }
+    for (const m of list) {
+      const u = isCommand(m) ? (m.interaction_metadata?.user || m.interaction?.user) : m.author;
+      if (!u?.id || who.has(u.id) || (u.bot && !isCommand(m))) continue;
+      who.set(u.id, null);
+      const pid = await linkedPlayer(env, u.id);
+      if (pid) who.set(u.id, await chatIdentity(cfg, pid, u.global_name || u.username));
+    }
+    const discordFrom = (u, member) => {
+      const shown = String(member?.nick || u?.global_name || u?.username || "Discord user").slice(0, 40);
+      const linked = u?.id ? who.get(u.id) : null;
+      if (linked) return { ...linked, discord: shown, discordId: u.id };
+      return { id: "discord:" + (u?.id || "0"), name: shown, discordId: u?.id || null, avatar: u?.avatar ? `https://cdn.discordapp.com/avatars/${u.id}/${u.avatar}.png?size=64` : null };
+    };
     await r2update(env, CHAT_KEY, chatEmpty, (b) => {
       let changed = false;
       for (const m of list) {
         if (b.lastDiscord && BigInt(m.id) <= BigInt(b.lastDiscord)) continue;
         b.lastDiscord = m.id; changed = true;
         if (m.webhook_id && m.webhook_id === ours) continue; // our own copy of a game message
+        if (isCommand(m)) {
+          // someone used an OCTIVE command in the channel: show who and the answer
+          const u = m.interaction_metadata?.user || m.interaction?.user || {};
+          const cmd = commandCard(m);
+          b.msgs.push({ seq: ++b.seq, id: "d" + m.id, at: m.timestamp || new Date().toISOString(), src: "command", text: "/" + cmd.name, cmd, from: discordFrom(u, m.interaction?.member) });
+          continue;
+        }
         if (m.author?.bot || (m.type !== 0 && m.type !== 19)) continue; // bots and system messages
         const text = discordToText(m);
         if (!text.trim()) continue;
-        const a = m.author || {};
-        b.msgs.push({
-          seq: ++b.seq, id: "d" + m.id, at: m.timestamp || new Date().toISOString(), src: "discord", text,
-          from: { id: "discord:" + a.id, name: String(m.member?.nick || a.global_name || a.username || "Discord user").slice(0, 40), avatar: a.avatar ? `https://cdn.discordapp.com/avatars/${a.id}/${a.avatar}.png?size=64` : null },
-        });
+        const from = discordFrom(m.author || {}, m.member);
+        b.msgs.push({ seq: ++b.seq, id: "d" + m.id, at: m.timestamp || new Date().toISOString(), src: "discord", text, from, linked: !from.id.startsWith("discord:") });
       }
       if (!changed) return false;
       if (b.msgs.length > CHAT_KEEP) b.msgs = b.msgs.slice(-CHAT_KEEP);
@@ -2078,14 +2130,9 @@ async function chatRoutes(request, env, url, ctx) {
     if (rl.at.length >= 12) fail(429, "You're sending a lot of messages. Wait a minute.");
     rl.at.push(now);
     await r2put(env, `chat/rate/${who.playerId}.json`, rl);
-    const card = (await publicItems(cfg, who.playerId, ["card"])).card || {};
-    const ov = moderation.overrides[who.playerId] || {};
-    const name = String(ov.name || card.name || who.username || "Player").slice(0, 40);
-    const avatarHash = ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : String(card.avatar || "");
-    const msg = {
-      id: "g" + crypto.randomUUID().replace(/-/g, "").slice(0, 16), at: new Date().toISOString(), src: "game", text,
-      from: { id: who.playerId, name, badges: badgesOf(who.playerId), avatar: avatarHash ? `${WORKER_BASE}/avatar/${encodeURIComponent(who.playerId)}?v=${encodeURIComponent(avatarHash)}` : null },
-    };
+    const from = await chatIdentity(cfg, who.playerId, who.username);
+    const name = from.name;
+    const msg = { id: "g" + crypto.randomUUID().replace(/-/g, "").slice(0, 16), at: new Date().toISOString(), src: "game", text, from };
     const box = await r2update(env, CHAT_KEY, chatEmpty, (bx) => {
       msg.seq = ++bx.seq;
       bx.msgs.push(msg);
@@ -2124,7 +2171,7 @@ async function chatRoutes(request, env, url, ctx) {
     });
     if (!removed) fail(404, "That message is already gone.");
     if (removed.discordId && env.DISCORD_CHAT_WEBHOOK) ctx.waitUntil(fetch(`${env.DISCORD_CHAT_WEBHOOK}/messages/${removed.discordId}`, { method: "DELETE" }).catch(() => {}));
-    else if (removed.src === "discord" && env.DISCORD_BOT_TOKEN && env.DISCORD_CHAT_CHANNEL_ID)
+    else if ((removed.src === "discord" || removed.src === "command") && env.DISCORD_BOT_TOKEN && env.DISCORD_CHAT_CHANNEL_ID)
       ctx.waitUntil(fetch(`https://discord.com/api/v10/channels/${env.DISCORD_CHAT_CHANNEL_ID}/messages/${removed.id.slice(1)}`, { method: "DELETE", headers: { Authorization: "Bot " + env.DISCORD_BOT_TOKEN } }).catch(() => {}));
     return reply({ ok: true });
   }
