@@ -1877,7 +1877,48 @@ async function isTester(request, env) {
   return badges.includes("TESTER") || badges.includes("DEV") || who.playerId === OWNER;
 }
 
+// Signed download links for the website (a link can't carry the sign-in header): valid for 2 hours.
+async function linkKey(env) {
+  let k = await r2json(env, "keys/test-links.json", null);
+  if (!k?.key) {
+    const b = crypto.getRandomValues(new Uint8Array(32));
+    k = { key: [...b].map((x) => x.toString(16).padStart(2, "0")).join("") };
+    await r2put(env, "keys/test-links.json", k);
+  }
+  return crypto.subtle.importKey("raw", new TextEncoder().encode(k.key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+}
+async function linkSig(env, file, exp) {
+  const sig = await crypto.subtle.sign("HMAC", await linkKey(env), new TextEncoder().encode(file + "|" + exp));
+  return [...new Uint8Array(sig)].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/** The tester download links (the website's Download page): the newest test build and signed file links. */
+async function testLinks(request, env) {
+  try {
+    if (!(await isTester(request, env))) return reply({ error: "Test builds are for testers." }, 403);
+  } catch (e) { return reply({ error: e.expose ? e.message : "Sign in first." }, e.status || 401); }
+  const m = await r2json(env, "test.json", null);
+  if (!m) return reply({ test: null });
+  const exp = Math.floor(Date.now() / 1000) + 2 * 3600;
+  const url = new URL(request.url);
+  const link = async (f) => f ? `${url.origin}/releases/test/${encodeURIComponent(f.file)}?exp=${exp}&sig=${await linkSig(env, f.file, exp)}` : null;
+  return reply({ test: { version: m.version, test: m.test, notes: m.notes, published: m.published,
+    windows: m.windows ? { size: m.windows.size, url: await link(m.windows) } : null,
+    android: m.android ? { size: m.android.size, url: await link(m.android) } : null,
+    web: !!m.web } });
+}
+
 async function testRelease(request, env, key) {
+  // a signed link from the website
+  const u = new URL(request.url), exp = Number(u.searchParams.get("exp")), sig = u.searchParams.get("sig") || "";
+  if (key.startsWith("test/") && exp && sig) {
+    if (exp * 1000 < Date.now()) return reply({ error: "This download link ran out. Open the Download page again." }, 403);
+    if (sig !== await linkSig(env, key.slice(5), exp)) return reply({ error: "This download link isn't valid." }, 403);
+    const res = await release(env, key, request);
+    const h = new Headers(res.headers);
+    h.set("Cache-Control", "private, no-store");
+    return new Response(res.body, { status: res.status, headers: h });
+  }
   try {
     if (!(await isTester(request, env))) return reply({ error: "Test builds are for testers." }, 403);
   } catch (e) { return reply({ error: e.expose ? e.message : "Sign in first." }, e.status || 401); }
@@ -1932,9 +1973,10 @@ export default {
       const w = url.pathname.match(/^\/web\/(\d{1,3}\.\d{1,3}\.\d{1,3}|t-[a-f0-9]{24})\/(?:~[A-Za-z0-9-]{1,40}\/)?((?:Build|StreamingAssets)\/[A-Za-z0-9._\/-]{1,200})$/);
       if (w && !w[2].includes("..")) return await webFile(env, w[1], w[2], request);
       if (url.pathname === "/releases/test.json") return await testRelease(request, env, "test.json");
+      if (url.pathname === "/releases/test-links") return await testLinks(request, env);
       const tf = url.pathname.match(/^\/releases\/test\/([A-Za-z0-9._-]{1,120})$/);
       if (tf) return await testRelease(request, env, `test/${tf[1]}`);
-      const r = url.pathname.match(/^\/releases\/([A-Za-z0-9._-]{1,120})$/);
+      const r = url.pathname.match(/^\/releases\/(latest\.json|OCTIVE[A-Za-z0-9._-]{0,120})$/);
       if (r) return await release(env, r[1], request);
       return cors(new Response("Not found", { status: 404 }));
     } catch (e) {

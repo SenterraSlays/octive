@@ -458,6 +458,12 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
 
 .sup-section { margin-top: 18px; padding: 18px; border-radius: 16px; border: 1px solid #ff6fae44; background: linear-gradient(135deg, #ff6fae12, transparent 60%); }
 .sup-section h2 { margin: 0 0 4px; color: var(--pink); font-size: 18px; }
+.tester-dl { margin: 0 0 22px; padding: 18px 20px; border-radius: 16px; border: 1px solid #5fb8ff55; background: linear-gradient(135deg, #5fb8ff14, transparent 60%), var(--surface); }
+.tester-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.tester-head h2 { margin: 0; font-size: 19px; }
+.tester-tag { background: #5fb8ff; color: #06121f; }
+.tester-notes { margin: 10px 0 0; padding: 10px 12px; border-radius: 10px; background: #ffffff08; color: var(--dim); font-size: 14px; }
+.tester-btns { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
 .sup-title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
 .sup-title h2 { margin: 0; }
 .sup-no { padding: 3px 10px; border-radius: 999px; border: 1px solid #ff6fae66; background: #ff6fae14; color: var(--pink); font-size: 12px; font-weight: 800; letter-spacing: 0.05em; font-variant-numeric: tabular-nums; }

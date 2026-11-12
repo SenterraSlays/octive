@@ -521,11 +521,37 @@
       "Not supported", "OCTIVE doesn't run on Macs, and there are no plans for a macOS version right now.",
       h("span.btn.wide.disabled", { "aria-disabled": "true" }, "Not available"));
     const notes = h("section.release-notes", { hidden: true });
+    const testerBox = h("section.tester-dl", { hidden: true });
     const page = h("div.download-page", {},
       h("section.page-head", {}, h("h1", { text: "Download OCTIVE" }), h("p.sub", { text: "Free on Windows and Android. Your account, scores and friends work on both." })),
+      testerBox,
       h("div.dl-grid", {}, win, android, web, linux, mac),
       notes);
     app.replaceChildren(page);
+    // testers (signed in here): the newest test build; the server only answers testers
+    (async () => {
+      if (!worker || !(store.get("octive.token", true) || store.get("octive.session"))) return;
+      let t = null;
+      try {
+        if (!store.get("octive.token", true)) await refreshSession();
+        t = (await callApi("/releases/test-links", undefined, true)).test;
+      } catch { return; }
+      if (!t || !page.isConnected) return;
+      const label = `${t.version}-test${t.test}`;
+      const onTest = store.get("octive.webChannel") === "test";
+      const play = h("button.btn", { type: "button", onclick: () => { store.set("octive.webChannel", onTest ? "release" : "test"); location.href = "play/"; } },
+        onTest ? "▶ Play the latest release in the browser" : "▶ Play the test build in the browser");
+      testerBox.replaceChildren(
+        h("div.tester-head", {}, h("span.badge.tester-tag", { text: "TESTER" }), h("h2", { text: `Test build ${label}` })),
+        h("p.panel-sub", { text: "Only testers see this. It's a test build, not a full release: it may have bugs. It installs over your current OCTIVE (songs, scores and settings are kept); after that the game offers newer test builds itself, and the Swap button in the main menu goes back to the latest release. When the full release comes out, test builds update to it." }),
+        t.notes ? h("p.tester-notes", { text: t.notes }) : null,
+        h("div.tester-btns", {},
+          t.windows ? h("a.btn.primary", { href: t.windows.url }, `Windows · ${mb(t.windows.size)}`) : null,
+          t.android ? h("a.btn.primary", { href: t.android.url }, `Android APK · ${mb(t.android.size)}`) : null,
+          t.web ? play : null),
+        h("p.dl-note", { text: "Windows: unzip it anywhere and open OCTIVE.exe; it installs itself over your current version. Android: open the APK. Links work for 2 hours; reload this page for new ones." }));
+      testerBox.hidden = false;
+    })();
     document.title = "Download · OCTIVE";
     loadRelease().then((m) => {
       if (!m || !page.isConnected) return;
