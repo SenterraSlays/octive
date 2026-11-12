@@ -1263,7 +1263,8 @@ function supportStatus(rec, playerId, boost) {
     until: lifetime ? null : until > now ? new Date(until).toISOString() : booster ? null : until ? new Date(until).toISOString() : null,
     days: Math.floor(days), months, since,
     milestone, purchases: (rec?.purchases || []).length,
-    totalMonthsBought: (rec?.purchases || []).reduce((n, p) => n + (p.months || 0), 0),
+    totalMonthsBought: (rec?.purchases || []).filter((p) => !p.gift).reduce((n, p) => n + (p.months || 0), 0),
+    monthsReceived: (rec?.purchases || []).filter((p) => p.gift).reduce((n, p) => n + (p.months || 0), 0),
   };
 }
 
@@ -1291,10 +1292,10 @@ async function supporters(env) {
   const out = {};
   const ids = new Set(LIFETIME_SUPPORTERS);
   const gifted = {}, firstBuy = {};
-  const bought = (id, at, months, gift) => {
+  const bought = (id, at, months, gift, paid = true) => {
     if (!id || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return;
     const t = Date.parse(at) || Date.now();
-    if (!(id in firstBuy) || t < firstBuy[id]) firstBuy[id] = t;
+    if (paid && (!(id in firstBuy) || t < firstBuy[id])) firstBuy[id] = t;
     if (gift) gifted[id] = (gifted[id] || 0) + (months || 0);
   };
   let cursor;
@@ -1314,16 +1315,16 @@ async function supporters(env) {
     const list = await env.RELEASES.list({ prefix: "gifts/", cursor });
     await Promise.all(list.objects.map(async (o) => {
       const g = await r2json(env, o.key, { pending: [] });
-      for (const x of g.pending || []) if (!x.free && x.amount > 0) bought(x.from, x.at, x.months, true);
+      for (const x of g.pending || []) bought(x.from, x.at, x.months, true, !x.free && x.amount > 0);
     }));
     cursor = list.truncated ? list.cursor : undefined;
   } while (cursor);
   await Promise.all([...ids].map(async (id) => {
     const rec = await r2json(env, `supporters/${id}.json`, null);
     for (const p of rec?.purchases || []) {
-      if (!(p.amount > 0)) continue; // free gifts from the developer aren't purchases
-      if (p.gift) bought(p.gift, p.at, p.months, true);
-      else bought(id, p.at, p.months, false);
+      const paid = p.amount > 0; // free gifts from the developer count as gifted, not as purchases
+      if (p.gift) bought(p.gift, p.at, p.months, true, paid);
+      else if (paid) bought(id, p.at, p.months, false);
     }
     const boost = boosts[id] ? await r2json(env, `boosters/${id}.json`, null) : null;
     const st = supportStatus(rec, id, boost);
