@@ -14,6 +14,7 @@
     TESTER: { badge: "TESTER", title: "OCTIVE tester", cls: "role-tester" },
     VIP: { badge: "VIP", title: "OCTIVE VIP", cls: "role-vip" },
     CREATOR: { badge: "CREATOR", title: "Content creator", cls: "role-creator" },
+    CHARTER: { badge: "CHARTER", title: "OCTIVE charter", cls: "role-charter" },
   };
   /**
    * The rankings Worker (Cloudflare) address, e.g. "https://octive-rankings.yourname.workers.dev".
@@ -179,7 +180,7 @@
       const n = src[i + 1];
       if (n === "#") { text += "#"; i++; continue; }
       if (n === "[" && src[i + 8] === "]" && /^[0-9a-fA-F]{6}$/.test(src.slice(i + 2, i + 8))) { flush(); cur = { ...cur, colour: src.slice(i + 2, i + 8), rainbow: false }; i += 8; continue; }
-      if (/^[0-9a-fA-F]{6}$/.test(src.slice(i + 1, i + 7)) && !isHex(src[i + 7] || "")) { flush(); cur = { ...cur, colour: src.slice(i + 1, i + 7), rainbow: false }; i += 6; continue; }
+      if (/^[0-9a-fA-F]{6}$/.test(src.slice(i + 1, i + 7))) { flush(); cur = { ...cur, colour: src.slice(i + 1, i + 7), rainbow: false }; i += 6; continue; }
       const c = n.toLowerCase();
       if (COLOURS[c] !== undefined) { flush(); cur = { colour: COLOURS[c] }; i++; continue; }
       const style = { l: "bold", o: "italic", n: "underline", m: "strike", k: "scramble", g: "rainbow" }[c];
@@ -234,10 +235,10 @@
         r.querySelector(".acc").textContent = fmt2.format(p.accuracy || 0) + "%";
         r.querySelector(".lvl").textContent = "Lv" + (p.level || 1);
         r.querySelector(".plays").textContent = fmt0.format(p.playCount || 0);
-        r.querySelector(".pp").textContent = fmt0.format(p.pp || 0) + "pp";
+        r.querySelector(".pp").textContent = fmt0.format(p.pp || 0) + " PR";
         if ((p.ppVersion || 2) < 3) {
           r.classList.add("pp-old");
-          r.querySelector(".pp").title = "PP from before the PP rework. It updates the next time this player opens OCTIVE.";
+          r.querySelector(".pp").title = "PR from before the rework. It updates the next time this player opens OCTIVE.";
           r.querySelector(".pp").append(h("span.pp-old-tag", { text: "before rework" }));
         }
         rows.appendChild(r);
@@ -269,7 +270,7 @@
     decorateCard(card, p);
     card.after(socialRow(p));
     const set = (sel, v) => { view.querySelector(sel).textContent = v; };
-    set(".c-pp", fmt0.format(p.pp || 0) + "pp");
+    set(".c-pp", fmt0.format(p.pp || 0) + " PR");
     set(".c-acc", fmt2.format(p.accuracy || 0) + "%");
     set(".c-rank", "#" + fmt0.format(p.rank));
     const lv = p.level || 1;
@@ -297,6 +298,21 @@
       const box = view.querySelector(".social-links");
       if (box && renderSocials(box, p.socials) > 0) view.querySelector(".socials").hidden = false;
     }
+    // everything under the card goes into tabs: the overview, and who they follow / are followed by / are friends with
+    const overview = h("div.prof-overview");
+    for (const el of [...view.children]) if (!el.matches(".back, .card, .social-row")) overview.append(el);
+    const pane = h("div.prof-pane");
+    const tabBtns = {};
+    const tabs = h("nav.prof-tabs", {}, ...[["overview", "Overview"], ["followers", "Followers"], ["following", "Following"], ["friends", "Friends"]].map(([k, label]) =>
+      (tabBtns[k] = h("button.prof-tab", { type: "button", onclick: () => openTab(k) }, label))));
+    function openTab(k) {
+      for (const [key, b] of Object.entries(tabBtns)) b.classList.toggle("active", key === k);
+      if (k === "overview") { pane.replaceChildren(overview); return; }
+      pane.replaceChildren(peopleList(p, k));
+    }
+    view.append(tabs, pane);
+    openTab("overview");
+    view.querySelector(".social-row")?.addEventListener("open-list", (e) => { openTab(e.detail); tabs.scrollIntoView({ behavior: "smooth", block: "start" }); });
     app.replaceChildren(view);
     document.title = `${p.name} · OCTIVE Rankings`;
     setTimeout(giftPopup, 400);
@@ -393,7 +409,7 @@
 
   const FEATURES = [
     ["osu", "Your osu! library", "Point OCTIVE at your osu! folder and play every mania map (and convert the rest). Collections come along too."],
-    ["pp", "Global ranking", "Every chart has a star rating. Your best plays earn performance points, levels and a place on the ranking."],
+    ["pp", "Global ranking", "Every chart has a star rating. Your best plays earn performance rating (PR), levels and a place on the ranking."],
     ["mp", "Multiplayer", "Make a room, share the code and play the same chart together, or watch a friend play live."],
     ["practice", "Practice mode", "Loop the hard part, slow it down to 0.5x and work up to full speed."],
     ["editor", "Chart editor", "Make your own charts with a waveform, scrub bar, test play and up to 20 keys."],
@@ -421,7 +437,7 @@
       h("div.home-copy", {},
         h("span.eyebrow", { text: "Free rhythm game · Windows and Android" }),
         h("h1", {}, "Hit every note.", h("br"), h("span.grad", { text: "Climb the ranking." })),
-        h("p.lead", { text: "OCTIVE is a vertical scrolling rhythm game for 1 to 20 keys. Bring your osu!mania library, play with friends online and earn performance points on a global ranking." }),
+        h("p.lead", { text: "OCTIVE is a vertical scrolling rhythm game for 1 to 20 keys. Bring your osu!mania library, play with friends online and earn performance rating (PR) on a global ranking." }),
         h("div.cta", {},
           h("a.btn.primary", { href: "#/download" }, "Download free"),
           h("a.btn.play", { href: "play/" }, "▶ Play in browser"),
@@ -433,7 +449,7 @@
     const stats = h("section.home-stats", {},
       stat("Ranked players", data ? fmt0.format(players.length) : "…"),
       stat("Online now", data ? fmt0.format(players.filter((p) => p.online).length) : "…", "online-count"),
-      stat("Top performance", top ? fmt0.format(top.pp) + "pp" : "—"),
+      stat("Top performance", top ? fmt0.format(top.pp) + " PR" : "—"),
       stat("Latest version", "…"));
     const features = h("section.features", {},
       h("h2.section-title", { text: "Everything a rhythm game player wants" }),
@@ -445,7 +461,7 @@
           h("span.pod-rank", { text: "#" + p.rank }),
           h("span.avatar", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial"), h("span.dot", { hidden: true })),
           h("span.pod-name", {}, h("span.name", { text: p.name || "Player" }), h("span.badge", { hidden: true })),
-          h("span.pod-pp", { text: fmt0.format(p.pp || 0) + "pp" }),
+          h("span.pod-pp", { text: fmt0.format(p.pp || 0) + " PR" }),
           h("span.pod-sub", { text: `${fmt2.format(p.accuracy || 0)}% · Lv${p.level || 1}` }));
         setAvatar(a.querySelector(".avatar"), p);
         setRole(a, a.querySelector(".badge"), p);
@@ -559,6 +575,12 @@
   function updateAccountNav() {
     const a = document.querySelector('[data-nav="account"]');
     if (a) a.textContent = me ? me.name : "Sign in";
+    const m = document.querySelector('[data-nav="messages"]');
+    if (m) {
+      m.hidden = !me;
+      m.textContent = "Messages";
+      if (me && dmUnread > 0) m.append(h("span.nav-count", { text: String(dmUnread) }));
+    }
   }
 
   const field = (label, input, hint) => h("label.field", {}, h("span.field-label", { text: label }), input, hint ? h("span.field-hint", { text: hint }) : null);
@@ -632,7 +654,7 @@
         h("div.card-name-row", {}, h("h1.card-name", { text: me.name }), h("span.badge", { hidden: true })),
         status ? h("div.card-status", { text: status }) : null,
         me.hasCard ? h("dl.card-stats", {},
-          h("div", {}, h("dt", { text: "Performance" }), h("dd", { text: fmt0.format(c.pp) + "pp" })),
+          h("div", {}, h("dt", { text: "Performance" }), h("dd", { text: fmt0.format(c.pp) + " PR" })),
           h("div", {}, h("dt", { text: "Accuracy" }), h("dd", { text: fmt2.format(c.accuracy) + "%" })),
           h("div", {}, h("dt", { text: "Level" }), h("dd", { text: "Lv" + c.level })),
           h("div", {}, h("dt", { text: "Plays" }), h("dd", { text: fmt0.format(c.playCount) }))) : h("p.panel-sub", { text: "Play a chart in the game while signed in and your stats show up here." })),
@@ -651,11 +673,13 @@
     const editable = me.hasCard && !me.banned;
     const tabs = [
       editable && ["supporter", "♥ Supporter", supporterPanel],
-      editable && ["profile", "Picture & bio", () => h("div.split", {}, picturePanel(), bioPanel())],
-      editable && me.creator && ["socials", "Socials", socialsPanel],
-      ["discord", "Discord", discordPanel],
+      editable && ["profile", "Profile", () => h("div", {}, h("div.split", {}, picturePanel(), bioPanel()), me.creator ? socialsPanel() : null)],
+      ["preferences", "Preferences", preferencesPanel],
       ["security", "Email & password", () => h("div.split", {}, emailPanel(), passwordPanel())],
     ].filter(Boolean);
+    const wanted = hashQuery().get("tab");
+    if (wanted && tabs.some((t) => t[0] === wanted)) accountTab = wanted;
+    if (accountTab === "discord" || accountTab === "socials") accountTab = accountTab === "discord" ? "preferences" : "profile";
     if (!tabs.some((t) => t[0] === accountTab)) accountTab = tabs[0][0];
     const nav = h("nav.acc-nav", { "aria-label": "Account sections" });
     const body = h("div.acc-body");
@@ -781,7 +805,20 @@
       box.append(h("div.panel-actions", { style: "justify-content:flex-start" }, get), codeBox);
     };
     render();
-    return section("Discord", "Link your Discord so /profile in the OCTIVE Discord shows your stats. You get a code here, then use /link in Discord.", box, out);
+    return section("Discord", "Link your Discord: /profile in the OCTIVE Discord shows your stats, and boosting the server makes you a supporter. You get a code here, then use /link in Discord.", box, out);
+  }
+
+  /** Preferences: connections (Discord) and shortcuts; the game's own options are in its Settings → Profile. */
+  function preferencesPanel() {
+    const conn = discordPanel();
+    const boost = h("p.field-hint", { text: "Boosting the OCTIVE Discord server with your Discord linked makes you a supporter for as long as the boost lasts (any paid supporter time is paused meanwhile and continues after)." });
+    conn.append(boost);
+    const more = section("Messages and friends", "Read and send messages to your friends, see who follows you, and manage who you follow.",
+      h("div.panel-actions", { style: "justify-content:flex-start;gap:10px;flex-wrap:wrap" },
+        h("a.btn.primary", { href: "#/messages" }, "Open messages"),
+        h("a.btn", { href: "#/u/" + encodeURIComponent(me.playerId) }, "My public profile")));
+    const game = section("In the game", "Discord status, appearing offline, who can watch you play and notifications are set in OCTIVE: Settings → Profile.");
+    return h("div", {}, conn, more, game);
   }
 
   function emailPanel() {
@@ -998,11 +1035,12 @@
     if (!s || (!s.active && !(s.days > 0))) return null;
     const earned = MILESTONE_ART.slice().reverse().filter(([m]) => (s.months || 0) >= m);
     return h("section.sup-section", {},
-      h("h2", { text: s.lifetime ? "Lifetime supporter" : s.active ? "OCTIVE supporter" : "Former supporter" }),
+      h("h2", { text: s.lifetime ? "Lifetime supporter" : s.booster ? "OCTIVE supporter · Server Booster" : s.active ? "OCTIVE supporter" : "Former supporter" }),
       h("div.tiles", {},
         h("div.tile", {}, h("span", { text: "Supported for" }), h("b", { text: monthsText(s.days) })),
         h("div.tile", {}, h("span", { text: "Since" }), h("b", { text: s.since ? new Date(s.since).toLocaleDateString(undefined, { month: "short", year: "numeric" }) : "—" })),
         s.lifetime ? h("div.tile", {}, h("span", { text: "Until" }), h("b", { text: "Forever" }))
+          : s.booster ? h("div.tile", {}, h("span", { text: "Until" }), h("b", { text: "Server Booster" }))
           : s.active && s.until ? h("div.tile", {}, h("span", { text: "Until" }), h("b", { text: new Date(s.until).toLocaleDateString(undefined, { dateStyle: "medium" }) })) : null,
         h("div.tile", {}, h("span", { text: "Months bought" }), h("b", { text: fmt0.format(s.totalMonthsBought || 0) }))),
       h("div.sup-earned", {}, earned.map(([, key, label]) => h("figure", {}, h("img", { src: `badges/supporter-${key}.png`, alt: "" }), h("figcaption", { text: label })))));
@@ -1033,8 +1071,13 @@
       followBtn.disabled = false; paint();
     });
     const gift = h("a.btn.gift", { href: "#/supporter?gift=" + encodeURIComponent(p.id), hidden: !!(me && me.playerId === p.id) || !!(p.supporter && p.supporter.lifetime) }, "♥ Gift supporter");
-    const row = h("div.social-row", {},
-      h("span.follow-count", {}, followers, " followers"), h("span.follow-count", {}, following, " following"),
+    const friends = h("b", { text: "…" });
+    let row;
+    const open = (k) => row.dispatchEvent(new CustomEvent("open-list", { detail: k }));
+    row = h("div.social-row", {},
+      h("button.follow-count", { type: "button", onclick: () => open("followers"), title: "See who follows " + (p.name || "them") }, followers, " followers"),
+      h("button.follow-count", { type: "button", onclick: () => open("following"), title: "See who " + (p.name || "they") + " follows" }, following, " following"),
+      h("button.follow-count", { type: "button", onclick: () => open("friends"), title: "See " + (p.name || "their") + "'s friends" }, friends, " friends"),
       h("span.grow"), out, followBtn, gift);
     paint();
     (async () => {
@@ -1044,6 +1087,7 @@
         const s = await res.json();
         followers.textContent = fmt0.format(s.followers || 0);
         following.textContent = fmt0.format((s.following || []).length);
+        friends.textContent = s.friends != null ? fmt0.format(s.friends) : "—";
         youFollow = isOwner || s.youFollow === true;
         paint();
       } catch { followers.textContent = "—"; following.textContent = "—"; }
@@ -1051,6 +1095,46 @@
     return row;
   }
   const ROLE_OWNER = "PlwcYVKV9y7NBFWfUaC263XpCFbE";
+
+  /** Followers, following or friends of a player; on your own profile you can unfollow and unfriend here. */
+  function peopleList(p, kind) {
+    const box = h("div.people", {}, h("p.empty", { text: "Loading…" }));
+    (async () => {
+      let r;
+      try { r = await callApi(`/social/${encodeURIComponent(p.id)}/${kind}`, undefined, !!(store.get("octive.token", true) || store.get("octive.session"))); }
+      catch (e) { box.replaceChildren(h("p.empty", { text: e.message })); return; }
+      const list = r.players || [];
+      const empty = { followers: "No followers yet.", following: "Not following anyone yet.", friends: "No friends to show. Friends show here once their game has been opened with version 1.4." }[kind];
+      if (!list.length) { box.replaceChildren(h("p.empty", { text: empty })); return; }
+      const mine = !!r.mine;
+      box.replaceChildren(h("p.people-count", { text: `${fmt0.format(list.length)} ${kind === "followers" ? (list.length === 1 ? "follower" : "followers") : kind === "friends" ? (list.length === 1 ? "friend" : "friends") : "followed"}` }),
+        ...list.map((x) => {
+          const actions = h("span.people-actions");
+          const row = h("div.person", {},
+            h("a.person-main", { href: "#/u/" + encodeURIComponent(x.id) },
+              dmAvatar(x.id, x.name, "person-av"),
+              h("span.person-text", {}, h("span.person-name", { text: x.name || "Player" }),
+                h("span.person-sub", { text: [x.rank ? "#" + fmt0.format(x.rank) : null, x.pp ? fmt0.format(x.pp) + " PR" : null, x.level ? "Lv" + x.level : null].filter(Boolean).join(" · ") || "not ranked yet" })),
+              x.online ? h("span.person-on", { title: "Online" }) : null),
+            actions);
+          if (mine && kind === "following" && x.id !== ROLE_OWNER)
+            actions.append(h("button.btn", { type: "button", onclick: async (e) => {
+              e.target.disabled = true;
+              try { await callApi("/follow", { playerId: x.id, follow: false }, true); row.remove(); } catch (err) { e.target.disabled = false; alert(err.message); }
+            } }, "Unfollow"));
+          if (mine && kind === "friends") {
+            actions.append(h("a.btn", { href: "#/messages/" + encodeURIComponent(x.id) }, "Message"));
+            actions.append(h("button.btn", { type: "button", onclick: async (e) => {
+              if (!confirm(`Remove ${x.name || "this player"} from your friends? Your game removes the friendship the next time it's open.`)) return;
+              e.target.disabled = true;
+              try { await callApi("/dm/unfriend", { playerId: x.id }, true); row.remove(); } catch (err) { e.target.disabled = false; alert(err.message); }
+            } }, "Unfriend"));
+          }
+          return row;
+        }));
+    })();
+    return box;
+  }
 
   // ---------------------------------------------------------------- #/supporter
 
@@ -1179,7 +1263,7 @@
       status.textContent = "";
       const s = me && me.supporter;
       if (s && (s.active || s.days > 0))
-        status.append(h("span.sup-pill", {}, h("img", { src: `badges/supporter-${milestoneArt(s.months || 0)[1]}.png`, alt: "" }), h("span", { text: s.lifetime ? "Lifetime supporter" : s.active ? `Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "medium" })}` : "Former supporter" })),
+        status.append(h("span.sup-pill", {}, h("img", { src: `badges/supporter-${milestoneArt(s.months || 0)[1]}.png`, alt: "" }), h("span", { text: s.lifetime ? "Lifetime supporter" : s.booster ? "Supporter · Server Booster" : s.active ? `Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "medium" })}` : "Former supporter" })),
           h("span.dim", { text: ` · ${monthsText(s.days)} in total` }));
     };
     paintMe();
@@ -1274,7 +1358,10 @@
         } catch (e) { setMsg(out, e.message); }
       });
     });
-    return section(s.lifetime ? "Supporter · lifetime" : "Supporter", s.lifetime ? `Thank you! You've supported OCTIVE for ${monthsText(s.days)}.` : `Thank you! Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "long" })} · ${monthsText(s.days)} in total.`,
+    return section(s.lifetime ? "Supporter · lifetime" : s.booster ? "Supporter · Server Booster" : "Supporter",
+      s.lifetime ? `Thank you! You've supported OCTIVE for ${monthsText(s.days)}.`
+        : s.booster ? `Thank you for boosting the OCTIVE Discord! You're a supporter while the boost lasts.${s.until ? ` Your paid supporter time is paused meanwhile and continues afterwards (until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "long" })}).` : ""}`
+        : `Thank you! Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "long" })} · ${monthsText(s.days)} in total.`,
       h("div.sup-edit", {},
         h("div.sup-col", {},
           field("Coloured name", nameInput, "Bio codes that spell your name exactly: #g rainbow, #c red, #l bold, #RRGGBB."),
@@ -1407,6 +1494,227 @@
     setTimeout(() => claim.focus(), 30);
   }
 
+  // ---------------------------------------------------------------- #/help: common questions
+  const HELP = [
+    ["Getting started", [
+      ["How do I get OCTIVE?", "Download it from the Download page: Windows (installer), Android (APK) or play in your browser. It's free."],
+      ["Do I need an account?", "No, you can play offline. An account puts your scores on the global ranking, keeps them in sync between devices, and lets you add friends and play multiplayer. Make one in the game: Profile → Sign up."],
+      ["Can I play my osu!mania maps?", "Yes. On Windows, Song Select → the folder button imports your whole osu! Songs folder, or import single .osz / .osu files. osu!standard, taiko and catch maps can be converted to 4K too (Settings → osu! songs)."],
+      ["The notes feel early or late", "Use Settings → Calibration: tap along to the clicks and apply the suggested audio offset. The visual offset moves only what you see."],
+    ]],
+    ["Scoring, PR and mods", [
+      ["What is PR?", "PR is your performance rating (it used to be called PP). It works like osu!'s performance points."],
+      ["How is PR worked out?", "Like osu!mania: each chart has a star rating, and a play's PR grows with the stars and needs high accuracy (osu!mania accuracy: Marvelous 320, Perfect 300, Great 200, Good 100, Bad 50). Your total is your best plays, each worth 95% of the one before, plus a small bonus for the number of charts played."],
+      ["Why did my PR change?", "Version 1.3.3 reworked PR: vibro and spam charts are rated more fairly and accuracy counts more. Your past plays were recalculated the first time you opened the new version."],
+      ["What do mods do?", "Pick them in Song Select (Mods, or F1). Easy widens the timing windows (PP ×0.5), Hard Rock tightens them (PP ×1.1), Hidden and Fade In hide the notes in different ways (PP ×1.06), Half Time and Double Time change the song speed (the stars are worked out at that speed), and Mirror flips the chart."],
+      ["Which charts give PR?", "Every chart you finish, built-in or imported. OCTIVE Official charts also have an online leaderboard per chart."],
+    ]],
+    ["Multiplayer and friends", [
+      ["How do I play with friends?", "Play → Multiplayer. The host makes a room and shares its code (or uses Invite friends); others join with the code or from Public rooms. Everyone needs the chart: built-in songs always work, imported songs must be the same file."],
+      ["My friend didn't get my invite", "They need to be on your friends list and online. Invites show as a notification with a Join button and in their Friends panel (F8)."],
+      ["What Discord commands are there?", "In the OCTIVE Discord: /profile shows a player's stats (yours, if linked), /leaderboard the ranking, /online who's playing, /download the game, /link connects your OCTIVE account (get the code on the website: Account → Preferences → Link Discord), /unlink disconnects it, and /update re-checks your supporter status and server boost right away and gives or removes the OCTIVE Supporter role."],
+      ["How do I get the OCTIVE Supporter role in Discord?", "Link your Discord (Account → Preferences → Link Discord, then /link in Discord). Supporters get the role automatically within a few hours, or straight away with /update. Boosting the OCTIVE Discord server also makes you a supporter while the boost lasts; any paid supporter time is paused meanwhile and continues afterwards."],
+      ["Can I message friends who are offline?", "Yes. Messages are saved to your account, so friends get them the next time they open OCTIVE. You can also read and send messages on this website: sign in and open Messages. Only friends can message each other."],
+      ["How do I play with just one friend?", "Open Friends (F8), click your friend and choose Play together. OCTIVE makes a private room for the two of you and sends them the invite."],
+      ["Can people watch me play?", "Friends can watch your plays live if you allow it in Settings → Profile & data."],
+    ]],
+    ["Accounts and scores", [
+      ["I signed in to another account and my scores were gone", "Scores on a computer belong to one account. When someone else signs in, your scores are put aside and come back when you sign in again. Plays made while signed out are only added to an account if you say yes when it asks."],
+      ["I forgot my password", "Use Forgot password on the Account page. It needs an email linked to your account (link one on the Account page while signed in)."],
+      ["Can I change my name?", "Yes, once a week in the game (Profile → Change name). Supporters can change it any time."],
+    ]],
+    ["Supporter and payments", [
+      ["What does supporting give?", "A supporter badge with anniversary art, a profile banner, coloured names, profile effects, an animated GIF picture, free name changes and a pink border on leaderboards. It's cosmetic only and never affects scores."],
+      ["How do gifts work?", "Choose As a gift on the Supporter page and pick a player. They get a pop-up on their own profile on this website to claim it, and their time starts when they claim it."],
+      ["Does it renew automatically?", "No. Each purchase is a one-time payment through Stripe; nothing is charged again."],
+    ]],
+    ["Problems", [
+      ["An osu! song won't play", "Some osu! maps have audio that's really an MP4 file with an .mp3 name. OCTIVE 1.4 plays these on Windows. If a song still fails, re-import it or report it in the Discord."],
+      ["osu! maps scroll strangely", "Turn off osu! scroll speed changes in Settings → Gameplay for a constant speed, like osu!'s constant speed option."],
+      ["Where are my files?", "Settings → Profile & data shows the data folder (songs, replays, skins and settings) with an Open folder button."],
+      ["Something else?", "Ask in the OCTIVE Discord server or open an issue at github.com/SenterraSlays/octive-rankings/issues."],
+    ]],
+  ];
+
+  function helpPage() {
+    document.title = "Help · OCTIVE";
+    const q = h("input.help-search", { type: "search", placeholder: "Search the questions…", "aria-label": "Search help" });
+    const list = h("div.help-list");
+    const paint = () => {
+      const term = q.value.trim().toLowerCase();
+      list.replaceChildren(...HELP.map(([group, items]) => {
+        const shown = items.filter(([a, b]) => !term || (a + " " + b).toLowerCase().includes(term));
+        if (!shown.length) return null;
+        return h("section.help-group", {}, h("h2", { text: group }),
+          ...shown.map(([a, b]) => h("details.help-item", term ? { open: true } : {}, h("summary", { text: a }), h("p", { text: b }))));
+      }).filter(Boolean));
+      if (!list.children.length) list.append(h("p.empty", { text: "No questions match. Try other words, or ask in the Discord." }));
+    };
+    q.addEventListener("input", paint);
+    paint();
+    app.replaceChildren(h("div.help-page", {},
+      h("section.page-head", {}, h("h1", { text: "Help" }), h("p.sub", { text: "Common questions about OCTIVE." })),
+      q, list));
+  }
+
+
+  // ---------------------------------------------------------------- messages (the same ones as in the game)
+  // #/messages lists conversations and friends; #/messages/<playerId> opens one. Messages live on the
+  // Worker (/dm/*), so they reach friends who are offline and match the game on every device.
+
+  let dmUnread = 0, dmTimer = null;
+
+  async function refreshDmBadge() {
+    if (!worker || !me) return;
+    try { const box = await callApi("/dm/inbox", undefined, true); dmUnread = box.unread || 0; } catch { /* keep */ }
+    updateAccountNav();
+  }
+
+  const dmAvatar = (id, name, cls = "dm-av") => {
+    const el = h("span." + cls, { text: (name || "?").slice(0, 1).toUpperCase() });
+    const img = h("img", { src: `${worker}/avatar/${encodeURIComponent(id)}`, alt: "", loading: "lazy" });
+    img.addEventListener("load", () => { el.textContent = ""; el.append(img); });
+    return el;
+  };
+
+  function dmWhen(ms) {
+    const d = new Date(ms), now = new Date();
+    if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    if (now - d < 6 * 86_400_000) return d.toLocaleDateString(undefined, { weekday: "short" });
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  }
+
+  async function messagesPage() {
+    document.title = "Messages · OCTIVE";
+    clearInterval(dmTimer); dmTimer = null;
+    if (!worker) { app.replaceChildren(h("p.empty", { text: "Messages aren't available on this copy of the site." })); return; }
+    if (!me && (store.get("octive.token", true) || store.get("octive.session"))) {
+      app.replaceChildren(h("p.empty", { text: "Loading your messages…" }));
+      try { if (!store.get("octive.token", true)) await refreshSession(); me = await callApi("me", undefined, true); updateAccountNav(); } catch { /* signed out */ }
+      if (page() !== "messages") return;
+    }
+    if (!me) {
+      app.replaceChildren(h("div.dm-signin", {},
+        h("h1", { text: "Messages" }),
+        h("p.sub", { text: "Sign in with your OCTIVE account to read and send messages to your friends." }),
+        h("a.btn.primary", { href: "#/account" }, "Sign in")));
+      return;
+    }
+    const openId = (location.hash.match(/^#\/messages\/([A-Za-z0-9_-]{8,64})/) || [])[1] || null;
+    const list = h("div.dm-list");
+    const pane = h("section.dm-pane");
+    const root = h("div.dm-page" + (openId ? ".dm-open" : ""), {}, h("aside.dm-side", {}, h("h1", { text: "Messages" }), list), pane);
+    app.replaceChildren(root);
+    let box = null, thread = [], since = 0;
+
+    const nameOf = (id) => (box?.threads || []).find((t) => t.with === id)?.name || (box?.friends || []).find((f) => f.id === id)?.name || "Player";
+
+    function paintList() {
+      const seen = new Set();
+      const rows = [];
+      for (const t of box?.threads || []) {
+        seen.add(t.with);
+        rows.push(h("a.dm-row" + (t.with === openId ? ".active" : "") + (t.unread ? ".unread" : ""), { href: "#/messages/" + encodeURIComponent(t.with) },
+          dmAvatar(t.with, t.name),
+          h("span.dm-row-main", {}, h("span.dm-row-name", { text: t.name || "Player" }), h("span.dm-row-last", { text: (t.fromMe ? "You: " : "") + (t.preview || "") })),
+          h("span.dm-row-side", {}, h("span.dm-when", { text: t.last ? dmWhen(t.last) : "" }), t.unread ? h("span.dm-count", { text: String(t.unread) }) : null)));
+      }
+      const others = (box?.friends || []).filter((f) => !seen.has(f.id)).sort((a, b) => a.name.localeCompare(b.name));
+      if (others.length) {
+        rows.push(h("p.dm-cap", { text: "Friends" }));
+        for (const f of others)
+          rows.push(h("a.dm-row" + (f.id === openId ? ".active" : ""), { href: "#/messages/" + encodeURIComponent(f.id) },
+            dmAvatar(f.id, f.name), h("span.dm-row-main", {}, h("span.dm-row-name", { text: f.name || "Player" }), h("span.dm-row-last", { text: "Start a conversation" }))));
+      }
+      if (!rows.length)
+        rows.push(h("p.dm-none", { text: box && !box.synced
+          ? "Open OCTIVE and sign in once: the game shares your friend list with the website so you can message them here."
+          : "No friends yet. Add friends in the game (Friends, F8), then message them here." }));
+      list.replaceChildren(...rows);
+    }
+
+    const feed = h("div.dm-feed");
+    const input = h("textarea.dm-input", { rows: 1, maxlength: 500, placeholder: "Write a message…", "aria-label": "Message" });
+    const sendBtn = h("button.btn.primary", { type: "submit" }, "Send");
+    const note = h("p.form-msg", { role: "status" });
+
+    function paintThread() {
+      const kids = [];
+      let day = "";
+      for (const m of thread) {
+        const d = new Date(m.at).toDateString();
+        if (d !== day) { day = d; kids.push(h("p.dm-day", { text: d === new Date().toDateString() ? "Today" : new Date(m.at).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) })); }
+        const mine = m.from === me.playerId;
+        kids.push(h("div.dm-msg" + (mine ? ".mine" : "") + (m.pending ? ".pending" : "") + (m.failed ? ".failed" : ""), {},
+          h("p", { text: m.text }),
+          h("span.dm-time", { text: m.failed ? "Not sent: " + m.failed : m.pending ? "Sending…" : new Date(m.at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) })));
+      }
+      if (!kids.length) kids.push(h("p.dm-none", { text: `Say hi to ${nameOf(openId)}! They'll see it in the game, even if they're offline right now.` }));
+      const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
+      feed.replaceChildren(...kids);
+      if (atBottom || !feed.dataset.ready) { feed.scrollTop = feed.scrollHeight; feed.dataset.ready = "1"; }
+    }
+
+    async function loadThread() {
+      if (!openId) return;
+      try {
+        const r = await callApi(`/dm/thread/${encodeURIComponent(openId)}?since=${since}`, undefined, true);
+        const fresh = (r.msgs || []).filter((m) => !thread.some((x) => x.id === m.id && !x.pending));
+        for (const m of fresh) { thread = thread.filter((x) => x.id !== m.id); thread.push(m); since = Math.max(since, m.at); }
+        thread.sort((a, b) => a.at - b.at);
+        if (fresh.length) paintThread();
+      } catch (e) { setMsg(note, e.message); }
+    }
+
+    async function loadInbox() {
+      try { box = await callApi("/dm/inbox", undefined, true); } catch (e) { list.replaceChildren(h("p.dm-none", { text: e.message })); return; }
+      dmUnread = box.unread || 0;
+      updateAccountNav();
+      const t = openId && (box.threads || []).find((x) => x.with === openId);
+      if (t && t.unread) { callApi("/dm/read", { with: openId }, true).then(refreshDmBadge).catch(() => {}); t.unread = 0; }
+      paintList();
+    }
+
+    async function send() {
+      const text = input.value.trim();
+      if (!text || !openId) return;
+      const id = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2) + Date.now()).replace(/-/g, "").slice(0, 32);
+      const draft = { id, from: me.playerId, text, at: Date.now(), pending: true };
+      thread.push(draft); input.value = ""; input.style.height = ""; paintThread();
+      try {
+        const r = await callApi("/dm/send", { to: openId, id, text, name: me.name }, true);
+        Object.assign(draft, r.msg, { pending: false });
+        since = Math.max(since, draft.at);
+        loadInbox();
+      } catch (e) { draft.pending = false; draft.failed = e.message; }
+      paintThread();
+    }
+
+    if (openId) {
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+      input.addEventListener("input", () => { input.style.height = ""; input.style.height = Math.min(input.scrollHeight, 160) + "px"; });
+      const head = h("div.dm-head", {},
+        h("a.dm-back", { href: "#/messages", "aria-label": "All messages" }, "←"),
+        dmAvatar(openId, nameOf(openId)),
+        h("a.dm-head-name", { href: "#/u/" + encodeURIComponent(openId) }, nameOf(openId)));
+      pane.replaceChildren(head, feed,
+        h("form.dm-send", { onsubmit: (e) => { e.preventDefault(); send(); } }, input, sendBtn), note);
+    } else pane.replaceChildren(h("div.dm-empty", {}, h("p", { text: "Pick a conversation or a friend." })));
+
+    await loadInbox();
+    if (openId) {
+      const nm = pane.querySelector(".dm-head-name"); if (nm) nm.textContent = nameOf(openId);
+      await loadThread();
+      paintThread();
+      input.focus();
+    }
+    dmTimer = setInterval(() => {
+      if (page() !== "messages") { clearInterval(dmTimer); dmTimer = null; return; }
+      if (document.hidden) return;
+      loadInbox(); loadThread();
+    }, 8000);
+  }
+
   function page() {
     const hash = location.hash || "#/";
     if (/^#\/u\//.test(hash)) return "player";
@@ -1424,16 +1732,23 @@
     else if (pg === "account") account();
     else if (pg === "reset") resetPage();
     else if (pg === "supporter") supporterPage();
+    else if (pg === "help") helpPage();
+    else if (pg === "messages") messagesPage();
     else home();
     if (fromHashChange) window.scrollTo(0, 0);
   }
 
-  window.addEventListener("hashchange", () => route(true));
+  window.addEventListener("hashchange", () => { route(true); document.body.classList.remove("menu-open"); });
+  // phones: the links fold into a menu button
+  const menuBtn = document.querySelector(".menu-btn");
+  if (menuBtn) menuBtn.addEventListener("click", () => document.body.classList.toggle("menu-open"));
   route();
   load();
   // stay signed in: show the name in the menu
   if (worker && (store.get("octive.token", true) || store.get("octive.session")) && page() !== "account")
-    callApi("me", undefined, true).then((m) => { me = m; updateAccountNav(); giftPopup(); }).catch(() => {});
+    callApi("me", undefined, true).then((m) => { me = m; updateAccountNav(); giftPopup(); refreshDmBadge(); }).catch(() => {});
+  // unread messages in the menu
+  setInterval(() => { if (me && !document.hidden && page() !== "messages") refreshDmBadge(); }, 90_000);
   // "Viewing Website" for others while signed in here
   setTimeout(pingSeen, 3000);
   setInterval(pingSeen, 120_000);

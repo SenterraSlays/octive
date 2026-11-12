@@ -29,7 +29,7 @@ let board = null, boardAt = 0, boardPromise = null;
 const cards = new Map();           // playerId -> { card, seen, at }
 const avatars = new Map();         // playerId:hash -> Uint8Array
 let moderation = { bans: {}, overrides: {}, roles: {}, badges: {} };
-const BADGE_ORDER = ["DEV", "MOD", "CREATOR", "VIP", "TESTER"];
+const BADGE_ORDER = ["DEV", "MOD", "CREATOR", "CHARTER", "VIP", "TESTER"];
 const SOCIAL_KEYS = ["youtube", "twitch", "tiktok", "x", "instagram", "bluesky", "discord", "website"];
 
 /** Every badge of a player, most important first (DEV is built in; others come from the developers' list). */
@@ -149,7 +149,8 @@ async function buildBoard(env) {
     return {
       id: e.playerId,
       rank: i + 1,
-      pp: Math.round(e.score * 100) / 100,
+      // a recalculated total on the card (PP rework) wins over an older leaderboard entry
+      pp: Number(card.ppVersion) >= PP_VERSION && typeof card.pp === "number" ? Math.round(card.pp * 100) / 100 : Math.round(e.score * 100) / 100,
       name: ov.name || card.name || meta.n || stripTag(e.playerName),
       accuracy: card.accuracy ?? meta.a ?? 0,
       level: card.level ?? meta.l ?? 1,
@@ -169,7 +170,7 @@ async function buildBoard(env) {
       online: seen > 0 && now - seen < ONLINE_MS,
       lastSeen: seen > 0 ? new Date(seen).toISOString() : null,
       platform: c.platform || "",
-      ppVersion: Number(meta.pv) || 2,
+      ppVersion: Number(card.ppVersion) || Number(meta.pv) || 2,
       status: seen > 0 && now - seen < ONLINE_MS ? platformStatus(c.platform) : null,
       avatarHash,
     };
@@ -478,7 +479,7 @@ async function me(env, who) {
     emailVerified: !!rec.verified,
     pendingEmail: rec.pending && rec.pending.exp > Date.now() ? rec.pending.email : null,
     discord: rec.discord ? { name: rec.discord.name || "", at: rec.discord.at || null } : null,
-    supporter: supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId),
+    supporter: supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId, await r2json(env, `boosters/${who.playerId}.json`, null)),
     gifts: await pendingGifts(env, who.playerId),
     looks: await r2json(env, `looks/${who.playerId}.json`, {}),
   };
@@ -628,6 +629,7 @@ async function account(request, env, route) {
       await bodyOf(request);
       const who = await signedIn(request, env);
       const rec = await record(env, who.playerId);
+      if (rec.discord?.id) await syncSupporterRole(env, who.playerId, rec.discord.id, undefined, true);
       if (rec.discord?.id) await env.RELEASES.delete(`discord/${rec.discord.id}.json`);
       delete rec.discord;
       await saveRecord(env, who.playerId, rec);
@@ -731,7 +733,7 @@ const DISCORD_PUBLIC_KEY = "57eae870ba2f5c8833c8c2df8ee0552e5a2d034eb3409d2a7475
 const SITE = "https://senterraslays.github.io/octive-rankings/";
 const WORKER_BASE = "https://octive-rankings-api.lunalazum18.workers.dev";
 const EPHEMERAL = 64;
-const BADGE_EMOJI = { DEV: "🛠️ DEV", MOD: "🛡️ MOD", CREATOR: "🎬 CREATOR", VIP: "⭐ VIP", TESTER: "🧪 TESTER" };
+const BADGE_EMOJI = { DEV: "🛠️ DEV", MOD: "🛡️ MOD", CREATOR: "🎬 CREATOR", CHARTER: "🎼 CHARTER", VIP: "⭐ VIP", TESTER: "🧪 TESTER" };
 
 function hexBytes(hex) { const b = new Uint8Array(hex.length / 2); for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16); return b; }
 
@@ -746,7 +748,7 @@ async function discordVerified(request, body) {
 
 const dReply = (data) => new Response(JSON.stringify({ type: 4, data }), { headers: { "Content-Type": "application/json" } });
 const fmtN = (n, d = 0) => Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
-const stripBio = (s) => String(s || "").replace(/#\[[0-9a-fA-F]{6}\]|#[0-9a-fA-F]{6}(?![0-9a-fA-F])|#[0-9a-fA-FlonmkgrLONMKGR]/g, "").replace(/##/g, "#").trim();
+const stripBio = (s) => String(s || "").replace(/#\[[0-9a-fA-F]{6}\]|#[0-9a-fA-F]{6}|#[0-9a-fA-FlonmkgrLONMKGR]/g, "").replace(/##/g, "#").trim();
 
 function playTimeText(ms) { const m = Math.floor((ms || 0) / 60000); return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`; }
 function agoText(iso) {
@@ -894,15 +896,36 @@ async function discordCommand(env, it) {
       const rec = await record(env, c.playerId);
       if (rec.discord && rec.discord.id !== user.id) await env.RELEASES.delete(`discord/${rec.discord.id}.json`);
       rec.discord = { id: user.id, name: user.global_name || user.username || "", at: new Date().toISOString() };
+      if (env.DISCORD_GUILD_ID && it.guild_id === env.DISCORD_GUILD_ID && it.member) await setBooster(env, c.playerId, user.id, it.member.premium_since || null);
       await saveRecord(env, c.playerId, rec);
       await env.RELEASES.put(`discord/${user.id}.json`, JSON.stringify({ playerId: c.playerId, at: rec.discord.at }), { httpMetadata: { contentType: "application/json" } });
+      await syncSupporterRole(env, c.playerId, user.id, env.DISCORD_GUILD_ID && it.guild_id === env.DISCORD_GUILD_ID ? it.member : undefined);
       let name = "your account";
       try { const p = await profileOf(env, c.playerId); if (p) name = `**${p.name}**`; } catch { /* fine */ }
       return { content: `✅ Linked to ${name}. Try \`/profile\`!`, flags: EPHEMERAL };
     }
+    case "update": {
+      // re-checks the server boost and gives or takes the OCTIVE Supporter role right now
+      const id = await linkedPlayer(env, user.id);
+      if (!id) return { content: `Your Discord isn't linked to an OCTIVE account yet. Sign in at ${SITE}#/account?tab=preferences, press **Link Discord**, then use \`/link\` with the code.`, flags: EPHEMERAL };
+      const member = env.DISCORD_GUILD_ID && it.guild_id === env.DISCORD_GUILD_ID && it.member ? it.member : await memberOf(env, user.id);
+      if (member) await setBooster(env, id, user.id, member.premium_since || null);
+      supportIndex = null;
+      const st = supportStatus(await r2json(env, `supporters/${id}.json`, null), id, await r2json(env, `boosters/${id}.json`, null));
+      if (member) await syncSupporterRole(env, id, user.id, member);
+      let name = "your account";
+      try { const p = await profileOf(env, id); if (p) name = `**${p.name}**`; } catch { /* fine */ }
+      const what = st.lifetime ? "a lifetime supporter"
+        : st.booster ? "a supporter while you boost the server" + (st.until ? ` (your paid time is paused and continues until ${new Date(st.until).toLocaleDateString("en-GB", { dateStyle: "medium" })} after)` : "")
+        : st.active ? `a supporter until ${new Date(st.until).toLocaleDateString("en-GB", { dateStyle: "medium" })}`
+        : "not a supporter right now";
+      const role = !env.DISCORD_SUPPORTER_ROLE_ID ? "" : !member ? " Join the OCTIVE Discord server to get the supporter role." : st.active ? " You have the **OCTIVE Supporter** role." : " The supporter role was removed.";
+      return { content: `🔄 Updated ${name}: you're ${what}.${role}`, flags: EPHEMERAL };
+    }
     case "unlink": {
       const id = await linkedPlayer(env, user.id);
       if (!id) return { content: "Your Discord isn't linked to an OCTIVE account.", flags: EPHEMERAL };
+      await syncSupporterRole(env, id, user.id, undefined, true);
       await env.RELEASES.delete(`discord/${user.id}.json`);
       const rec = await record(env, id); delete rec.discord; await saveRecord(env, id, rec);
       return { content: "Unlinked. Your OCTIVE account and Discord aren't connected any more.", flags: EPHEMERAL };
@@ -916,6 +939,15 @@ async function discordInteraction(request, env, ctx) {
   const body = await request.text();
   if (!(await discordVerified(request, body))) return new Response("invalid request signature", { status: 401 });
   const it = JSON.parse(body);
+  // any command used in the OCTIVE server tells us whether that member boosts it
+  if (env.DISCORD_GUILD_ID && it.guild_id === env.DISCORD_GUILD_ID && it.member?.user?.id)
+    ctx.waitUntil((async () => {
+      const link = await r2json(env, `discord/${it.member.user.id}.json`, null);
+      if (link?.playerId) {
+        await setBooster(env, link.playerId, it.member.user.id, it.member.premium_since || null);
+        await syncSupporterRole(env, link.playerId, it.member.user.id, it.member);
+      }
+    })().catch(() => {}));
   if (it.type === 1) return new Response(JSON.stringify({ type: 1 }), { headers: { "Content-Type": "application/json" } }); // PING
   if (it.type !== 2) return dReply({ content: "Not supported.", flags: EPHEMERAL });
   // answer straight away when the result is ready within ~2.5 s (Discord allows 3 s); otherwise answer
@@ -1010,6 +1042,7 @@ async function chartScores(request, env, url) {
       badges: badgesOf(who.playerId),
       date: new Date().toISOString(),
       version: String(b.version || "").slice(0, 12),
+      mods: String(b.mods || "").replace(/[^A-Z ]/g, "").slice(0, 40),
     };
     const key = `scores/${songId}/${chartId}.json`;
     boards.delete(key);
@@ -1091,7 +1124,103 @@ async function r2json(env, key, fallback) {
 const r2put = (env, key, v) => env.RELEASES.put(key, JSON.stringify(v), { httpMetadata: { contentType: "application/json" } });
 
 /** Status of a supporter record: active, until, days supported in total, milestone. */
-function supportStatus(rec, playerId) {
+// ---------------------------------------------------------------- Discord server boosters
+// A player who linked Discord and boosts the OCTIVE Discord server is a supporter while the boost lasts.
+// Needs the variable DISCORD_GUILD_ID (the server) and the secret DISCORD_BOT_TOKEN (the bot must be in
+// the server). Boosts are checked every 6 hours (cron) and whenever the player uses a command there.
+//   boosters/<playerId>.json  { discordId, since, checked }   (only while boosting)
+
+/** Paid or gifted supporter time that fell while boosting (it's paused, not used up), in ms. */
+function pausedDuringBoost(rec, boostSince, until = Date.now()) {
+  const b = Date.parse(boostSince || "");
+  if (!b || !rec?.periods) return 0;
+  let ms = 0;
+  for (const p of rec.periods) {
+    if (p.boostCredit) continue;
+    const s = Math.max(Date.parse(p.start), b), e = Math.min(Date.parse(p.end), until);
+    if (e > s) ms += e - s;
+  }
+  return ms;
+}
+
+async function setBooster(env, playerId, discordId, premiumSince) {
+  if (!playerId) return;
+  const key = `boosters/${playerId}.json`;
+  const old = await r2json(env, key, null);
+  if (premiumSince) {
+    await env.RELEASES.put(key, JSON.stringify({ discordId, since: premiumSince, checked: new Date().toISOString() }), { httpMetadata: { contentType: "application/json" } });
+  } else if (old) {
+    // the boost ended: give back the paid / gifted time that was paused while it lasted
+    const rec = await r2json(env, `supporters/${playerId}.json`, null);
+    const credit = pausedDuringBoost(rec, old.since);
+    if (rec && credit > 60_000) {
+      const now = Date.now();
+      const until = Math.max(now, ...rec.periods.filter((x) => !x.boostCredit).map((x) => Date.parse(x.end)));
+      rec.periods.push({ start: new Date(until).toISOString(), end: new Date(until + credit).toISOString(), boostCredit: true, note: "supporter time paused while boosting" });
+      await env.RELEASES.put(`supporters/${playerId}.json`, JSON.stringify(rec), { httpMetadata: { contentType: "application/json" } });
+    }
+    await env.RELEASES.delete(key);
+  }
+  supportIndex = null; // the supporter list changes
+}
+
+/** A member of the OCTIVE Discord server: the member object, null when they aren't in it, undefined if unknown. */
+async function memberOf(env, discordId) {
+  if (!env.DISCORD_GUILD_ID || !env.DISCORD_BOT_TOKEN || !discordId) return undefined;
+  const res = await fetch(`https://discord.com/api/v10/guilds/${env.DISCORD_GUILD_ID}/members/${discordId}`, { headers: { Authorization: "Bot " + env.DISCORD_BOT_TOKEN } });
+  if (res.status === 404) return null;
+  if (!res.ok) return undefined;
+  return await res.json();
+}
+
+/**
+ * The "OCTIVE Supporter" role in the Discord server follows supporter status in the game: linked players get
+ * it while they're supporters (paid, gifted, lifetime or boosting) and lose it when that ends or they unlink.
+ * Needs the variable DISCORD_SUPPORTER_ROLE_ID; the bot needs Manage Roles and a role above that one.
+ */
+async function syncSupporterRole(env, playerId, discordId, member, forceRemove = false) {
+  const role = env.DISCORD_SUPPORTER_ROLE_ID;
+  if (!role || !env.DISCORD_GUILD_ID || !env.DISCORD_BOT_TOKEN) return;
+  try {
+    if (!discordId && playerId) discordId = (await record(env, playerId))?.discord?.id;
+    if (!discordId) return;
+    if (member === undefined) member = await memberOf(env, discordId);
+    if (!member) return; // not in the server (or Discord didn't answer)
+    let active = false;
+    if (!forceRemove && playerId) {
+      const st = supportStatus(await r2json(env, `supporters/${playerId}.json`, null), playerId, await r2json(env, `boosters/${playerId}.json`, null));
+      active = st.active;
+    }
+    const has = (member.roles || []).includes(role);
+    if (active === has) return;
+    const res = await fetch(`https://discord.com/api/v10/guilds/${env.DISCORD_GUILD_ID}/members/${discordId}/roles/${role}`,
+      { method: active ? "PUT" : "DELETE", headers: { Authorization: "Bot " + env.DISCORD_BOT_TOKEN, "X-Audit-Log-Reason": active ? "OCTIVE supporter" : "No longer an OCTIVE supporter" } });
+    if (!res.ok) console.log("supporter role", res.status, (await res.text()).slice(0, 200));
+  } catch (e) { console.log("supporter role failed", e && e.message); }
+}
+
+/** Re-checks every linked Discord account (the cron job): boosts and the supporter role. */
+async function refreshBoosters(env) {
+  if (!env.DISCORD_GUILD_ID || !env.DISCORD_BOT_TOKEN) return;
+  let cursor;
+  do {
+    const list = await env.RELEASES.list({ prefix: "discord/", cursor });
+    for (const o of list.objects) {
+      const discordId = o.key.slice(8, -5);
+      const link = await r2json(env, o.key, null);
+      if (!link?.playerId) continue;
+      const member = await memberOf(env, discordId);
+      if (member !== undefined) {
+        await setBooster(env, link.playerId, discordId, member ? member.premium_since || null : null);
+        if (member) await syncSupporterRole(env, link.playerId, discordId, member);
+      }
+      await new Promise((r) => setTimeout(r, 120)); // stay under Discord's rate limit
+    }
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+}
+
+function supportStatus(rec, playerId, boost) {
   const now = Date.now();
   const lifetime = LIFETIME_SUPPORTERS.includes(playerId) || !!rec?.lifetime;
   const periods = rec?.periods || [];
@@ -1103,12 +1232,17 @@ function supportStatus(rec, playerId) {
     until = Math.max(until, e);
   }
   if (lifetime) { const first = since ? Date.parse(since) : Date.parse("2026-11-09"); days = Math.max(days, (now - first) / 86_400_000); since = since || "2026-11-09T00:00:00Z"; }
-  const active = lifetime || until > now;
+  const booster = !!boost;
+  // while boosting, paid / gifted time is paused: its end moves later by the time spent boosting
+  const paused = booster && !lifetime ? pausedDuringBoost(rec, boost.since, now) : 0;
+  if (paused > 0 && until > Date.parse(boost.since)) until += paused;
+  const active = lifetime || until > now || booster;
   const months = Math.floor(days / 30.4375);
   let milestone = null;
   if (active || days > 0) for (const [m, label] of MILESTONES) if (months >= m) milestone = { months: m, label };
   return {
-    active, lifetime, until: lifetime ? null : until ? new Date(until).toISOString() : null,
+    active, lifetime, booster, boostingSince: boost?.since || null,
+    until: lifetime ? null : until > now ? new Date(until).toISOString() : booster ? null : until ? new Date(until).toISOString() : null,
     days: Math.floor(days), months, since,
     milestone, purchases: (rec?.purchases || []).length,
     totalMonthsBought: (rec?.purchases || []).reduce((n, p) => n + (p.months || 0), 0),
@@ -1127,9 +1261,16 @@ async function supporters(env) {
     for (const o of list.objects) ids.add(o.key.slice(11, -5));
     cursor = list.truncated ? list.cursor : undefined;
   } while (cursor);
+  const boosts = {};
+  do {
+    const list = await env.RELEASES.list({ prefix: "boosters/", cursor });
+    for (const o of list.objects) { const id = o.key.slice(9, -5); ids.add(id); boosts[id] = true; }
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
   await Promise.all([...ids].map(async (id) => {
     const rec = await r2json(env, `supporters/${id}.json`, null);
-    const st = supportStatus(rec, id);
+    const boost = boosts[id] ? await r2json(env, `boosters/${id}.json`, null) : null;
+    const st = supportStatus(rec, id, boost);
     if (!st.active && st.days <= 0) return;
     const looks = st.active ? await r2json(env, `looks/${id}.json`, {}) : {};
     out[id] = { ...st, nameStyle: looks.nameStyle || "", effect: looks.effect || "none", banner: looks.banner || "", gif: looks.gif || "" };
@@ -1230,7 +1371,7 @@ async function supportRoutes(request, env, url, ctx) {
       const id = s.metadata?.playerId, months = Number(s.metadata?.months);
       if (s.payment_status === "paid" && id && months >= 1 && months <= MAX_MONTHS) {
         if (s.metadata?.gift === "1") await addGift(env, id, { id: s.id, from: s.metadata?.buyer || "", months, amount: s.amount_total, currency: s.currency, free: false });
-        else await grantMonths(env, id, months, s);
+        else { await grantMonths(env, id, months, s); supportIndex = null; await syncSupporterRole(env, id); }
       }
     }
     return new Response("ok");
@@ -1301,19 +1442,21 @@ async function supportRoutes(request, env, url, ctx) {
     for (const x of want) rec = await grantMonths(env, who.playerId, x.months, { id: x.id, amount_total: x.amount, currency: x.currency, metadata: { gift: "1", buyer: x.from } });
     g.pending = list.filter((x) => !want.includes(x));
     await r2put(env, key, g);
-    return reply({ ok: true, claimed: want.length, months: want.reduce((n, x) => n + x.months, 0), status: supportStatus(rec, who.playerId), gifts: g.pending });
+    supportIndex = null;
+    await syncSupporterRole(env, who.playerId);
+    return reply({ ok: true, claimed: want.length, months: want.reduce((n, x) => n + x.months, 0), status: supportStatus(rec, who.playerId, await r2json(env, `boosters/${who.playerId}.json`, null)), gifts: g.pending });
   }
   if (path === "/support/me") {
     const who = await signedIn(request, env);
     const rec = await r2json(env, `supporters/${who.playerId}.json`, null);
     const looks = await r2json(env, `looks/${who.playerId}.json`, {});
-    return reply({ ...supportStatus(rec, who.playerId), looks, history: (rec?.purchases || []).map((p) => ({ at: p.at, months: p.months, amount: p.amount, currency: p.currency })) });
+    return reply({ ...supportStatus(rec, who.playerId, await r2json(env, `boosters/${who.playerId}.json`, null)), looks, history: (rec?.purchases || []).map((p) => ({ at: p.at, months: p.months, amount: p.amount, currency: p.currency })) });
   }
   if (path === "/support/gif") {
     // a supporter's animated picture, sent as the raw file (up to 8 MB; base64 JSON would be too slow)
     if (request.method !== "POST") fail(405, "Use POST.");
     const who = await signedIn(request, env);
-    const st = supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId);
+    const st = supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId, await r2json(env, `boosters/${who.playerId}.json`, null));
     if (!st.active) fail(403, "This is a supporter perk.");
     const len = Number(request.headers.get("Content-Length") || 0);
     if (len > GIF_MAX) fail(413, "That GIF is too big (8 MB at most).");
@@ -1331,7 +1474,7 @@ async function supportRoutes(request, env, url, ctx) {
     // supporters: name colours (bio codes), profile effect, banner picture, animated GIF profile picture
     const b = await bodyOf(request, 2_500_000);
     const who = await signedIn(request, env);
-    const st = supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId);
+    const st = supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId, await r2json(env, `boosters/${who.playerId}.json`, null));
     if (!st.active) fail(403, "This is a supporter perk.");
     const looks = await r2json(env, `looks/${who.playerId}.json`, {});
     if (b.nameStyle !== undefined) {
@@ -1376,6 +1519,31 @@ async function supportRoutes(request, env, url, ctx) {
     if (!o) return cors(new Response("Not found", { status: 404 }));
     return cors(new Response(o.body, { headers: { "Content-Type": m[1] === "gif" ? "image/gif" : "image/jpeg", "Cache-Control": url.searchParams.get("v") ? "public, max-age=31536000, immutable" : "public, max-age=300" } }));
   }
+  // who: followers, following or friends of a player (names and ranking numbers where known)
+  m = path.match(/^\/social\/([A-Za-z0-9_-]{1,64})\/(followers|following|friends)$/);
+  if (m) {
+    const [, id, kind] = m;
+    let board = { players: [] };
+    try { board = await leaderboard(env); } catch { /* no names from the ranking */ }
+    const byId = new Map(board.players.map((p) => [p.id, p]));
+    let ids = [];
+    const names = new Map();
+    if (kind === "following") ids = await followingOf(env, id);
+    else if (kind === "followers") ids = id === OWNER ? board.players.map((p) => p.id) : ((await r2json(env, `followers/${id}.json`, { followers: [] })).followers || []);
+    else {
+      const box = await r2json(env, dmInboxKey(id), dmEmptyInbox());
+      for (const f of box.friends || []) { ids.push(f.id); names.set(f.id, f.name); }
+    }
+    ids = [...new Set(ids)].filter((x) => !moderation.bans[x]).slice(0, 1000);
+    const players = ids.map((x) => {
+      const b = byId.get(x);
+      return { id: x, name: b?.name || names.get(x) || "Player", rank: b?.rank || null, pp: b?.pp || null, level: b?.level || null, online: b?.online || false };
+    }).sort((a, b) => (a.rank || 1e9) - (b.rank || 1e9));
+    let mine = null;
+    const h = request.headers.get("Authorization") || "";
+    if (h.startsWith("Bearer ")) { try { const who = await signedIn(request, env); mine = who.playerId === id; } catch { /* signed out */ } }
+    return reply({ kind, players, mine });
+  }
   // following
   m = path.match(/^\/social\/([A-Za-z0-9_-]{1,64})$/);
   if (m) {
@@ -1384,7 +1552,9 @@ async function supportRoutes(request, env, url, ctx) {
     let youFollow = null;
     const h = request.headers.get("Authorization") || "";
     if (h.startsWith("Bearer ")) { try { const who = await signedIn(request, env); youFollow = (await followingOf(env, who.playerId)).includes(id); } catch { /* signed out */ } }
-    return reply({ following, followers, youFollow, owner: OWNER });
+    let friends = null;
+    try { friends = ((await r2json(env, dmInboxKey(id), dmEmptyInbox())).friends || []).length; } catch { /* none */ }
+    return reply({ following, followers, friends, youFollow, owner: OWNER });
   }
   if (path === "/follow") {
     const b = await bodyOf(request);
@@ -1403,7 +1573,237 @@ async function supportRoutes(request, env, url, ctx) {
   return null;
 }
 
+// ---------------------------------------------------------------- private messages
+// Messages between friends are kept here (R2), so they reach a friend who is offline, follow the player
+// to every device and can be read and sent on the website. The game also pings an online friend through
+// Unity Friends so a message shows at once; both copies carry the same id.
+//   dm/inbox/<player>.json   { name, friends:[{id,name}], blocked:[id], synced, threads:{ <other>: {name,last,unread,preview,fromMe} } }
+//   dm/thread/<a>__<b>.json  { msgs:[{id,from,text,at}] }   (a < b, the newest DM_KEEP messages)
+// Only friends can message each other: the game uploads the player's friend and block lists
+// (POST /dm/friends) and a message needs the RECEIVER's list to include the sender.
+
+const DM_KEEP = 500;
+const DM_FILE_DAYS = 7;   // sent files nobody opened are removed after this
+
+/** Removes sent files nobody downloaded within a week (the cron job). */
+async function cleanDmFiles(env) {
+  let cursor;
+  const now = Date.now();
+  do {
+    const list = await env.RELEASES.list({ prefix: "dm/files/", cursor, include: ["customMetadata"] });
+    const old = list.objects.filter((o) => now - Number(o.customMetadata?.at || Date.parse(o.uploaded) || 0) > DM_FILE_DAYS * 86_400_000).map((o) => o.key);
+    if (old.length) await env.RELEASES.delete(old);
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+}
+const DM_THREADS = 300;
+const DM_ID = /^[A-Za-z0-9_-]{8,64}$/;
+const dmRate = new Map();           // player -> recent send times (per Worker instance)
+let dmModerationAt = 0;
+
+const dmPair = (a, b) => (a < b ? `${a}__${b}` : `${b}__${a}`);
+const dmInboxKey = (id) => `dm/inbox/${id}.json`;
+const dmThreadKey = (a, b) => `dm/thread/${dmPair(a, b)}.json`;
+const dmEmptyInbox = () => ({ name: "", friends: [], blocked: [], threads: {} });
+const dmName = (s) => String(s || "").replace(/[\u0000-\u001f]/g, "").trim().slice(0, 40);
+
+/** Reads, changes and writes an R2 JSON object, retrying when another request wrote it in between. */
+async function r2update(env, key, fallback, change) {
+  for (let i = 0; i < 6; i++) {
+    const o = await env.RELEASES.get(key);
+    let v = fallback();
+    if (o) { try { v = await o.json(); } catch { /* start again */ } }
+    if (change(v) === false) return v;
+    const opts = { httpMetadata: { contentType: "application/json" } };
+    if (o) opts.onlyIf = { etagMatches: o.etag };
+    const put = await env.RELEASES.put(key, JSON.stringify(v), opts);
+    if (put) return v;
+  }
+  fail(503, "The message server is busy. Try again in a moment.");
+}
+
+function dmTrim(box) {
+  const ids = Object.keys(box.threads || {});
+  if (ids.length <= DM_THREADS) return;
+  ids.sort((a, b) => (box.threads[b].last || 0) - (box.threads[a].last || 0));
+  for (const id of ids.slice(DM_THREADS)) delete box.threads[id];
+}
+
+async function dmRoutes(request, env, url) {
+  const path = url.pathname;
+  let m;
+  const who = await signedIn(request, env);
+  if (Date.now() - dmModerationAt > 5 * 60_000) { dmModerationAt = Date.now(); try { await loadModeration(config(env)); } catch { /* keep the old lists */ } }
+  if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+  const me = who.playerId;
+
+  // the game keeps the friend and block lists here (and the player's display name)
+  if (path === "/dm/friends") {
+    const b = await bodyOf(request, 200_000);
+    const friends = (Array.isArray(b.friends) ? b.friends : [])
+      .filter((f) => f && DM_ID.test(String(f.id))).slice(0, 1000).map((f) => ({ id: String(f.id), name: dmName(f.name) }));
+    const blocked = (Array.isArray(b.blocked) ? b.blocked : []).map(String).filter((x) => DM_ID.test(x)).slice(0, 1000);
+    const done = new Set((Array.isArray(b.doneUnfriend) ? b.doneUnfriend : []).map(String));
+    await r2update(env, dmInboxKey(me), dmEmptyInbox, (box) => {
+      box.unfriend = (box.unfriend || []).filter((x) => !done.has(x));
+      const pending = new Set(box.unfriend);
+      box.friends = friends.filter((f) => !pending.has(f.id)); box.blocked = blocked; box.synced = Date.now();
+      if (b.name) box.name = dmName(b.name);
+    });
+    return reply({ ok: true });
+  }
+
+  // a file sent in a conversation (a replay with its song): only friends, at most 40 MB, kept 60 days
+  if (path === "/dm/file" && request.method === "POST") {
+    const to = String(url.searchParams.get("to") || "");
+    if (!DM_ID.test(to) || to === me) fail(400, "You can't send that player files.");
+    const theirs = await r2json(env, dmInboxKey(to), dmEmptyInbox());
+    const mine = await r2json(env, dmInboxKey(me), dmEmptyInbox());
+    if ((theirs.blocked || []).includes(me)) fail(403, "This player isn't taking messages from you.");
+    const friendly = theirs.synced ? (theirs.friends || []).some((f) => f.id === me) : (mine.friends || []).some((f) => f.id === to);
+    if (!friendly) fail(403, "You can only send files to your friends.");
+    const len = Number(request.headers.get("Content-Length") || 0);
+    if (len > 40 * 1048576) fail(413, "That file is too big to send (40 MB at most).");
+    // at most 25 files and 300 MB a day per player
+    const day = new Date().toISOString().slice(0, 10);
+    const quotaKey = `dm/quota/${me}.json`;
+    const quota = await r2json(env, quotaKey, { day, files: 0, bytes: 0 });
+    if (quota.day !== day) { quota.day = day; quota.files = 0; quota.bytes = 0; }
+    if (quota.files >= 25 || quota.bytes + len > 300 * 1048576) fail(429, "You've sent a lot of files today. Try again tomorrow.");
+    const body = await request.arrayBuffer();
+    if (body.byteLength === 0) fail(400, "The file is empty.");
+    if (body.byteLength > 40 * 1048576) fail(413, "That file is too big to send (40 MB at most).");
+    const id = crypto.randomUUID().replace(/-/g, "");
+    const name = String(url.searchParams.get("name") || "replay.octreplay").replace(/[^A-Za-z0-9 ._()\[\]-]/g, "_").slice(0, 120);
+    await env.RELEASES.put(`dm/files/${id}`, body, { httpMetadata: { contentType: "application/octet-stream" }, customMetadata: { from: me, to, name, at: String(Date.now()) } });
+    quota.files += 1; quota.bytes += body.byteLength;
+    await r2put(env, quotaKey, quota);
+    return reply({ ok: true, id, size: body.byteLength });
+  }
+  m = path.match(/^\/dm\/file\/([a-f0-9]{32})$/);
+  if (m) {
+    const o = await env.RELEASES.get(`dm/files/${m[1]}`);
+    if (!o) fail(404, "That file isn't there any more.");
+    const meta = o.customMetadata || {};
+    if (meta.from !== me && meta.to !== me) fail(403, "That file wasn't sent to you.");
+    if (Date.now() - Number(meta.at || 0) > DM_FILE_DAYS * 86_400_000) {
+      await env.RELEASES.delete(`dm/files/${m[1]}`);
+      fail(404, "That file expired (files that aren't opened within a week are removed).");
+    }
+    const h = new Headers({ "Content-Type": "application/octet-stream", "Content-Disposition": `attachment; filename="${meta.name || "replay.octreplay"}"`, "Cache-Control": "private, no-store" });
+    if (meta.to === me) {
+      // the receiver has it now: it's taken off the server
+      const bytes = await o.arrayBuffer();
+      await env.RELEASES.delete(`dm/files/${m[1]}`);
+      return cors(new Response(bytes, { headers: h }));
+    }
+    return cors(new Response(o.body, { headers: h }));
+  }
+
+  // conversations, newest first, with unread counts
+  if (path === "/dm/inbox") {
+    const box = await r2json(env, dmInboxKey(me), dmEmptyInbox());
+    const threads = Object.entries(box.threads || {}).map(([id, t]) => ({ with: id, ...t })).sort((a, b) => (b.last || 0) - (a.last || 0));
+    const unread = threads.reduce((n, t) => n + (t.unread || 0), 0);
+    return reply({ me, name: box.name || who.username || "", friends: box.friends || [], synced: !!box.synced, threads, unread, unfriend: box.unfriend || [], now: Date.now() });
+  }
+
+  // one conversation (messages after "since", in ms)
+  m = path.match(/^\/dm\/thread\/([A-Za-z0-9_-]{8,64})$/);
+  if (m) {
+    const since = Number(url.searchParams.get("since") || 0) || 0;
+    const t = await r2json(env, dmThreadKey(me, m[1]), { msgs: [] });
+    return reply({ msgs: (t.msgs || []).filter((x) => x.at > since), now: Date.now() });
+  }
+
+  if (path === "/dm/send") {
+    const b = await bodyOf(request, 8000);
+    const to = String(b.to || "");
+    if (!DM_ID.test(to) || to === me) fail(400, "You can't message that player.");
+    const text = String(b.text || "").replace(/\r/g, "").trim().slice(0, 500);
+    if (!text) fail(400, "The message is empty.");
+    const id = /^[A-Za-z0-9_-]{8,40}$/.test(String(b.id || "")) ? String(b.id) : crypto.randomUUID().replace(/-/g, "");
+    const now = Date.now();
+    const times = (dmRate.get(me) || []).filter((t) => now - t < 60_000);
+    if (times.length >= 30) fail(429, "You're sending messages too fast. Wait a moment.");
+    times.push(now); dmRate.set(me, times);
+    if (dmRate.size > 5000) dmRate.delete(dmRate.keys().next().value);
+    if (moderation.bans[to]) fail(403, "This player can't receive messages.");
+    const [mine, theirs] = await Promise.all([r2json(env, dmInboxKey(me), dmEmptyInbox()), r2json(env, dmInboxKey(to), dmEmptyInbox())]);
+    if ((theirs.blocked || []).includes(me)) fail(403, "This player isn't taking messages from you.");
+    // the receiver's own friend list decides; before their game uploaded it, the sender's does
+    const friendly = theirs.synced ? (theirs.friends || []).some((f) => f.id === me) : (mine.friends || []).some((f) => f.id === to);
+    if (!friendly) fail(403, "You can only message your friends.");
+    const kind = b.kind === "replay" ? "replay" : "chat";
+    const data = kind === "replay" && /^[a-f0-9]{32}$/.test(String(b.data || "")) ? String(b.data) : undefined;
+    if (kind === "replay" && !data) fail(400, "That replay wasn't uploaded.");
+    const msg = { id, from: me, text, at: now, ...(kind !== "chat" ? { kind, data } : {}) };
+    let dup = false;
+    await r2update(env, dmThreadKey(me, to), () => ({ msgs: [] }), (t) => {
+      t.msgs = t.msgs || [];
+      if (t.msgs.some((x) => x.id === id)) { dup = true; return false; }
+      t.msgs.push(msg);
+      if (t.msgs.length > DM_KEEP) t.msgs.splice(0, t.msgs.length - DM_KEEP);
+    });
+    if (!dup) {
+      const myName = mine.name || dmName(b.name) || who.username || "Player";
+      const theirName = theirs.name || (mine.friends || []).find((f) => f.id === to)?.name || "Player";
+      const preview = (kind === "replay" ? "🎬 " : "") + text.slice(0, 140);
+      await Promise.all([
+        r2update(env, dmInboxKey(to), dmEmptyInbox, (box) => {
+          box.threads = box.threads || {};
+          const t = box.threads[me] || {};
+          box.threads[me] = { name: myName, last: now, unread: (t.unread || 0) + 1, preview, fromMe: false };
+          dmTrim(box);
+        }),
+        r2update(env, dmInboxKey(me), dmEmptyInbox, (box) => {
+          box.threads = box.threads || {};
+          box.threads[to] = { name: theirName, last: now, unread: 0, preview, fromMe: true };
+          dmTrim(box);
+        }),
+      ]);
+    }
+    return reply({ ok: true, msg });
+  }
+
+  // unfriend on the website: the friend leaves your list here at once, and your game removes the friendship
+  // in Unity Friends the next time it starts (it reads "unfriend" from the inbox)
+  if (path === "/dm/unfriend") {
+    const b = await bodyOf(request, 2000);
+    const other = String(b.playerId || "");
+    if (!DM_ID.test(other)) fail(400, "That isn't a player.");
+    await r2update(env, dmInboxKey(me), dmEmptyInbox, (box) => {
+      box.friends = (box.friends || []).filter((f) => f.id !== other);
+      box.unfriend = [...new Set([...(box.unfriend || []), other])];
+    });
+    await r2update(env, dmInboxKey(other), dmEmptyInbox, (box) => {
+      if (!(box.friends || []).some((f) => f.id === me)) return false;
+      box.friends = box.friends.filter((f) => f.id !== me);
+    });
+    return reply({ ok: true });
+  }
+
+  // read on some device: the unread count goes to 0 everywhere
+  if (path === "/dm/read") {
+    const b = await bodyOf(request, 2000);
+    const other = String(b.with || "");
+    if (!DM_ID.test(other)) fail(400, "That isn't a player.");
+    await r2update(env, dmInboxKey(me), dmEmptyInbox, (box) => {
+      const t = box.threads && box.threads[other];
+      if (!t || !t.unread) return false;
+      t.unread = 0;
+    });
+    return reply({ ok: true });
+  }
+  fail(404, "Not found.");
+}
+
 export default {
+  // every 6 hours: who still boosts the Discord server (wrangler.toml [triggers] crons)
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(Promise.all([refreshBoosters(env).catch((e) => console.log("boosters", e && e.message)), cleanDmFiles(env).catch((e) => console.log("dm files", e && e.message))]));
+  },
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
@@ -1413,6 +1813,10 @@ export default {
     }
     if (/^\/(support\/|stripe\/webhook$|looks\/|social\/|follow$)/.test(url.pathname)) {
       try { const r = await supportRoutes(request, env, url, ctx); if (r) return r; }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+    }
+    if (url.pathname.startsWith("/dm/")) {
+      try { return await dmRoutes(request, env, url); }
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/scores/")) {

@@ -12,3 +12,12 @@ preview_urls = false
 [[r2_buckets]]
 binding = "RELEASES"
 bucket_name = "octive-releases"
+
+# Discord server boosters: re-checked every 6 hours (needs DISCORD_GUILD_ID and the DISCORD_BOT_TOKEN secret)
+[triggers]
+crons = ["0 */6 * * *"]
+
+# the OCTIVE Discord server and its "OCTIVE Supporter" role (the bot token is the secret DISCORD_BOT_TOKEN)
+[vars]
+DISCORD_GUILD_ID = "1167928565065601175"
+DISCORD_SUPPORTER_ROLE_ID = "1570329712826253445"
