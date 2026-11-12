@@ -140,8 +140,8 @@ main { width: 100%; max-width: 1100px; margin: 0 auto; padding: 28px 16px 40px; 
 .card-rank { position: absolute; right: 22px; top: -10px; font-size: clamp(64px, 12vw, 140px); font-weight: 300; color: #ffffff14; pointer-events: none; }
 .card-avatar { width: 150px; height: 150px; border-radius: 14px; overflow: hidden; flex-shrink: 0; display: grid; place-items: center; background: #3b2f6e; font-size: 64px; }
 .card-body { flex: 1; min-width: 0; position: relative; }
-.card-name-row { display: flex; align-items: center; gap: 12px; }
-.card-name { margin: 0; font-size: clamp(30px, 5vw, 44px); font-weight: 600; overflow-wrap: anywhere; }
+.card-name-row { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; }
+.card-name { margin: 0; font-size: clamp(30px, 5vw, 44px); font-weight: 600; overflow-wrap: anywhere; flex: 0 1 auto; min-width: min(100%, max-content); margin-right: 4px; }
 .card-title { color: var(--accent); font-size: 12px; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; margin-top: 2px; }
 .card-stats { display: flex; gap: 32px; margin: 16px 0 14px; flex-wrap: wrap; }
 .card-stats div { display: flex; flex-direction: column; }
@@ -448,7 +448,16 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
 .fx-layer { position: absolute !important; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2 !important; }
 .card-name span { white-space: pre-wrap; }
 
-.social-row { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin-top: 12px; padding: 12px 16px; border-radius: 14px; background: var(--surface); border: 1px solid var(--line); }
+.social-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 12px; }
+.fc-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; flex: 1 1 420px; }
+.fc-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.social-row .follow-count { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 14px; background: var(--surface); border: 1px solid var(--line); color: var(--dim); font: inherit; cursor: pointer; text-align: left; transition: border-color .15s, background .15s, transform .15s; }
+.social-row .follow-count:hover { border-color: #8b7bff99; background: #8b7bff14; transform: translateY(-1px); }
+.fc-icon { width: 36px; height: 36px; flex-shrink: 0; border-radius: 10px; display: grid; place-items: center; background: #8b7bff26; color: var(--accent); }
+.fc-icon svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.fc-text { display: flex; flex-direction: column; min-width: 0; }
+.fc-text b { color: var(--text); font-size: 20px; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.fc-text small { font-size: 10px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
 .follow-count { color: var(--dim); font-size: 14px; }
 .follow-count b { color: var(--text); font-size: 18px; margin-right: 4px; }
 .social-row .grow { flex: 1; }
@@ -695,9 +704,14 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
 }
 
 /* ---------------------------------------------------------------- public profile: tabs and people lists */
-.social-row .follow-count { background: none; border: 0; color: var(--dim); font: inherit; cursor: pointer; padding: 4px 8px; border-radius: 8px; }
-.social-row .follow-count b { color: var(--text); }
-.social-row .follow-count:hover { background: #ffffff0d; color: var(--text); }
+@media (max-width: 520px) {
+  .fc-tiles { gap: 6px; flex-basis: 100%; }
+  .social-row .follow-count { flex-direction: column; align-items: flex-start; gap: 6px; padding: 10px; }
+  .fc-icon { width: 28px; height: 28px; border-radius: 8px; }
+  .fc-text b { font-size: 17px; }
+  .fc-actions { width: 100%; }
+  .fc-actions .btn { flex: 1; justify-content: center; }
+}
 .prof-tabs { display: flex; gap: 6px; margin: 22px 0 14px; border-bottom: 1px solid var(--line); flex-wrap: wrap; scroll-margin-top: 80px; }
 .prof-tab { background: none; border: 0; color: var(--dim); font: inherit; font-weight: 700; font-size: 14px; padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
 .prof-tab:hover { color: var(--text); }

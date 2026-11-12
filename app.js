@@ -1139,11 +1139,15 @@
     const friends = h("b", { text: "…" });
     let row;
     const open = (k) => row.dispatchEvent(new CustomEvent("open-list", { detail: k }));
+    const icon = (paths) => { const s = document.createElement("span"); s.className = "fc-icon"; s.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${paths}</svg>`; return s; };
+    const tile = (k, count, label, title, paths) => h("button.follow-count", { type: "button", onclick: () => open(k), title },
+      icon(paths), h("span.fc-text", {}, count, h("small", { text: label })));
     row = h("div.social-row", {},
-      h("button.follow-count", { type: "button", onclick: () => open("followers"), title: "See who follows " + (p.name || "them") }, followers, " followers"),
-      h("button.follow-count", { type: "button", onclick: () => open("following"), title: "See who " + (p.name || "they") + " follows" }, following, " following"),
-      h("button.follow-count", { type: "button", onclick: () => open("friends"), title: "See " + (p.name || "their") + "'s friends" }, friends, " friends"),
-      h("span.grow"), out, followBtn, gift);
+      h("div.fc-tiles", {},
+        tile("followers", followers, "Followers", "See who follows " + (p.name || "them"), '<path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1"/><circle cx="9" cy="8" r="3.5"/><path d="M22 19v-1a4 4 0 0 0-3-3.9M16 4.2a3.5 3.5 0 0 1 0 6.6"/>'),
+        tile("following", following, "Following", "See who " + (p.name || "they") + " follows", '<path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/>'),
+        tile("friends", friends, "Friends", "See " + (p.name || "their") + "'s friends", '<circle cx="12" cy="8" r="4"/><path d="M4 20c0-3.3 3.6-6 8-6s8 2.7 8 6"/>')),
+      h("div.fc-actions", {}, out, followBtn, gift));
     paint();
     (async () => {
       try {
