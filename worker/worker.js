@@ -1585,7 +1585,8 @@ async function supporters(env) {
   if (supportIndex && Date.now() - supportIndexAt < 60_000) return supportIndex;
   const out = {};
   const ids = new Set(LIFETIME_SUPPORTERS);
-  const gifted = {}, firstBuy = {};
+  const gifted = {}, firstBuy = {}, firstSeen = {};
+  const seen = (id, at) => { const t = Date.parse(at) || 0; if (t && (!(id in firstSeen) || t < firstSeen[id])) firstSeen[id] = t; };
   const bought = (id, at, months, gift, paid = true) => {
     if (!id || !/^[A-Za-z0-9_-]{8,64}$/.test(id)) return;
     const t = Date.parse(at) || Date.now();
@@ -1616,17 +1617,23 @@ async function supporters(env) {
   await Promise.all([...ids].map(async (id) => {
     const rec = await r2json(env, `supporters/${id}.json`, null);
     for (const p of rec?.purchases || []) {
+      seen(id, p.at); // when they first had supporter (bought, gifted to them, or given)
       const paid = p.amount > 0; // free gifts from the developer count as gifted, not as purchases
       if (p.gift) bought(p.gift, p.at, p.months, true, paid);
       else if (paid) bought(id, p.at, p.months, false);
     }
     const boost = boosts[id] ? await r2json(env, `boosters/${id}.json`, null) : null;
+    if (boost) seen(id, boost.since || boost.at);
     const st = supportStatus(rec, id, boost);
     if (!st.active && st.days <= 0) return;
     const looks = st.active ? await r2json(env, `looks/${id}.json`, {}) : {};
     out[id] = { ...st, nameStyle: looks.nameStyle || "", effect: looks.effect || "none", banner: looks.banner || "", gif: looks.gif || "" };
   }));
-  try { numberIndex = await assignNumbers(env, firstBuy); } catch (e) { console.log("supporter numbers", e && e.message); }
+  // every supporter gets a number like the developer's #0000: buyers in the order they first bought, and anyone
+  // who became a supporter another way (a gift, a server boost, lifetime) in the order they first had it
+  const order = { ...firstBuy };
+  for (const id of Object.keys(out)) if (!(id in order)) order[id] = firstSeen[id] || Date.now();
+  try { numberIndex = await assignNumbers(env, order); } catch (e) { console.log("supporter numbers", e && e.message); }
   giftedIndex = gifted;
   for (const [id, st] of Object.entries(out)) { st.gifted = gifted[id] || 0; if (id in numberIndex) st.number = numberIndex[id]; }
   supportIndex = out; supportIndexAt = Date.now();
