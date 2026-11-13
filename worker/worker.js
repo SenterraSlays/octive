@@ -696,6 +696,73 @@ async function account(request, env, route) {
       await env.RELEASES.put(`discord-codes/${code}.json`, JSON.stringify({ playerId: who.playerId, exp }), { httpMetadata: { contentType: "application/json" } });
       return reply({ code, exp });
     }
+    // ---- the developer's and the official account's moderator view of a player (the game's player pop-up)
+    case "mod/inspect": {
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can see this.");
+      const id = String(b.playerId || "");
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
+      const cfg = config(env);
+      await loadModeration(cfg);
+      const [pub, rec, sup, boost, followers, following, inbox, db, web, alerts, rate] = await Promise.all([
+        publicItems(cfg, id, ["card", "seen", "platform"]).catch(() => ({})),
+        record(env, id),
+        r2json(env, `supporters/${id}.json`, null),
+        r2json(env, `boosters/${id}.json`, null),
+        followerCount(env, id).catch(() => 0),
+        followingOf(env, id).catch(() => []),
+        r2json(env, dmInboxKey(id), dmEmptyInbox()).catch(() => ({})),
+        r2json(env, WS_DB, { items: [] }),
+        env.RELEASES.head(`webseen/${id}`).catch(() => null),
+        r2json(env, `scores/rate/${id}.json`, null),
+        r2json(env, `workshop/rate/${id}.json`, null),
+      ]);
+      const card = pub.card || {};
+      const st = supportStatus(sup, id, boost);
+      const uploads = (db.items || []).filter((x) => x.creatorId === id && !x.removed).map(wsPublic);
+      return reply({
+        playerId: id, name: card.name || null, hasCard: !!pub.card,
+        version: card.version || null, ppVersion: card.ppVersion || null, platform: pub.platform || null,
+        lastSeenGame: pub.seen || null, lastSeenWebsite: web ? web.uploaded.toISOString() : null,
+        badges: badgesOf(id), check: checkOf(id), banned: moderation.bans[id] || null, overrides: moderation.overrides[id] || null,
+        discord: rec.discord?.id ? { id: rec.discord.id, username: rec.discord.username || null, name: rec.discord.name || null, linkedAt: rec.discord.at || null, prefs: rec.discordPrefs || {} } : null,
+        emailLinked: !!rec.email, emailVerified: !!rec.verified,
+        supporter: st, supporterPurchases: (sup?.purchases || []).length,
+        followers, following: following.length, friends: (inbox.friends || []).length, blocked: (inbox.blocked || []).length,
+        conversations: Object.keys(inbox.threads || {}).length,
+        uploads, scoresSharedToday: rate && rate.day === new Date().toISOString().slice(0, 10) ? rate.n : 0,
+        achievements: Object.keys(card.achievements || {}).length,
+        stats: { pp: card.pp || 0, accuracy: card.accuracy || 0, level: card.level || 0, playCount: card.playCount || 0, playTimeMs: card.playTimeMs || 0, rank: card.rank || 0 },
+      });
+    }
+    case "mod/unlink-discord": {
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      const id = String(b.playerId || "");
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
+      const rec = await record(env, id);
+      if (!rec.discord?.id) fail(400, "They haven't linked a Discord.");
+      await env.RELEASES.delete(`discord/${rec.discord.id}.json`);
+      delete rec.discord; delete rec.discordPrefs;
+      await saveRecord(env, id, rec);
+      return reply({ ok: true });
+    }
+    case "mod/remove-uploads": {
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      const id = String(b.playerId || "");
+      const db = await r2json(env, WS_DB, { items: [] });
+      const mine = (db.items || []).filter((x) => x.creatorId === id && !x.removed);
+      for (const it of mine) {
+        try { await discordApi(env, "DELETE", `/channels/${it.channelId}/messages/${it.messageId}`); } catch { /* already gone */ }
+        wsUrls.delete(it.id);
+      }
+      await r2update(env, WS_DB, () => ({ items: [] }), (d) => { for (const x of d.items || []) if (x.creatorId === id) x.removed = true; });
+      return reply({ ok: true, removed: mine.length });
+    }
     case "discord/status": {
       // the game's Discord settings: who's linked and the Discord options
       await bodyOf(request);
@@ -1909,7 +1976,7 @@ async function supportRoutes(request, env, url, ctx) {
     // the developer (Senterra) gives supporter time for free
     const b = await bodyOf(request);
     const who = await signedIn(request, env);
-    if (who.playerId !== OWNER) fail(403, "Only the OCTIVE developer can gift supporter for free.");
+    if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only the OCTIVE developer can gift supporter for free.");
     const months = Math.round(Number(b.months));
     if (!(months >= 1 && months <= 120)) fail(400, "Choose 1 to 120 months.");
     const target = String(b.playerId || "");
@@ -2810,6 +2877,14 @@ async function discordMessageAlert(env, to, from, fromName, preview) {
   if (!env.DISCORD_BOT_TOKEN) return;
   const rec = await record(env, to);
   if (!rec.discord?.id || !rec.discordPrefs?.dmAlerts) return;
+  // they're on OCTIVE right now (the game or the website): they see it there, no DM needed
+  try {
+    const pub = await publicItems(config(env), to, ["seen"]);
+    const seen = pub.seen ? Date.parse(pub.seen) : 0;
+    if (seen > 0 && Date.now() - seen < ONLINE_MS) return;
+    const web = await env.RELEASES.head(`webseen/${to}`);
+    if (web && Date.now() - web.uploaded.getTime() < WEB_MS) return;
+  } catch { /* unknown: alert as usual */ }
   const key = `discord-alerts/${to}.json`;
   const last = await r2json(env, key, {});
   if (last[from] && Date.now() - last[from] < 10 * 60_000) return;
