@@ -16,6 +16,25 @@
   const OFFICIAL_ID = "o2quUJmLzZujIpPomajHJ7oW07aI";
   /** The check beside a name ("official" or "verified"), from the server or the built-in list. */
   const checkOf = (p) => p ? (p.check || (p.id === OFFICIAL_ID ? "official" : ROLES[p.id]?.badge === "DEV" ? "verified" : null)) : null;
+  const INF = "∞";
+  const isOfficial = (p) => !!p && (p.id === OFFICIAL_ID || p.official === true);
+  // the official account's status: "Octive • v1.5.0 • 8 players online", a new number every 12 s (the same for everyone)
+  let offStat = null, offStatAt = 0, offClock = 0;
+  function loadOfficialStatus() {
+    if (!worker || Date.now() - offStatAt < 60_000) return;
+    offStatAt = Date.now();
+    fetch(worker + "/official/status", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)).then((d) => {
+      if (!d) return; offStat = d; if (d.now) offClock = d.now - Date.now();
+    }).catch(() => {});
+  }
+  function officialText() {
+    loadOfficialStatus();
+    const head = `Octive \u2022 v${(offStat && offStat.version) || (release && release.version) || ""}`.replace(/ v$/, "");
+    const st = offStat && offStat.stats && offStat.stats.length ? offStat.stats[Math.floor((Date.now() + offClock) / (offStat.rotateMs || 12000)) % offStat.stats.length] : null;
+    return st ? `${head} \u2022 ${fmt0.format(st.value)} ${st.label}` : head;
+  }
+  /** A player from the ranking, or the official account (which isn't ranked). */
+  const findPlayer = (id) => (data && data.players.find((x) => x.id === id)) || (data && data.official && data.official.id === id ? data.official : null);
   const checkEl = (p) => { const c = checkOf(p); return c ? h("span.check." + c, { title: c === "official" ? "Official OCTIVE account" : "Verified: this is really them", role: "img", "aria-label": c }) : null; };
 
   /** Built-in special accounts by Unity player ID (same list as the game's PlayerRoles). */
@@ -234,14 +253,15 @@
     function render(filter) {
       rows.textContent = "";
       const q = (filter || "").trim().toLowerCase();
-      const list = q ? data.players.filter((p) => (p.name || "").toLowerCase().includes(q)) : data.players;
+      const list = q ? data.players.filter((p) => (p.name || "").toLowerCase().includes(q)) : data.players.slice();
+      if (q && data.official && ("octive".includes(q) || (data.official.name || "").toLowerCase().includes(q))) list.unshift(data.official);
       empty.hidden = list.length > 0;
       if (!list.length && q) empty.textContent = `Nobody called "${filter.trim()}" is ranked.`;
       for (const p of list) {
         const r = clone("tpl-row").firstElementChild;
         r.href = "#/u/" + encodeURIComponent(p.id);
         r.dataset.place = String(p.rank);
-        r.querySelector(".rank").textContent = "#" + fmt0.format(p.rank);
+        r.querySelector(".rank").textContent = isOfficial(p) ? INF : "#" + fmt0.format(p.rank);
         nameInto(r.querySelector(".name"), p);
         setAvatar(r.querySelector(".avatar"), p);
         setRole(r, r.querySelector(".badge"), p);
@@ -257,10 +277,11 @@
           if (gp) tags.append(gp);
           if (![...tags.children].some((el) => !el.hidden)) tags.remove();
         }
-        r.querySelector(".acc").textContent = fmt2.format(p.accuracy || 0) + "%";
-        r.querySelector(".lvl").textContent = "Lv" + (p.level || 1);
-        r.querySelector(".plays").textContent = fmt0.format(p.playCount || 0);
-        r.querySelector(".pp").textContent = fmt0.format(p.pp || 0) + " PR";
+        r.querySelector(".acc").textContent = isOfficial(p) ? "100.00%" : fmt2.format(p.accuracy || 0) + "%";
+        r.querySelector(".lvl").textContent = "Lv" + (isOfficial(p) ? 1000 : p.level || 1);
+        r.querySelector(".plays").textContent = isOfficial(p) ? INF : fmt0.format(p.playCount || 0);
+        r.querySelector(".pp").textContent = (isOfficial(p) ? INF : fmt0.format(p.pp || 0)) + " PR";
+        if (isOfficial(p)) r.classList.add("official-row");
         if ((p.ppVersion || 2) < 3) {
           r.classList.add("pp-old");
           r.querySelector(".pp").title = "PR from before the rework. It updates the next time this player opens OCTIVE.";
@@ -276,7 +297,7 @@
   }
 
   function player(id) {
-    const p = data.players.find((x) => x.id === id);
+    const p = findPlayer(id);
     if (!p) {
       app.innerHTML = '<a class="back" href="#/rankings">← All players</a><p class="empty">That player isn\'t in the ranking (yet).</p>';
       setTimeout(giftPopup, 400);
@@ -285,13 +306,17 @@
     const view = clone("tpl-player");
     const card = view.querySelector(".card");
     nameInto(view.querySelector(".card-name"), p);
-    view.querySelector(".card-rank").textContent = "#" + fmt0.format(p.rank);
+    view.querySelector(".card-rank").textContent = isOfficial(p) ? INF : "#" + fmt0.format(p.rank);
     setAvatar(view.querySelector(".card-avatar"), p);
     const role = setRole(card, view.querySelector(".badge"), p);
     if (role) { const t = view.querySelector(".card-title"); t.textContent = role.title; t.hidden = false; }
     const status = view.querySelector(".card-status");
     status.textContent = p.online ? "● " + statusText(p) : statusText(p);
     status.classList.toggle("on", !!p.online);
+    if (isOfficial(p)) {
+      // its status line keeps changing while the page is open
+      const tick = setInterval(() => { if (!status.isConnected) { clearInterval(tick); return; } status.textContent = "● " + statusText(p); }, 1000);
+    }
     decorateCard(card, p);
     card.after(socialRow(p));
     // what they shared to the Workshop
@@ -321,6 +346,14 @@
     view.querySelector(".fill").style.width = Math.round(Math.max(0, Math.min(1, p.levelProgress || 0)) * 100) + "%";
     const toNext = Math.round((xpFor(lv + 1) - xpFor(lv)) * (1 - (p.levelProgress || 0)));
     set(".c-next", `${fmt0.format(toNext)} xp to Lv${lv + 1}`);
+    if (isOfficial(p)) {
+      // the official account: every number is infinite, and it never misses
+      set(".c-pp", INF + " PR"); set(".c-acc", "100.00%"); set(".c-rank", INF);
+      set(".c-lvl", "Lv1000"); set(".s-level", "Lv1000"); set(".c-next", "Max level");
+      for (const sel of [".s-score", ".s-plays", ".s-fc", ".s-rank", ".s-time", ".s-xp"]) set(sel, INF);
+      set(".s-combo", INF + "x");
+      view.querySelector(".fill").style.width = "100%";
+    }
     if (p.devFriend && !ROLES[p.id]) view.querySelector(".devfriend").hidden = false;
     if (p.bio && p.bio.trim()) {
       view.querySelector(".bio").hidden = false;
@@ -1250,6 +1283,7 @@
   const STATUS_TEXT = { desktop: "Online Desktop", mobile: "Online Mobile", web: "Online Website", site: "Viewing Website" };
   /** "Online Desktop", "Viewing Website", "Last online 3 hours ago"… */
   function statusText(p) {
+    if (isOfficial(p)) return officialText();
     if (p.online) {
       // test builds report "desktop-dev" etc.: "Online Desktop - Playing DEV Build"
       const dev = /-dev$/.test(p.status || "");

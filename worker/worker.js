@@ -192,6 +192,60 @@ async function buildBoard(env) {
 // the official OCTIVE account: never ranked, can message anyone (and anyone can answer it), level 1000
 const OFFICIAL_ID = "o2quUJmLzZujIpPomajHJ7oW07aI";
 const isOfficial = (id) => id === OFFICIAL_ID;
+/** How long each number of the official account's status line shows (everyone sees the same one at once). */
+const OFFICIAL_ROTATE_MS = 12_000;
+
+const verParts = (v) => String(v || "0").split(".").map((x) => parseInt(x, 10) || 0);
+const verNewer = (a, b) => { const x = verParts(a), y = verParts(b); for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); return false; };
+async function countPrefix(env, prefix) {
+  let n = 0, cursor;
+  do { const list = await env.RELEASES.list({ prefix, cursor }); n += list.objects.length; cursor = list.truncated ? list.cursor : undefined; } while (cursor);
+  return n;
+}
+
+let officialStats = null, officialStatsAt = 0;
+/**
+ * The official account's status: "Octive • v1.5.0 • 8 players online", the number changing every 12 seconds
+ * (players online, registered users, Workshop creations, scores submitted, active supporters). Cached a minute.
+ */
+async function officialStatus(env) {
+  if (officialStats && Date.now() - officialStatsAt < 60_000) return officialStats;
+  const cfg = config(env);
+  const [board, sup, web, items, inboxes, accounts, latest, card] = await Promise.all([
+    leaderboard(env).catch(() => ({ players: [], total: 0 })),
+    supporters(env).catch(() => ({})),
+    webVisitors(env).catch(() => ({})),
+    r2json(env, WS_DB, { items: [] }).catch(() => ({ items: [] })),
+    countPrefix(env, "dm/inbox/").catch(() => 0),
+    countPrefix(env, "accounts/").catch(() => 0),
+    env.RELEASES.get("latest.json").then((o) => (o ? o.json() : null)).catch(() => null),
+    publicItems(cfg, OFFICIAL_ID, ["card"]).then((x) => x.card || null).catch(() => null),
+  ]);
+  const now = Date.now();
+  const online = new Set(board.players.filter((p) => p.online).map((p) => p.id));
+  for (const [id, at] of Object.entries(web)) if (now - at < WEB_MS && !isOfficial(id)) online.add(id);
+  // the newest of the released version and the one the official account last played on
+  let version = latest?.version || "1.0.0";
+  if (card?.version && verNewer(card.version, version)) version = card.version;
+  const stats = [
+    { key: "online", label: "players online", value: online.size },
+    { key: "users", label: "registered users", value: Math.max(board.total || 0, inboxes, accounts) },
+    { key: "workshop", label: "workshop creations", value: (items.items || []).length },
+    { key: "scores", label: "scores submitted", value: board.players.reduce((n, p) => n + (p.playCount || 0), 0) },
+    { key: "supporters", label: "active supporters", value: Object.values(sup).filter((x) => x.active).length },
+  ];
+  officialStats = { version, stats, rotateMs: OFFICIAL_ROTATE_MS };
+  officialStatsAt = now;
+  return officialStats;
+}
+
+/** The official account as a search result (it isn't on the ranking). */
+async function officialProfile(env) {
+  try {
+    const p = await profileOf(env, OFFICIAL_ID);
+    return p ? { ...p, rank: 0, official: true } : null;
+  } catch { return null; }
+}
 
 async function leaderboard(env) {
   if (board && Date.now() - boardAt < BOARD_TTL) return board;
@@ -835,8 +889,8 @@ async function profileOf(env, playerId) {
     id: playerId, rank: card.rank || 0, pp: card.pp || 0, name: ov.name || card.name || "Player", accuracy: card.accuracy || 0,
     level: isOfficial(playerId) ? 1000 : card.level || 1, levelProgress: isOfficial(playerId) ? 1 : card.levelProgress || 0, playCount: card.playCount || 0, maxCombo: card.maxCombo || 0,
     fullCombos: card.fullCombos || 0, playTimeMs: card.playTimeMs || 0, totalScore: card.totalScore || 0, bio: card.bio || "", achievements: card.achievements || {},
-    badges: badgesOf(playerId), check: checkOf(playerId), online: seen > 0 && Date.now() - seen < ONLINE_MS, lastSeen: seen ? new Date(seen).toISOString() : null,
-    platform: items.platform || "", status: seen > 0 && Date.now() - seen < ONLINE_MS ? platformStatus(items.platform) : null,
+    badges: badgesOf(playerId), check: checkOf(playerId), online: isOfficial(playerId) || (seen > 0 && Date.now() - seen < ONLINE_MS), lastSeen: seen ? new Date(seen).toISOString() : null,
+    platform: items.platform || "", status: isOfficial(playerId) ? "official" : seen > 0 && Date.now() - seen < ONLINE_MS ? platformStatus(items.platform) : null,
     avatarHash: ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : (card.avatar || ""),
   };
 }
@@ -2943,8 +2997,10 @@ export default {
         try { sup = await supporters(env); } catch { /* none */ }
         try { web = await webVisitors(env); } catch { /* none */ }
         const players = board.players.map((p) => withWeb({ ...p, supporter: sup[p.id] || null, ...giftInfo(p.id) }, web));
-        return json({ ...board, online: players.filter((p) => p.online).length, players }, 30);
+        const official = await officialProfile(env);
+        return json({ ...board, online: players.filter((p) => p.online).length, players, official }, 30);
       }
+      if (url.pathname === "/official/status") return json({ ...(await officialStatus(env)), now: Date.now() }, 30);
       const m = url.pathname.match(/^\/avatar\/([A-Za-z0-9_-]{1,64})$/);
       if (m) return await avatar(env, m[1], url.searchParams.get("v"));
       // /web/<version>/[~<build stamp>/]Build/... — the stamp only makes browsers fetch a re-uploaded build
