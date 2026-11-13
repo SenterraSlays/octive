@@ -736,6 +736,24 @@ async function account(request, env, route) {
         stats: { pp: card.pp || 0, accuracy: card.accuracy || 0, level: card.level || 0, playCount: card.playCount || 0, playTimeMs: card.playTimeMs || 0, rank: card.rank || 0 },
       });
     }
+    case "mod/verify": {
+      // verify (or un-verify) a song: its charts get a global leaderboard
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can verify songs.");
+      const id = String(b.songId || "");
+      if (!songIdOk(id) || officialSong(id)) fail(400, "That song can't be verified.");
+      const clean = (v, n) => String(v || "").replace(/[\u0000-\u001F\u007F]/g, "").trim().slice(0, n);
+      let out = null;
+      await r2update(env, "verified.json", () => ({ songs: {} }), (d) => {
+        d.songs ||= {};
+        if (b.verified === false) delete d.songs[id];
+        else d.songs[id] = { title: clean(b.title, 120), artist: clean(b.artist, 120), osuSet: Number(b.osuSet) > 0 ? Math.round(Number(b.osuSet)) : undefined, workshopId: /^[a-z0-9]{16,40}$/.test(String(b.workshopId || "")) ? String(b.workshopId) : undefined, by: who.playerId, at: new Date().toISOString() };
+        out = d;
+      });
+      verifiedCache = out; verifiedAt = Date.now();
+      return reply({ ok: true, verified: b.verified !== false, count: Object.keys(out?.songs || {}).length });
+    }
     case "mod/unlink-discord": {
       const b = await bodyOf(request);
       const who = await signedIn(request, env);
@@ -1287,6 +1305,14 @@ async function discordCommand(env, it) {
       const db = await r2json(env, WS_DB, { items: [] });
       const creator = url.searchParams.get("creator");
     let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type) && (!creator || it.creatorId === creator));
+    // ?verified=1 / 0, ?customizable=1 (skins and styles anyone may change)
+    const ver = url.searchParams.get("verified");
+    if (ver === "1") items = items.filter((it) => !!it.verified); else if (ver === "0") items = items.filter((it) => !it.verified);
+    if (url.searchParams.get("customizable") === "1") items = items.filter((it) => it.type === "themes" || !(it.meta && it.meta.locked));
+    if (url.searchParams.get("builtin") === "1") items = items.filter((it) => !!it.builtin);
+    // ?song=<songId>: the upload holding that song (multiplayer: get the room's song)
+    const song = String(url.searchParams.get("song") || "");
+    if (song) items = items.filter((it) => (it.songIds || []).includes(song));
       if (q) items = items.filter((it) => `${it.title} ${it.creator} ${it.description}`.toLowerCase().includes(q));
       items.sort((a, b) => b.at - a.at);
       const shown = items.slice(0, 8);
@@ -1492,6 +1518,24 @@ const SCORE_MAX = 1_000_000;
 const boards = new Map(); // key -> { data, at }
 
 const officialSong = (id) => /^octive-[a-z0-9-]{1,80}$/.test(id || "");
+const songIdOk = (id) => /^[a-z0-9][a-z0-9_-]{0,89}$/.test(id || "");
+
+// ---- verified songs: Senterra and the official account verify any song (by its song id), which gives its
+// charts a global leaderboard like OCTIVE's own. Kept in R2 at verified.json.
+let verifiedCache = null, verifiedAt = 0;
+async function verifiedSongs(env) {
+  if (verifiedCache && Date.now() - verifiedAt < 60_000) return verifiedCache;
+  verifiedCache = await r2json(env, "verified.json", { songs: {} });
+  verifiedCache.songs ||= {};
+  verifiedAt = Date.now();
+  return verifiedCache;
+}
+/** A song with global leaderboards: OCTIVE's own, or one Senterra or Octive verified. */
+async function boardSong(env, id) {
+  if (officialSong(id)) return true;
+  if (!songIdOk(id)) return false;
+  return !!(await verifiedSongs(env)).songs[id];
+}
 const chartIdOk = (id) => /^[A-Za-z0-9_-]{1,80}$/.test(id || "");
 
 async function readBoard(env, songId, chartId) {
@@ -1510,7 +1554,7 @@ async function readBoard(env, songId, chartId) {
 async function chartScores(request, env, url) {
   const m = url.pathname.match(/^\/scores\/([a-z0-9-]{1,90})\/([A-Za-z0-9_-]{1,80})$/);
   if (m && request.method === "GET") {
-    if (!officialSong(m[1])) return reply({ entries: [], official: false });
+    if (!(await boardSong(env, m[1]))) return reply({ entries: [], official: false });
     const data = await readBoard(env, m[1], m[2]);
     if (Date.now() - boardAt > BOARD_TTL) { try { await loadModeration(config(env)); } catch { /* keep */ } }
     let sup = {};
@@ -1522,7 +1566,7 @@ async function chartScores(request, env, url) {
     const b = await bodyOf(request);
     const who = await signedIn(request, env);
     const songId = String(b.songId || ""), chartId = String(b.chartId || "");
-    if (!officialSong(songId) || !chartIdOk(chartId)) fail(400, "Only OCTIVE Official charts have online leaderboards.");
+    if (!(await boardSong(env, songId)) || !chartIdOk(chartId)) fail(400, "Only OCTIVE Official and verified charts have online leaderboards.");
     const score = Math.round(Number(b.score)), acc = Number(b.accuracy);
     if (!(score >= 0 && score <= SCORE_MAX) || !(acc >= 0 && acc <= 100)) fail(400, "That score isn't valid.");
     const cfg = config(env);
@@ -1614,7 +1658,7 @@ const MONTH_MS = 30.4375 * 86_400_000;
 const PRICE_CENTS = 250;
 const MAX_MONTHS = 120; // any number of months (up to 10 years) for yourself or as a gift
 const GIF_MAX = 8 * 1048576; // supporters' animated pictures
-const LIFETIME_SUPPORTERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE"]; // Senterra
+const LIFETIME_SUPPORTERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE", "o2quUJmLzZujIpPomajHJ7oW07aI"]; // Senterra, and the official OCTIVE account
 const OWNER = "PlwcYVKV9y7NBFWfUaC263XpCFbE"; // everyone follows the developer
 const MILESTONES = [[0, "new"], [1, "1 month"], [3, "3 months"], [6, "6 months"], [12, "1 year"], [24, "2 years"], [36, "3 years"], [48, "4 years"], [60, "5 years"], [120, "10 years"]];
 const EFFECTS = ["none", "sparkles", "snow", "hearts", "embers", "stars", "aurora", "rain"];
@@ -2309,7 +2353,15 @@ async function chatPull(env) {
         const text = discordToText(m);
         if (!text.trim()) continue;
         const from = discordFrom(m.author || {}, m.member);
-        b.msgs.push({ seq: ++b.seq, id: "d" + m.id, at: m.timestamp || new Date().toISOString(), src: "discord", text, from, linked: !from.id.startsWith("discord:") });
+        // a Discord reply: to a Discord message ("d<id>"), or to a game message's Discord copy
+        let reply;
+        const ref = m.referenced_message;
+        if (ref && ref.id) {
+          const target = b.msgs.find((x) => x.id === "d" + ref.id || x.discordId === ref.id);
+          reply = target ? { id: target.id, name: target.from?.name || "", text: String(target.text || "").slice(0, 120), fromId: target.from?.id || null }
+            : { id: "d" + ref.id, name: String(ref.member?.nick || ref.author?.global_name || ref.author?.username || "").slice(0, 40), text: String(ref.content || "").slice(0, 120), fromId: null };
+        }
+        b.msgs.push({ seq: ++b.seq, id: "d" + m.id, at: m.timestamp || new Date().toISOString(), src: "discord", text, from, linked: !from.id.startsWith("discord:"), reply });
       }
       if (!changed) return false;
       if (b.msgs.length > CHAT_KEEP) b.msgs = b.msgs.slice(-CHAT_KEEP);
@@ -2324,8 +2376,17 @@ async function chatRoutes(request, env, url, ctx) {
     await chatPull(env);
     const after = Number(url.searchParams.get("after") || 0);
     const box = await r2json(env, CHAT_KEY, chatEmpty());
-    const msgs = (box.msgs || []).filter((m) => m.seq > after && !moderation.bans[m.from?.id]);
-    return reply({ seq: box.seq || 0, msgs: after ? msgs : msgs.slice(-80), discord: !!env.DISCORD_CHAT_CHANNEL_ID, channel: env.DISCORD_CHAT_CHANNEL_ID || null, guild: env.DISCORD_GUILD_ID || null });
+    let msgs = (box.msgs || []).filter((m) => m.seq > after && !moderation.bans[m.from?.id]);
+    if (!after) msgs = msgs.slice(-80);
+    // messages from before someone linked their Discord: shown as their OCTIVE player now (so they're clickable)
+    const unlinked = [...new Set(msgs.filter((m) => String(m.from?.id || "").startsWith("discord:")).map((m) => m.from.id.slice(8)))].slice(0, 30);
+    if (unlinked.length) {
+      const cfg = config(env);
+      const ids = new Map();
+      for (const d of unlinked) { const pid = await linkedPlayer(env, d).catch(() => null); if (pid) ids.set(d, await chatIdentity(cfg, pid, null)); }
+      if (ids.size) msgs = msgs.map((m) => { const d = String(m.from?.id || "").startsWith("discord:") ? m.from.id.slice(8) : null; const p = d && ids.get(d); return p ? { ...m, from: { ...p, discord: m.from.name, discordId: d }, linked: true } : m; });
+    }
+    return reply({ seq: box.seq || 0, msgs, discord: !!env.DISCORD_CHAT_CHANNEL_ID, channel: env.DISCORD_CHAT_CHANNEL_ID || null, guild: env.DISCORD_GUILD_ID || null });
   }
   if (path === "/chat/send" && request.method === "POST") {
     const b = await bodyOf(request);
@@ -2347,17 +2408,33 @@ async function chatRoutes(request, env, url, ctx) {
     const from = await chatIdentity(cfg, who.playerId, who.username);
     const name = from.name;
     const msg = { id: "g" + crypto.randomUUID().replace(/-/g, "").slice(0, 16), at: new Date().toISOString(), src: "game", text, from };
+    let replyTarget = null;
     const box = await r2update(env, CHAT_KEY, chatEmpty, (bx) => {
       msg.seq = ++bx.seq;
+      const rid = String(b.replyTo || "");
+      const t = rid ? bx.msgs.find((x) => x.id === rid) : null;
+      if (t) { msg.reply = { id: t.id, name: t.from?.name || "", text: String(t.text || "").slice(0, 120), fromId: t.from?.id || null }; replyTarget = t; }
       bx.msgs.push(msg);
       if (bx.msgs.length > CHAT_KEEP) bx.msgs = bx.msgs.slice(-CHAT_KEEP);
     });
     // and into the Discord channel, as the player (no pings)
     if (env.DISCORD_CHAT_WEBHOOK) ctx.waitUntil((async () => {
       const badge = (msg.from.badges || []).includes("DEV") ? " 🛠️" : (msg.from.badges || []).includes("MOD") ? " 🛡️" : "";
+      // @Name of someone with a linked Discord pings them there; a reply quotes what it answers (and pings its writer)
+      const recent = (box.msgs || []).slice(-200);
+      const byName = new Map();
+      for (const x of recent) if (x.from?.discordId && x.from?.name) byName.set(String(x.from.name).toLowerCase(), x.from.discordId);
+      const pings = new Set();
+      let content = text.replace(/@([^\s@]{2,40})/g, (all, nm) => { const d = byName.get(String(nm).toLowerCase()); if (!d) return all; pings.add(d); return `<@${d}>`; });
+      if (replyTarget) {
+        const quote = String(replyTarget.text || "").replace(/\n/g, " ").slice(0, 80);
+        const rd = replyTarget.from?.discordId;
+        if (rd) pings.add(rd);
+        content = `> ↪ ${rd ? `<@${rd}>` : `**${replyTarget.from?.name || "someone"}**`}: ${quote}\n${content}`;
+      }
       const r = await fetch(env.DISCORD_CHAT_WEBHOOK + "?wait=true", {
         method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" },
-        body: JSON.stringify({ content: text, username: `${name}${badge} · OCTIVE`.slice(0, 80), avatar_url: msg.from.avatar || `${SITE}logo-512.png`, allowed_mentions: { parse: [] } }),
+        body: JSON.stringify({ content: content.slice(0, 2000), username: `${name}${badge} · OCTIVE`.slice(0, 80), avatar_url: msg.from.avatar || `${SITE}logo-512.png`, allowed_mentions: { parse: [], users: [...pings].slice(0, 10) } }),
       });
       if (!r.ok) { console.log("chat webhook", r.status, (await r.text()).slice(0, 200)); return; }
       const posted = await r.json();
@@ -2513,6 +2590,63 @@ async function zipPreview(u8, entries, kind) {
   return guess ? await tryName(guess.name) : null;
 }
 
+/**
+ * What a file holds, for the Workshop's details: a song's title, artist, bpm, length, osu! set and every
+ * difficulty (name, keys, stars, notes, charter); a skin's or style's lock (customizable or not).
+ */
+async function wsMeta(kind, u8) {
+  try {
+    if (kind === "charts") {
+      const entries = zipEntries(u8);
+      const man = entries.find((e) => e.name.toLowerCase() === "manifest.json");
+      if (!man) return null;
+      const m = JSON.parse(new TextDecoder().decode(await zipRead(u8, man, 4 * 1048576)));
+      const tags = Array.isArray(m.song?.tags) ? m.song.tags : [];
+      const set = tags.map((t) => /^osu-set:(\d+)$/i.exec(String(t))).find(Boolean);
+      return {
+        songId: String(m.songId || "").slice(0, 100) || null, title: String(m.song?.title || "").slice(0, 160), artist: String(m.song?.artist || "").slice(0, 160),
+        bpm: Number(m.song?.bpm) || 0, durationUs: Number(m.song?.durationUs) || 0, osuSet: set ? Number(set[1]) : 0,
+        charts: (Array.isArray(m.charts) ? m.charts : []).slice(0, 60).map((c) => ({
+          difficulty: String(c.difficulty || "").slice(0, 100), keys: Number(c.keyCount) || 0, stars: Math.round((Number(c.rating) || 0) * 100) / 100,
+          notes: Number(c.noteCount) || 0, creator: String(c.creator || "").slice(0, 60),
+        })),
+      };
+    }
+    if (kind === "skins") {
+      const entries = zipEntries(u8);
+      const sk = entries.find((e) => e.name.toLowerCase() === "skin.json");
+      if (!sk) return null;
+      const m = JSON.parse(new TextDecoder().decode(await zipRead(u8, sk, 4 * 1048576)));
+      return { name: String(m.name || "").slice(0, 100), author: String(m.author || "").slice(0, 60), locked: !!m.locked };
+    }
+    if (kind === "styles") {
+      const o = JSON.parse(new TextDecoder().decode(u8));
+      let locked = false;
+      if (typeof o.skin === "string" && o.skin.length < 60_000_000) {
+        try {
+          const bin = Uint8Array.from(atob(o.skin), (c) => c.charCodeAt(0));
+          const sk = zipEntries(bin).find((e) => e.name.toLowerCase() === "skin.json");
+          if (sk) locked = !!JSON.parse(new TextDecoder().decode(await zipRead(bin, sk, 4 * 1048576))).locked;
+        } catch { /* not readable */ }
+      }
+      return { name: String(o.name || "").slice(0, 100), locked };
+    }
+  } catch { /* nothing readable */ }
+  return null;
+}
+
+const bytesHash = async (u8) => [...new Uint8Array(await crypto.subtle.digest("SHA-256", u8))].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+/** An upload that's already in the Workshop (the same file, or the same song): it, or null. */
+function wsDuplicate(items, hashes, songIds, exceptId) {
+  for (const x of items) {
+    if (x.removed || x.id === exceptId) continue;
+    if ((x.hashes || []).some((h) => hashes.includes(h))) return x;
+    if (songIds.length && (x.songIds || []).some((sid) => songIds.includes(sid))) return x;
+  }
+  return null;
+}
+
 /** Checks a file and finds its preview; returns { preview } or throws a readable error. */
 async function wsInspect(kind, u8) {
   if (kind === "charts" || kind === "skins") {
@@ -2542,7 +2676,10 @@ async function wsInspect(kind, u8) {
 
 const wsPublic = (it) => ({
   id: it.id, type: it.type, title: it.title, description: it.description, creator: it.creator, creatorId: it.creatorId,
-  fileName: it.fileName, size: it.size, at: it.at, downloads: it.downloads || 0, updated: it.updatedAt || null, version: it.version || 1,
+  fileName: it.fileName, fileNames: it.fileNames || [it.fileName], size: it.size, at: it.at, downloads: it.downloads || 0, updated: it.updatedAt || null, version: it.version || 1,
+  // verified by OCTIVE (its own content, or checked by Senterra / Octive); skins and styles not locked can be changed
+  verified: !!it.verified, builtin: !!it.builtin, originalId: it.originalId || null, customizable: it.type === "themes" ? true : it.type === "skins" || it.type === "styles" ? !(it.meta && it.meta.locked) : undefined,
+  songIds: it.songIds || [], songs: it.meta && it.meta.songs ? it.meta.songs : undefined,
   preview: it.preview ? `${WORKER_BASE}/api/preview/${it.id}` : null,
   discord: it.channelId && it.messageId && it.guildId ? `https://discord.com/channels/${it.guildId}/${it.channelId}/${it.messageId}` : null,
 });
@@ -2567,6 +2704,65 @@ async function workshopRoutes(request, env, url, ctx) {
     return reply({ items: items.slice(0, 300).map(wsPublic), counts, maxBytes: await wsMaxBytes(env).catch(() => null) });
   }
 
+  // ---- a file of an item, through this server (the browser version can't read Discord's files directly)
+  let mf = path.match(/^\/api\/file\/([a-z0-9]{16,40})$/);
+  if (mf && request.method === "GET") {
+    const db = await r2json(env, WS_DB, { items: [] });
+    const it = (db.items || []).find((x) => x.id === mf[1] && !x.removed);
+    if (!it) fail(404, "That item isn't available any more.");
+    const msg = await discordApi(env, "GET", `/channels/${it.channelId}/messages/${it.messageId}`);
+    const names = it.fileNames && it.fileNames.length ? it.fileNames : [it.fileName];
+    const n = Math.max(0, Math.min(names.length - 1, Number(url.searchParams.get("n")) || 0));
+    const att = (msg.attachments || []).find((a) => a.filename === names[n]);
+    if (!att) fail(404, "That item's file is missing on Discord.");
+    const res = await fetch(att.url);
+    return cors(new Response(res.body, { status: res.status, headers: { "Content-Type": "application/octet-stream", "Cache-Control": "private, max-age=600" } }));
+  }
+
+  // ---- one item with its details: songs and difficulties, or the skin's lock (older items get them now, once)
+  let mi = path.match(/^\/api\/items\/([a-z0-9]{16,40})$/);
+  if (mi && request.method === "GET") {
+    const db = await r2json(env, WS_DB, { items: [] });
+    let it = (db.items || []).find((x) => x.id === mi[1] && !x.removed);
+    if (!it) fail(404, "That item isn't in the Workshop any more.");
+    if (!it.meta && it.type !== "themes" && env.DISCORD_BOT_TOKEN) {
+      try {
+        const msg = await discordApi(env, "GET", `/channels/${it.channelId}/messages/${it.messageId}`);
+        const names = it.fileNames && it.fileNames.length ? it.fileNames : [it.fileName];
+        const metas = [], hashes = [];
+        for (const a of (msg.attachments || []).filter((x) => names.includes(x.filename)).slice(0, 9)) {
+          if (a.size > 60 * 1048576) continue;
+          const u8 = new Uint8Array(await (await fetch(a.url)).arrayBuffer());
+          metas.push(await wsMeta(it.type, u8)); hashes.push(await bytesHash(u8));
+        }
+        const meta = it.type === "charts" ? { songs: metas.filter(Boolean), locked: false } : (metas[0] || { locked: false });
+        const songIds = it.type === "charts" ? meta.songs.map((x) => x.songId).filter(Boolean) : [];
+        await r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === it.id); if (!x) return false; x.meta = meta; x.hashes = x.hashes || hashes; x.songIds = x.songIds || songIds; it = x; });
+      } catch (e) { console.log("workshop details", e && e.message); }
+    }
+    return reply({ item: { ...wsPublic(it), meta: it.meta || null } });
+  }
+
+  // ---- verify (Senterra and the official account): OCTIVE vouches for it
+  mi = path.match(/^\/api\/items\/([a-z0-9]{16,40})\/verify$/);
+  if (mi && request.method === "POST") {
+    const who = await signedIn(request, env);
+    if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can verify Workshop items.");
+    const b = await bodyOf(request);
+    let out = null;
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === mi[1]); if (!x) return false; x.verified = b.verified !== false; out = x; });
+    if (!out) fail(404, "That item isn't in the Workshop any more.");
+    // a verified song's charts get global leaderboards too
+    if (out.verified && out.type === "charts") {
+      await r2update(env, "verified.json", () => ({ songs: {} }), (d) => {
+        d.songs ||= {};
+        for (const sg of (out.meta && out.meta.songs) || []) if (sg.songId && songIdOk(sg.songId) && !officialSong(sg.songId)) d.songs[sg.osuSet > 0 ? "osu-" + sg.osuSet : sg.songId] = { title: sg.title, artist: sg.artist, osuSet: sg.osuSet || undefined, workshopId: out.id, by: who.playerId, at: new Date().toISOString() };
+      });
+      verifiedCache = null;
+    }
+    return reply({ ok: true, item: wsPublic(out) });
+  }
+
   // ---- a preview picture (kept in R2, so lists never depend on Discord's expiring links)
   let m = path.match(/^\/api\/preview\/([a-z0-9]{16,40})$/);
   if (m && request.method === "GET") {
@@ -2586,19 +2782,21 @@ async function workshopRoutes(request, env, url, ctx) {
       let msg;
       try { msg = await discordApi(env, "GET", `/channels/${it.channelId}/messages/${it.messageId}`); }
       catch (e) { if (e.status === 404) fail(404, "That item was removed from Discord."); throw e; }
-      const att = (msg.attachments || []).find((a) => a.filename === it.fileName) || (msg.attachments || []).find((a) => !/^preview\./i.test(a.filename));
-      if (!att) fail(404, "That item's file is missing on Discord.");
+      const names = it.fileNames && it.fileNames.length ? it.fileNames : [it.fileName];
+      const atts = msg.attachments || [];
+      const found = names.map((n) => atts.find((a) => a.filename === n)).filter(Boolean);
+      if (!found.length) { const any = atts.find((a) => !/^preview\./i.test(a.filename)); if (any) found.push(any); }
+      if (!found.length) fail(404, "That item's file is missing on Discord.");
       // Discord's links say when they run out (ex=hex seconds); never keep one past that
       let until = Date.now() + WS_URL_TTL;
-      const ex = (att.url.match(/[?&]ex=([0-9a-f]+)/) || [])[1];
-      if (ex) until = Math.min(until, parseInt(ex, 16) * 1000 - 300_000);
-      c = { url: att.url, until };
+      for (const att of found) { const ex = (att.url.match(/[?&]ex=([0-9a-f]+)/) || [])[1]; if (ex) until = Math.min(until, parseInt(ex, 16) * 1000 - 300_000); }
+      c = { url: found[0].url, files: found.map((a) => ({ name: a.filename, url: a.url, size: a.size })), until };
       wsUrls.set(it.id, c);
       if (wsUrls.size > 2000) wsUrls.delete(wsUrls.keys().next().value);
     }
     ctx.waitUntil(r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === it.id); if (!x) return false; x.downloads = (x.downloads || 0) + 1; }).catch(() => {}));
     if (url.searchParams.get("redirect") === "1") return cors(Response.redirect(c.url, 302));
-    return reply({ url: c.url, fileName: it.fileName, size: it.size, type: it.type, title: it.title });
+    return reply({ url: c.url, files: c.files || [{ name: it.fileName, url: c.url, size: it.size }], fileName: it.fileName, size: it.size, type: it.type, title: it.title });
   }
 
   // ---- upload from the game
@@ -2613,7 +2811,7 @@ async function workshopRoutes(request, env, url, ctx) {
     const rateKey = `workshop/rate/${who.playerId}.json`;
     const rate = await r2json(env, rateKey, { day, n: 0 });
     if (rate.day !== day) { rate.day = day; rate.n = 0; }
-    const isStaff = badgesOf(who.playerId).some((b) => b === "DEV" || b === "MOD");
+    const isStaff = badgesOf(who.playerId).some((b) => b === "DEV" || b === "MOD") || who.playerId === OWNER || isOfficial(who.playerId);
     if (rate.n >= 15 && !isStaff) fail(429, "You've uploaded a lot today. Try again tomorrow.");
 
     const max = await wsMaxBytes(env);
@@ -2621,17 +2819,41 @@ async function workshopRoutes(request, env, url, ctx) {
     if (len > max + 200_000) fail(413, `That's too big: the OCTIVE Discord takes files up to ${Math.floor(max / 1048576)} MB right now.`);
     let form;
     try { form = await request.formData(); } catch { fail(400, "The upload wasn't readable (multipart/form-data expected)."); }
-    const file = form.get("file");
-    if (!file || typeof file === "string") fail(400, "No file was attached.");
-    const fileName = String(file.name || "item").replace(/[^A-Za-z0-9 ._()\[\]'&+,-]/g, "_").slice(0, 100);
-    const ext = (fileName.match(/\.[A-Za-z]+$/) || [""])[0].toLowerCase();
-    const type = WS_TYPES[ext];
-    if (!type) fail(400, "Only .oct (charts), .octskin (skins), .octtheme (themes) and .octstyle (styles) files can be shared.");
-    if (file.size > max) fail(413, `That's too big: the OCTIVE Discord takes files up to ${Math.floor(max / 1048576)} MB right now.`);
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    const { preview } = await wsInspect(type, bytes);
+    // one file, or (charts) the songs of one entry: a pack or speed copies, up to 9 songs in one item
+    const files = form.getAll("file").filter((f) => f && typeof f !== "string");
+    if (!files.length) fail(400, "No file was attached.");
+    const parts = [];
+    let type = null, total = 0;
+    for (const file of files) {
+      const fileName = String(file.name || "item").replace(/[^A-Za-z0-9 ._()\[\]'&+,-]/g, "_").slice(0, 100);
+      const ext = (fileName.match(/\.[A-Za-z]+$/) || [""])[0].toLowerCase();
+      const t = WS_TYPES[ext];
+      if (!t) fail(400, "Only .oct (charts), .octskin (skins), .octtheme (themes) and .octstyle (styles) files can be shared.");
+      if (type && t !== type) fail(400, "Share one kind of thing at a time.");
+      type = t;
+      total += file.size;
+      if (total > max) fail(413, `That's too big: the OCTIVE Discord takes up to ${Math.floor(max / 1048576)} MB in one post right now.`);
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const { preview } = await wsInspect(t, bytes);
+      parts.push({ fileName, bytes, preview, hash: await bytesHash(bytes), meta: await wsMeta(t, bytes) });
+    }
+    if (parts.length > 1 && type !== "charts") fail(400, "Only songs can be shared several at a time.");
+    if (parts.length > 9) fail(400, "Share at most 9 songs in one post.");
+    const fileName = parts[0].fileName, bytes = parts[0].bytes;
+    const preview = (parts.find((x) => x.preview) || {}).preview || null;
+    const hashes = parts.map((x) => x.hash);
+    const songIds = parts.map((x) => x.meta && x.meta.songId).filter(Boolean);
+    const meta = type === "charts" ? { songs: parts.map((x) => x.meta).filter(Boolean) } : (parts[0].meta || null);
+    if (meta && type !== "charts") meta.songs = undefined;
+    if (type === "charts" && meta) meta.locked = false;
+    if (type !== "charts" && parts[0].meta) meta.locked = !!parts[0].meta.locked;
 
-    const clean = (v, n) => String(v || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@​$1").trim().slice(0, n);
+    // the same file, or the same song, is only in the Workshop once
+    const dbNow = await r2json(env, WS_DB, { items: [] });
+    const dup = wsDuplicate(dbNow.items || [], hashes, songIds, null);
+    if (dup) fail(409, `That's already in the Workshop: "${dup.title}" by ${dup.creator}.${dup.creatorId === who.playerId ? " Use the edit button on it to upload a new version." : ""}`);
+
+    const clean = (v, n) => String(v || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@\u200b$1").trim().slice(0, n);
     const card = (await publicItems(cfg, who.playerId, ["card"]).catch(() => ({}))).card || {};
     const creator = clean(moderation.overrides[who.playerId]?.name || card.name || form.get("creator") || who.username || "Player", 40);
     const title = clean(form.get("title"), 80) || fileName.replace(/\.[^.]+$/, "");
@@ -2644,6 +2866,7 @@ async function workshopRoutes(request, env, url, ctx) {
     const channelId = channels[type];
     if (!channelId) fail(503, `The #${WS_CHANNEL[type]} channel wasn't found on the OCTIVE Discord.`);
     const pType = imageType(preview);
+    const diffs = meta && meta.songs ? meta.songs.reduce((n, x) => n + (x.charts || []).length, 0) : 0;
     const embed = {
       title: `${WS_LABEL[type]}: ${title}`.slice(0, 256), color: WS_COLOR[type],
       description: description || undefined,
@@ -2651,8 +2874,8 @@ async function workshopRoutes(request, env, url, ctx) {
       fields: [
         // a linked Discord gets the credit (shown as their name, no ping)
         ...(creatorDiscord ? [{ name: "Made by", value: `<@${creatorDiscord}>`, inline: true }] : []),
-        { name: "File", value: `${fileName} · ${(bytes.length / 1048576).toFixed(bytes.length < 1048576 ? 2 : 1)} MB`, inline: true },
-        { name: "Get it", value: `Download the file above, or [open it in OCTIVE](${SITE}#/open/workshop/${id})`, inline: true },
+        { name: parts.length > 1 ? "Files" : "File", value: (parts.length > 1 ? `${parts.length} songs` : fileName) + ` · ${(total / 1048576).toFixed(total < 1048576 ? 2 : 1)} MB` + (diffs ? ` · ${diffs} difficult${diffs === 1 ? "y" : "ies"}` : ""), inline: true },
+        { name: "Get it", value: `Download the file${parts.length > 1 ? "s" : ""} above, or [open it in OCTIVE](${SITE}#/open/workshop/${id})`, inline: true },
       ],
       footer: { text: `Shared from OCTIVE · ${id}` },
       timestamp: new Date().toISOString(),
@@ -2661,16 +2884,23 @@ async function workshopRoutes(request, env, url, ctx) {
     const fd = new FormData();
     fd.append("payload_json", JSON.stringify({
       embeds: [embed], allowed_mentions: { parse: [] },
-      attachments: [{ id: 0, filename: fileName }, ...(pType ? [{ id: 1, filename: `preview.${pType}` }] : [])],
+      attachments: [...parts.map((x, k) => ({ id: k, filename: x.fileName })), ...(pType ? [{ id: parts.length, filename: `preview.${pType}` }] : [])],
     }));
-    fd.append("files[0]", new Blob([bytes], { type: "application/octet-stream" }), fileName);
-    if (pType) fd.append("files[1]", new Blob([preview], { type: pType === "png" ? "image/png" : "image/jpeg" }), `preview.${pType}`);
+    parts.forEach((x, k) => fd.append(`files[${k}]`, new Blob([x.bytes], { type: "application/octet-stream" }), x.fileName));
+    if (pType) fd.append(`files[${parts.length}]`, new Blob([preview], { type: pType === "png" ? "image/png" : "image/jpeg" }), `preview.${pType}`);
     let posted;
     try { posted = await discordApi(env, "POST", `/channels/${channelId}/messages`, fd, true); }
     catch (e) { if (e.status === 413) fail(413, "Discord refused the file: it's too big for the server right now."); throw e; }
 
     if (pType) await env.RELEASES.put(`workshop/previews/${id}`, preview, { httpMetadata: { contentType: pType === "png" ? "image/png" : "image/jpeg" } });
-    const item = { id, type, title, description, creator, creatorId: who.playerId, fileName, size: bytes.length, channelId, messageId: posted.id, guildId: env.DISCORD_GUILD_ID, at: Date.now(), downloads: 0, preview: !!pType };
+    const item = {
+      id, type, title, description, creator, creatorId: who.playerId, fileName, fileNames: parts.map((x) => x.fileName), size: total,
+      channelId, messageId: posted.id, guildId: env.DISCORD_GUILD_ID, at: Date.now(), downloads: 0, preview: !!pType,
+      hashes, songIds, meta, verified: isOfficial(who.playerId), // the official account's uploads are OCTIVE's own: verified
+      // OCTIVE's own songs, skins and themes (once built into the game): every player gets them
+      builtin: isOfficial(who.playerId) && form.get("builtin") === "1" ? true : undefined,
+      originalId: isOfficial(who.playerId) && /^octive[.-][a-z0-9.-]{1,60}$/.test(String(form.get("originalId") || "")) ? String(form.get("originalId")) : undefined,
+    };
     await r2update(env, WS_DB, () => ({ items: [] }), (d) => { d.items = d.items || []; d.items.push(item); });
     rate.n += 1;
     await r2put(env, rateKey, rate);
@@ -2787,6 +3017,15 @@ async function workshopRoutes(request, env, url, ctx) {
       bytes = new Uint8Array(await file.arrayBuffer());
       ({ preview } = await wsInspect(it.type, bytes));
     }
+    // a new version: its details again, and it mustn't be someone else's upload
+    let newHash = null, newMeta = null;
+    if (bytes) {
+      newHash = await bytesHash(bytes);
+      newMeta = await wsMeta(it.type, bytes);
+      const sid = it.type === "charts" && newMeta && newMeta.songId ? [newMeta.songId] : [];
+      const dup = wsDuplicate(db.items || [], [newHash], sid, it.id);
+      if (dup) fail(409, `That file is already in the Workshop: "${dup.title}" by ${dup.creator}.`);
+    }
     // a few updates a day per player (they count with uploads)
     const day = new Date().toISOString().slice(0, 10);
     const rateKey = `workshop/rate/${who.playerId}.json`;
@@ -2842,6 +3081,11 @@ async function workshopRoutes(request, env, url, ctx) {
       if (!x) return false;
       x.title = title; x.description = description; x.fileName = fileName; x.size = size; x.updatedAt = Date.now(); x.version = version;
       x.creator = creator; x.creatorId = newCreatorId;
+      if (newHash) {
+        x.hashes = [newHash]; x.fileNames = [fileName];
+        x.meta = it.type === "charts" ? { songs: newMeta ? [newMeta] : [], locked: false } : (newMeta || { locked: false });
+        x.songIds = it.type === "charts" && newMeta && newMeta.songId ? [newMeta.songId] : [];
+      }
       if (pType) x.preview = true;
       out = x;
     });
@@ -3181,6 +3425,7 @@ export default {
         const official = await officialProfile(env);
         return json({ ...board, online: players.filter((p) => p.online).length, players, official }, 30);
       }
+      if (url.pathname === "/verified") { const v = await verifiedSongs(env); return json({ songs: v.songs }, 60); }
       if (url.pathname === "/official/status") return json({ ...(await officialStatus(env)), now: Date.now() }, 30);
       const m = url.pathname.match(/^\/avatar\/([A-Za-z0-9_-]{1,64})$/);
       if (m) return await avatar(env, m[1], url.searchParams.get("v"));

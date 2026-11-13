@@ -710,18 +710,22 @@
   // ---------------------------------------------------------------- #/workshop: charts, skins, themes and styles players shared
   const WS_TYPES = [["charts", "Charts"], ["skins", "Skins"], ["themes", "Themes"], ["styles", "Styles"]];
   const WS_LABEL = { charts: "Chart", skins: "Skin", themes: "Theme", styles: "Style" };
-  let wsType = "charts", wsSort = "new", wsQuery = "";
+  let wsType = "charts", wsSort = "new", wsQuery = ""; let wsVerified = "", wsCustom = false;
 
   function workshopCard(it) {
     const pic = h("div.ws-pic" + (it.type === "skins" || it.type === "styles" ? ".contain" : ""));
     if (it.preview) { const img = h("img", { src: it.preview, alt: "", loading: "lazy" }); img.onerror = () => img.remove(); pic.append(img); }
     else pic.append(h("span.ws-type", { text: WS_LABEL[it.type] || "" }));
     const kb = it.size / 1048576;
+    if (it.verified) pic.append(h("span.ws-verified", { text: "✓ VERIFIED", title: "Verified by OCTIVE" }));
+    if (it.customizable && (it.type === "skins" || it.type === "styles")) pic.append(h("span.ws-custom", { text: "CUSTOMIZABLE", title: "Its maker allows changes" }));
+    pic.addEventListener("click", () => { location.hash = "#/workshop/" + it.id; });
+    pic.title = "Details";
     return h("article.ws-card", {},
       pic,
       h("div.ws-body", {},
         h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
-        h("h3", { text: it.title, title: it.title }),
+        h("h3", {}, h("a", { href: "#/workshop/" + it.id, text: it.title, title: it.title })),
         h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
         h("p.ws-desc", { text: it.description || "", title: it.description || undefined }),
         h("span.ws-meta", { text: `${kb.toFixed(kb < 1 ? 2 : 1)} MB · ${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"} · ${new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })}` }),
@@ -764,6 +768,8 @@
   }
 
   function workshopPage() {
+    const one = (location.hash.match(/^#\/workshop\/([a-z0-9]{16,40})/) || [])[1];
+    if (one) { workshopItemPage(one); return; }
     document.title = "Workshop · OCTIVE";
     const tabs = h("div.ws-tabs");
     const grid = h("div.ws-grid", {}, h("p.empty", { text: "Loading…" }));
@@ -771,17 +777,23 @@
     const search = h("input.help-search.ws-search", { type: "search", placeholder: "Search titles and creators…", value: wsQuery });
     const sort = h("select.ws-sort", {}, h("option", { value: "new", text: "Newest" }), h("option", { value: "popular", text: "Most downloaded" }));
     sort.value = wsSort;
+    const verSel = h("select.ws-sort", {}, h("option", { value: "", text: "Everything" }), h("option", { value: "1", text: "✓ Verified" }), h("option", { value: "0", text: "Not verified" }));
+    verSel.value = wsVerified;
+    const customBox = h("input", { type: "checkbox" }); customBox.checked = wsCustom;
+    const customLbl = h("label.ws-custom-filter", { title: "Only skins and styles their makers allow you to change" }, customBox, " Customizable");
     let counts = {};
     const paintTabs = () => tabs.replaceChildren(...WS_TYPES.map(([id, name]) => {
       const b = h("button.ws-tab" + (id === wsType ? ".on" : ""), { type: "button" }, name, counts[id] ? h("span.ws-count", { text: String(counts[id]) }) : null);
       b.addEventListener("click", () => { wsType = id; paintTabs(); load(); });
       return b;
     }));
+    const paintCustom = () => { customLbl.hidden = !(wsType === "skins" || wsType === "styles"); };
     let gen = 0;
     const load = () => {
       const g = ++gen;
       status.textContent = "Loading…";
-      fetch(`${worker}/api/items?type=${wsType}&sort=${wsSort}${wsQuery ? "&q=" + encodeURIComponent(wsQuery) : ""}`, { cache: "no-cache" })
+      paintCustom();
+      fetch(`${worker}/api/items?type=${wsType}&sort=${wsSort}${wsQuery ? "&q=" + encodeURIComponent(wsQuery) : ""}${wsVerified ? "&verified=" + wsVerified : ""}${wsCustom && (wsType === "skins" || wsType === "styles") ? "&customizable=1" : ""}`, { cache: "no-cache" })
         .then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
           if (g !== gen || !grid.isConnected) return;
           if (!d) { status.textContent = "The Workshop can't be reached right now."; grid.replaceChildren(); return; }
@@ -794,14 +806,59 @@
     let t = null;
     search.addEventListener("input", () => { wsQuery = search.value.trim(); clearTimeout(t); t = setTimeout(load, 250); });
     sort.addEventListener("change", () => { wsSort = sort.value; load(); });
+    verSel.addEventListener("change", () => { wsVerified = verSel.value; load(); });
+    customBox.addEventListener("change", () => { wsCustom = customBox.checked; load(); });
     app.replaceChildren(h("div.ws-page", {},
       h("section.page-head", {}, h("h1", { text: "Workshop" }),
         h("p.sub", { text: "Charts, skins, themes and styles made by players. Download them here and open them with OCTIVE, or get them in the game (Play → Workshop). To share yours, use Share in the game: it's posted in the OCTIVE Discord too." })),
-      h("div.ws-bar", {}, tabs, h("div.ws-tools", {}, search, sort)),
+      h("div.ws-bar", {}, tabs, h("div.ws-tools", {}, search, sort, verSel, customLbl)),
       status, grid));
     paintTabs();
     load();
   }
+
+  /** One Workshop item: its picture, description and (songs) every difficulty, like an osu! beatmap page. */
+  function workshopItemPage(id) {
+    document.title = "Workshop · OCTIVE";
+    const box = h("div.ws-item", {}, h("p.empty", { text: "Loading…" }));
+    app.replaceChildren(h("div.ws-page", {}, h("a.back", { href: "#/workshop" }, "← Workshop"), box));
+    fetch(`${worker}/api/items/${id}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+      if (!box.isConnected) return;
+      const it = d && d.item;
+      if (!it) { box.replaceChildren(h("p.empty", { text: "That item isn't in the Workshop any more." })); return; }
+      document.title = `${it.title} · Workshop · OCTIVE`;
+      const kb = it.size / 1048576;
+      const pic = h("div.ws-item-pic" + (it.type === "skins" || it.type === "styles" ? ".contain" : ""));
+      if (it.preview) pic.append(h("img", { src: it.preview, alt: "" }));
+      const meta = it.meta || {};
+      const diffs = h("div.ws-diffs");
+      for (const sg of meta.songs || []) {
+        diffs.append(h("div.ws-song", {}, h("b", { text: `${sg.artist} - ${sg.title}` }),
+          h("span.field-hint", { text: [sg.bpm ? `${Math.round(sg.bpm * 10) / 10} BPM` : "", sg.durationUs ? fmtLength(sg.durationUs) : ""].filter(Boolean).join(" · ") })));
+        for (const c of (sg.charts || []).slice().sort((a, b) => a.keys - b.keys || a.stars - b.stars))
+          diffs.append(h("div.ws-diff", {}, h("span.ws-diff-bar", { style: `background:${starColor(c.stars)}` }), h("span.ws-diff-keys", { text: `${c.keys}K` }),
+            h("span.ws-diff-name", { text: c.difficulty }), c.creator ? h("span.field-hint", { text: "by " + c.creator }) : null,
+            h("span.field-hint", { text: `${fmt0.format(c.notes || 0)} notes` }), h("b.ws-diff-stars", { text: `★ ${Number(c.stars || 0).toFixed(2)}`, style: `color:${starColor(c.stars)}` })));
+      }
+      if (it.type === "skins" || it.type === "styles") diffs.append(h("p.field-hint", { text: it.customizable ? "Customizable: you can change it in the skin maker." : "🔒 Locked: only its maker can change it." }));
+      box.replaceChildren(
+        h("div.ws-item-top", {}, pic,
+          h("div.ws-item-head", {},
+            h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
+            h("h1", {}, it.title, it.verified ? h("span.ws-verified.inline", { text: "✓ VERIFIED" }) : null),
+            h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
+            h("p.field-hint", { text: `${kb.toFixed(kb < 1 ? 2 : 1)} MB · ${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"} · ${new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })}${it.updated ? " · updated " + new Date(it.updated).toLocaleDateString(undefined, { dateStyle: "medium" }) : ""}` }),
+            h("div.ws-actions", {},
+              h("a.btn.primary", { href: `octive://workshop/${it.id}`, onclick: () => openHint() }, "Open in OCTIVE"),
+              h("a.btn", { href: `${worker}/api/download/${it.id}?redirect=1` }, (it.fileNames || []).length > 1 ? "Download (first song)" : "Download"),
+              it.discord ? h("a.btn.ghost", { href: it.discord, target: "_blank", rel: "noopener" }, "On Discord") : null))),
+        it.description ? h("p.ws-item-desc", { text: it.description }) : null,
+        diffs);
+    });
+  }
+
+  const fmtLength = (us) => { const s = Math.round(us / 1e6); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+  const starColor = (st) => st >= 8 ? "#ff5c8a" : st >= 6 ? "#b69bff" : st >= 4 ? "#f2c14e" : st >= 2.5 ? "#4ad391" : "#4fd6e8";
 
   // ---------------------------------------------------------------- downloads
 
