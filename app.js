@@ -440,6 +440,140 @@
   };
   const icon = (id) => { const s = document.createElement("span"); s.className = "f-icon"; s.innerHTML = `<svg viewBox="0 0 24 24">${ICONS[id] || ""}</svg>`; return s; };
 
+  // ---------------------------------------------------------------- the front page's live playfield
+  // A real chart from a song that comes with OCTIVE (data/demo.json, made from the game's own files), played by
+  // autoplay on a canvas: notes, long notes, receptor flashes, judgements, combo and score. Sound is optional.
+  let demoData = null;
+  function livePlayfield() {
+    const wrap = h("div.live-pf");
+    const cv = h("canvas", { "aria-hidden": "true" });
+    const tag = h("div.live-tag", {}, h("span.live-dot"), h("span", { text: "Live autoplay" }));
+    const song = h("div.live-song", {}, h("b", { text: "Loading…" }), h("span"));
+    const sound = h("button.live-sound", { type: "button", title: "Play with sound", "aria-label": "Play with sound" }, "🔈 Sound");
+    wrap.append(cv, tag, song, sound);
+    const ctx = cv.getContext("2d");
+    const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let audio = null, t0 = performance.now(), lastT = -1, hit = 0, combo = 0, judgeAt = -1e9, judgeText = "", flash = [0, 0, 0, 0], bursts = [], visible = true;
+    const COL = [["#ffb3cb", "#ff5c8a"], ["#a6f5ff", "#3fd8e6"], ["#a6f5ff", "#3fd8e6"], ["#ffb3cb", "#ff5c8a"]];
+    const io2 = "IntersectionObserver" in window ? new IntersectionObserver((e) => { visible = e[0].isIntersecting; }) : null;
+    if (io2) io2.observe(wrap);
+
+    function size() {
+      const r = wrap.getBoundingClientRect(), dpr = Math.min(2, window.devicePixelRatio || 1);
+      const w = Math.max(200, Math.round(r.width)), hh = Math.max(260, Math.round(r.height));
+      if (cv.width !== w * dpr || cv.height !== hh * dpr) { cv.width = w * dpr; cv.height = hh * dpr; cv.style.width = w + "px"; cv.style.height = hh + "px"; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); }
+      return [w, hh];
+    }
+    const rr = (x, y, w, h2, r) => { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h2, r) : ctx.rect(x, y, w, h2); };
+
+    function frame() {
+      if (!wrap.isConnected) { if (audio) audio.pause(); io2 && io2.disconnect(); return; }
+      requestAnimationFrame(frame);
+      if (!demoData || (!visible && !audio)) return;
+      const d = demoData, [W, H] = size();
+      let t = audio && !audio.paused ? audio.currentTime * 1000 : (performance.now() - t0) % d.durationMs;
+      if (reduce && !audio) t = 9000;
+      if (t < lastT) { hit = 0; combo = 0; bursts = []; }
+      // autoplay hits every note when it reaches the line
+      while (hit < d.notes.length && d.notes[hit][0] <= t) {
+        const n = d.notes[hit++];
+        combo++; flash[n[1]] = 1; judgeAt = t; judgeText = hit % 23 === 0 ? "PERFECT" : "MARVELOUS";
+        bursts.push({ lane: n[1], at: t });
+      }
+      lastT = t;
+      const pad = 16, laneW = (W - pad * 2) / d.keys, hitY = H - 70, speed = 0.62; // px per ms
+      ctx.clearRect(0, 0, W, H);
+      // lanes
+      for (let l = 0; l < d.keys; l++) {
+        const x = pad + l * laneW;
+        ctx.fillStyle = l % 2 ? "rgba(255,255,255,0.035)" : "rgba(255,255,255,0.02)";
+        ctx.fillRect(x + 2, 0, laneW - 4, H);
+        if (flash[l] > 0) {
+          const g = ctx.createLinearGradient(0, hitY, 0, hitY - 160);
+          g.addColorStop(0, `rgba(255,255,255,${0.16 * flash[l]})`); g.addColorStop(1, "rgba(255,255,255,0)");
+          ctx.fillStyle = g; ctx.fillRect(x + 2, hitY - 160, laneW - 4, 160);
+        }
+      }
+      // long note bodies, then the notes
+      const noteH = 16;
+      for (let i = hit - 40 < 0 ? 0 : hit - 40; i < d.notes.length; i++) {
+        const [nt, lane, end] = d.notes[i];
+        const y = hitY - (nt - t) * speed;
+        if (y < -40 && !end) break;
+        if (y < -40 && end && hitY - (end - t) * speed > H) break;
+        const x = pad + lane * laneW + 5, w = laneW - 10;
+        const [c1, c2] = COL[lane % 4];
+        if (end) {
+          if (t > end) continue;
+          const yHead = Math.min(y, hitY), yTail = hitY - (end - t) * speed;
+          if (yTail < yHead) {
+            ctx.fillStyle = t >= nt ? c2 + "aa" : c2 + "66";
+            rr(x + w * 0.18, yTail, w * 0.64, yHead - yTail, 6); ctx.fill();
+          }
+          if (t >= nt) { flash[lane] = Math.max(flash[lane], 0.6); continue; } // held: the head sits in the receptor
+        } else if (nt < t) continue;
+        if (y > H + 20) continue;
+        const g = ctx.createLinearGradient(0, y - noteH / 2, 0, y + noteH / 2);
+        g.addColorStop(0, c1); g.addColorStop(1, c2);
+        ctx.fillStyle = g; ctx.shadowColor = c2; ctx.shadowBlur = 12;
+        rr(x, y - noteH / 2, w, noteH, 7); ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+      // receptors and hit bursts
+      for (let l = 0; l < d.keys; l++) {
+        const x = pad + l * laneW + 5, w = laneW - 10;
+        ctx.strokeStyle = `rgba(255,255,255,${0.35 + 0.5 * flash[l]})`; ctx.lineWidth = 2;
+        rr(x, hitY - noteH / 2 - 2, w, noteH + 4, 8); ctx.stroke();
+        flash[l] = Math.max(0, flash[l] - 0.08);
+      }
+      bursts = bursts.filter((b) => t - b.at < 260);
+      for (const b of bursts) {
+        const k = (t - b.at) / 260, cx = pad + b.lane * laneW + laneW / 2;
+        ctx.strokeStyle = `rgba(255,255,255,${0.8 * (1 - k)})`; ctx.lineWidth = 3 * (1 - k) + 1;
+        ctx.beginPath(); ctx.ellipse(cx, hitY, laneW * (0.35 + 0.5 * k), 12 + 22 * k, 0, 0, Math.PI * 2); ctx.stroke();
+      }
+      // HUD: combo, judgement, score
+      ctx.textAlign = "center";
+      if (combo >= 3) {
+        ctx.fillStyle = "rgba(255,255,255,0.92)"; ctx.font = "800 40px Inter, system-ui, sans-serif";
+        ctx.fillText(String(combo), W / 2, H * 0.36);
+        ctx.fillStyle = "rgba(255,255,255,0.45)"; ctx.font = "700 10px Inter, system-ui, sans-serif"; ctx.fillText("COMBO", W / 2, H * 0.36 + 16);
+      }
+      const ja = t - judgeAt;
+      if (ja < 700) {
+        const pop = 1 + 0.18 * Math.max(0, 1 - ja / 80), alpha = ja < 450 ? 1 : 1 - (ja - 450) / 250;
+        ctx.save(); ctx.translate(W / 2, H * 0.52); ctx.scale(pop, pop);
+        ctx.font = "800 17px Inter, system-ui, sans-serif"; ctx.fillStyle = judgeText === "PERFECT" ? `rgba(255,216,102,${alpha})` : `rgba(165,240,255,${alpha})`;
+        ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 14; ctx.fillText(judgeText, 0, 0); ctx.restore();
+      }
+      ctx.textAlign = "right"; ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.font = "800 15px Inter, system-ui, sans-serif";
+      ctx.fillText(String(Math.round(1e6 * hit / d.notes.length)).padStart(7, "0"), W - 12, 24);
+      ctx.fillStyle = "rgba(255,255,255,0.5)"; ctx.font = "700 11px Inter, system-ui, sans-serif"; ctx.fillText("100.00%", W - 12, 40);
+      // progress
+      ctx.fillStyle = "rgba(139,123,255,0.8)"; ctx.fillRect(0, 0, W * (t / d.durationMs), 3);
+    }
+
+    const go = (d) => {
+      demoData = d;
+      song.firstChild.textContent = `${d.artist} - ${d.title}`;
+      song.lastChild.textContent = `${d.difficulty} · ${d.keys}K · ★${d.rating}`;
+      requestAnimationFrame(frame);
+    };
+    if (demoData) go(demoData);
+    else fetch("data/demo.json", { cache: "force-cache" }).then((r) => r.ok ? r.json() : null).then((d) => { if (d) go(d); else song.firstChild.textContent = ""; }).catch(() => { song.firstChild.textContent = ""; });
+    sound.addEventListener("click", () => {
+      if (!audio) {
+        audio = new Audio("data/demo.mp3"); audio.loop = true; audio.volume = 0.6;
+        // start where the picture is, so the sound and the notes line up
+        audio.currentTime = ((performance.now() - t0) % (demoData ? demoData.durationMs : 32000)) / 1000;
+        audio.play().catch(() => {});
+        sound.textContent = "🔊 Mute"; sound.title = "Mute";
+      } else if (audio.paused) { audio.play().catch(() => {}); sound.textContent = "🔊 Mute"; }
+      else { audio.pause(); t0 = performance.now() - audio.currentTime * 1000; sound.textContent = "🔈 Sound"; }
+    });
+    return wrap;
+  }
+
   function home() {
     const players = data ? data.players : [];
     const online = players.filter((p) => p.online).length;
@@ -454,7 +588,7 @@
         h("div.cta", {},
           h("a.btn.primary.big", { href: "#/download" }, "Download free"),
           h("a.btn.big", { href: "play/" }, "▶ Play in browser"))),
-      h("div.h2-art", {}, h("div.h2-frame", {}, playfield()), emblemSvg(64)));
+      h("div.h2-art", {}, h("div.h2-frame", {}, livePlayfield()), emblemSvg(64)));
     const live = (label, value, cls) => h("div.h2-live" + (cls ? "." + cls : ""), {}, h("b", { text: value }), h("span", { text: label }));
     const vEl = live("Latest version", "…");
     const strip = h("section.h2-strip", {},
@@ -1247,6 +1381,8 @@
         friends.textContent = s.friends != null ? fmt0.format(s.friends) : "—";
         youFollow = isOwner || s.youFollow === true;
         paint();
+        // their Discord, when they chose to show it (Settings → Profile → Discord in the game)
+        if (s.discord) row.append(h("div.fc-discord", {}, h("span", { text: "Discord" }), h("b", { text: s.discord })));
       } catch { followers.textContent = "—"; following.textContent = "—"; }
     })();
     return row;

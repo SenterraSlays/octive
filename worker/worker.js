@@ -625,6 +625,39 @@ async function account(request, env, route) {
       await env.RELEASES.put(`discord-codes/${code}.json`, JSON.stringify({ playerId: who.playerId, exp }), { httpMetadata: { contentType: "application/json" } });
       return reply({ code, exp });
     }
+    case "discord/status": {
+      // the game's Discord settings: who's linked and the Discord options
+      await bodyOf(request);
+      const who = await signedIn(request, env);
+      const rec = await record(env, who.playerId);
+      const p = rec.discordPrefs || {};
+      return reply({ linked: rec.discord?.id ? { name: rec.discord.name || "", at: rec.discord.at } : null, prefs: { dmAlerts: !!p.dmAlerts, updates: !!p.updates, show: !!p.show } });
+    }
+    case "discord/prefs": {
+      // the Discord options (linked accounts only): DMs from the bot, the updates role, Discord on the profile
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      const rec = await record(env, who.playerId);
+      if (!rec.discord?.id) fail(400, "Link your Discord first.");
+      const p = rec.discordPrefs || {};
+      if ("dmAlerts" in b) p.dmAlerts = !!b.dmAlerts;
+      if ("show" in b) p.show = !!b.show;
+      let note = null;
+      if ("updates" in b && env.DISCORD_GUILD_ID && env.DISCORD_BOT_TOKEN) {
+        // the @Octive Updates role: pinged when a new version is announced
+        const roleId = env.DISCORD_UPDATES_ROLE_ID || "1569905255766822953";
+        const res = await fetch(`https://discord.com/api/v10/guilds/${env.DISCORD_GUILD_ID}/members/${rec.discord.id}/roles/${roleId}`, {
+          method: b.updates ? "PUT" : "DELETE", headers: { Authorization: "Bot " + env.DISCORD_BOT_TOKEN, "X-Audit-Log-Reason": "OCTIVE settings", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" },
+        });
+        if (res.status === 404) fail(400, "Join the OCTIVE Discord server first, then switch this on again.");
+        if (!res.ok) fail(502, "Discord didn't let the bot change your role right now.");
+        p.updates = !!b.updates;
+        note = b.updates ? "You'll be pinged for OCTIVE updates." : "No more update pings.";
+      }
+      rec.discordPrefs = p;
+      await saveRecord(env, who.playerId, rec);
+      return reply({ ok: true, prefs: { dmAlerts: !!p.dmAlerts, updates: !!p.updates, show: !!p.show }, note });
+    }
     case "discord/unlink": {
       await bodyOf(request);
       const who = await signedIn(request, env);
@@ -1108,6 +1141,28 @@ async function discordCommand(env, it) {
           st?.lifetime ? null : linkButton(`Gift ${clean(p.name).slice(0, 30)}`, `${SITE}#/supporter?gift=${encodeURIComponent(p.id)}`, "🎁"),
         )],
         allowed_mentions: { parse: [] },
+      };
+    }
+    case "workshop": {
+      // the newest shared items (all four channels, or one kind), with links to their posts and downloads
+      const type = opt(data, "type"), q = String(opt(data, "search") || "").trim().toLowerCase();
+      const db = await r2json(env, WS_DB, { items: [] });
+      let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type));
+      if (q) items = items.filter((it) => `${it.title} ${it.creator} ${it.description}`.toLowerCase().includes(q));
+      items.sort((a, b) => b.at - a.at);
+      const shown = items.slice(0, 8);
+      const label = type ? WS_LABEL[type] + "s" : "Workshop";
+      if (!shown.length) return { embeds: [{ color: C_ACCENT, title: `🧰 ${label}`, description: q ? `Nothing matches **${clean(q)}**.` : "Nothing shared yet. Share yours from OCTIVE: Play → Workshop → Share yours." }] };
+      const lines = shown.map((it) => {
+        const post = it.channelId && it.messageId ? `https://discord.com/channels/${it.guildId || env.DISCORD_GUILD_ID}/${it.channelId}/${it.messageId}` : null;
+        const mb = (it.size / 1048576).toFixed(it.size < 1048576 ? 2 : 1);
+        return `**${clean(it.title)}** · ${WS_LABEL[it.type]} by ${clean(it.creator)}
+　${post ? `[Post](${post}) · ` : ""}[Download](${WORKER_BASE}/api/download/${it.id}?redirect=1) · ${mb} MB · ${fmtN(it.downloads || 0)} ⬇ · <t:${unix(new Date(it.at).toISOString())}:R>`;
+      });
+      return {
+        embeds: [{ color: type ? WS_COLOR[type] : C_ACCENT, title: `🧰 ${label}`, url: `${SITE}#/workshop`, description: lines.join("\n\n"),
+          footer: { text: `${items.length} shared${q ? " matching" : ""} · get them in OCTIVE: Play → Workshop` } }],
+        components: [row(linkButton("Open the Workshop", `${SITE}#/workshop`, "🧰"))],
       };
     }
     case "stats": {
@@ -1922,7 +1977,9 @@ async function supportRoutes(request, env, url, ctx) {
     if (h.startsWith("Bearer ")) { try { const who = await signedIn(request, env); youFollow = (await followingOf(env, who.playerId)).includes(id); } catch { /* signed out */ } }
     let friends = null;
     try { friends = ((await r2json(env, dmInboxKey(id), dmEmptyInbox())).friends || []).length; } catch { /* none */ }
-    return reply({ following, followers, friends, youFollow, owner: OWNER });
+    let discord = null;
+    try { const rec = await record(env, id); if (rec.discord?.id && rec.discordPrefs?.show) discord = rec.discord.name || null; } catch { /* none */ }
+    return reply({ following, followers, friends, youFollow, owner: OWNER, discord });
   }
   if (path === "/follow") {
     const b = await bodyOf(request);
@@ -2475,6 +2532,26 @@ async function workshopRoutes(request, env, url, ctx) {
   fail(404, "Not found.");
 }
 
+/** A Discord DM from the bot: "X sent you a message" (opted in, linked, at most once per friend every 10 minutes). */
+async function discordMessageAlert(env, to, from, fromName, preview) {
+  if (!env.DISCORD_BOT_TOKEN) return;
+  const rec = await record(env, to);
+  if (!rec.discord?.id || !rec.discordPrefs?.dmAlerts) return;
+  const key = `discord-alerts/${to}.json`;
+  const last = await r2json(env, key, {});
+  if (last[from] && Date.now() - last[from] < 10 * 60_000) return;
+  last[from] = Date.now();
+  for (const k of Object.keys(last)) if (Date.now() - last[k] > 3600_000) delete last[k];
+  await r2put(env, key, last);
+  const ch = await discordApi(env, "POST", "/users/@me/channels", { recipient_id: rec.discord.id });
+  await discordApi(env, "POST", `/channels/${ch.id}/messages`, {
+    embeds: [{ color: 0x8b7bff, title: `💬 ${String(fromName).slice(0, 40)} sent you a message on OCTIVE`, description: String(preview || "").slice(0, 300),
+      footer: { text: "Reply in the game (F8) or on the website · turn these off in Settings → Profile → Discord" } }],
+    components: [{ type: 1, components: [{ type: 2, style: 5, label: "Open messages", url: `${SITE}#/messages/${encodeURIComponent(from)}` }] }],
+    allowed_mentions: { parse: [] },
+  });
+}
+
 async function dmRoutes(request, env, url) {
   const path = url.pathname;
   let m;
@@ -2608,6 +2685,7 @@ async function dmRoutes(request, env, url) {
           dmTrim(box);
         }),
       ]);
+      try { await discordMessageAlert(env, to, me, myName, preview); } catch (e) { console.log("discord alert", e && e.message); }
     }
     return reply({ ok: true, msg });
   }

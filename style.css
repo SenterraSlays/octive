@@ -878,3 +878,21 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
 .h2-frame .playfield { width: 320px; }
 .h2-art .emblem { position: absolute; width: 120px; height: 120px; left: 2%; bottom: -10px; filter: drop-shadow(0 0 24px #7c6cff66); }
 .h2-shelf > .empty, .ws-grid > .empty { grid-column: 1 / -1; text-align: left; }
+
+/* ---------------------------------------------------------------- 1.4.6: the live playfield (real chart, autoplay) */
+.live-pf { position: relative; width: 320px; height: 440px; border-radius: 18px; overflow: hidden;
+  background: repeating-linear-gradient(0deg, #ffffff06 0 1px, transparent 1px 60px), #0b0d16; border: 1px solid #ffffff1a; box-shadow: inset 0 0 60px #7c6cff1a; }
+.live-pf canvas { position: absolute; inset: 0; display: block; }
+.live-tag { position: absolute; top: 10px; left: 12px; display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; color: #ffffffb0; }
+.live-dot { width: 7px; height: 7px; border-radius: 50%; background: #ff4d6d; box-shadow: 0 0 8px #ff4d6d; animation: live-blink 1.4s ease-in-out infinite; }
+@keyframes live-blink { 50% { opacity: 0.35; } }
+.live-song { position: absolute; left: 12px; right: 12px; bottom: 10px; display: flex; flex-direction: column; font-size: 11px; color: #ffffff99; text-shadow: 0 1px 6px #000; pointer-events: none; }
+.live-song b { color: #fff; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.live-sound { position: absolute; top: 30px; left: 10px; font: inherit; font-size: 11px; font-weight: 700; color: #fff; background: #00000080; border: 1px solid #ffffff2a; border-radius: 8px; padding: 4px 8px; cursor: pointer; }
+.live-sound:hover { background: #8b7bff66; }
+@media (max-width: 900px) { .h2-art { display: flex; } .h2-frame { transform: none; } .h2-art .emblem { display: none; } }
+
+.fc-discord { display: inline-flex; align-items: center; gap: 8px; margin-top: 10px; padding: 6px 12px; border-radius: 10px; background: #5865f222; border: 1px solid #5865f266; font-size: 13px; }
+.fc-discord span { color: #9aa4ff; font-weight: 700; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; }
+.live-sound { top: auto; left: auto; right: 10px; bottom: 12px; }
+.live-song { right: 90px; }
