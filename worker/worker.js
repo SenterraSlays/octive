@@ -58,6 +58,228 @@ function socialsOf(card) {
 
 const stripTag = (n) => { if (!n) return "Player"; const i = n.lastIndexOf("#"); return i > 0 ? n.slice(0, i) : n; };
 
+// ---------------------------------------------------------------- server validation
+// Nothing a game (or anyone pretending to be one) sends is trusted. Every number is range-checked, the
+// PR total, accuracy and level are worked out HERE from the player's plays (POST /account/rank/sync),
+// a PR or level jump much bigger than a day of real playing is held for Senterra / Octive to look at, and
+// the ranking, profiles and Discord only ever show entries that pass. Entries written straight to the
+// leaderboard with impossible values are taken off it.
+const V = {
+  maxStars: 25,            // the hardest real charts are far below this
+  maxTotalPR: 60_000,      // the best players are around 13,000
+  maxLevel: 1000,
+  maxPlays: 2_000_000,
+  maxCombo: 200_000,
+  maxPlayTimeMs: 100_000_000_000, // about three years of playing
+  maxBig: 9_000_000_000_000_000,
+  dayPR: 4_000,            // more PR than this within 24 hours waits for a moderator
+  dayLevels: 25,           // the same for levels
+  maxCharts: 30_000,
+};
+const isNum = (v, lo, hi) => typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi;
+const isInt = (v, lo, hi) => isNum(v, lo, hi) && Number.isInteger(v);
+const NAME_RE = /^[A-Za-z0-9_.\-]{3,20}$/;
+const validName = (n) => typeof n === "string" && NAME_RE.test(n);
+const round2 = (x) => Math.round(x * 100) / 100;
+
+/** The most PR a play can give on a chart of these stars (100% accuracy, longest-chart bonus), as the game works it out. */
+function playPRMax(stars, acc = 100) {
+  const s = Math.min(V.maxStars, Math.max(0, stars));
+  const a = Math.max(0, Math.min(1, acc / 100));
+  return 8 * Math.pow(Math.max(s - 0.15, 0.05), 2.2) * Math.max(0, 5 * a - 4) * 1.1 * 1.0005 + 0.02;
+}
+/** Total PR from the best play per chart: the best counts fully, the next 95%, … plus the plays bonus (Performance.Total). */
+function totalPR(best) {
+  const sorted = [...best].sort((a, b) => b - a);
+  let t = 0, w = 1;
+  for (const p of sorted) { t += p * w; w *= 0.95; }
+  return round2(t + 416.6667 * (1 - Math.pow(0.995, Math.min(1000, sorted.length))));
+}
+function weightedAccuracy(plays) {
+  let s = 0, ws = 0, w = 1;
+  for (const p of [...plays].sort((a, b) => b.pp - a.pp)) { s += p.acc * w; ws += w; w *= 0.95; }
+  return ws > 0 ? round2(s / ws) : 0;
+}
+const LV_FIRST = 150_000, LV_GROWTH = 1.07;
+const xpForLevel = (l) => (l <= 1 ? 0 : Math.round(LV_FIRST * (Math.pow(LV_GROWTH, l - 1) - 1) / (LV_GROWTH - 1)));
+function levelOf(xp) {
+  if (!(xp > 0)) return 1;
+  let lv = 1 + Math.floor(Math.log(xp * (LV_GROWTH - 1) / LV_FIRST + 1) / Math.log(LV_GROWTH));
+  lv = Math.max(1, Math.min(V.maxLevel, lv));
+  while (lv > 1 && xpForLevel(lv) > xp) lv--;
+  while (lv < V.maxLevel && xpForLevel(lv + 1) <= xp) lv++;
+  return lv;
+}
+function levelProgress(xp) {
+  const lv = levelOf(xp);
+  if (lv >= V.maxLevel) return 1;
+  const a = xpForLevel(lv), b = xpForLevel(lv + 1);
+  return Math.round(Math.max(0, Math.min(1, (xp - a) / (b - a))) * 1000) / 1000;
+}
+const cleanBio = (b) => (typeof b === "string" ? b.replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").split("\n").slice(0, 8).join("\n").slice(0, 400) : "");
+function cleanAchievements(a) {
+  const out = {};
+  if (!a || typeof a !== "object" || Array.isArray(a)) return out;
+  for (const [k, v] of Object.entries(a).slice(0, 400))
+    if (/^[a-z0-9_.-]{1,48}$/i.test(k) && typeof v === "string" && v.length <= 40 && !Number.isNaN(Date.parse(v)) && Date.parse(v) <= Date.now() + 86_400_000) out[k] = v;
+  return out;
+}
+const cleanInt = (v, lo, hi, d = lo) => (isNum(v, lo - 1e-9, hi) ? Math.round(v) : d);
+
+/**
+ * Why a ranking entry can't be real (null when it's fine): what a real game can never send. The name must
+ * follow the name rules, the numbers must be possible.
+ */
+function boardProblem(e, card, meta) {
+  if (!isNum(e.score, 0, V.maxTotalPR)) return `PR ${e.score}`;
+  if (card.pp !== undefined && !isNum(card.pp, 0, V.maxTotalPR)) return `card PR ${card.pp}`;
+  const acc = card.accuracy ?? meta.a ?? 0;
+  if (!isNum(acc, 0, 100)) return `accuracy ${acc}`;
+  const lv = card.level ?? meta.l ?? 1;
+  if (!isInt(lv, 1, V.maxLevel)) return `level ${lv}`;
+  const lp = card.levelProgress ?? meta.lp ?? 0;
+  if (!isNum(lp, 0, 1)) return `level progress ${lp}`;
+  const pc = card.playCount ?? meta.pc ?? 0;
+  if (!isInt(pc, 0, V.maxPlays)) return `plays ${pc}`;
+  for (const [k, v] of [["totalScore", card.totalScore ?? meta.ts], ["fullCombos", card.fullCombos ?? meta.fc], ["xp", card.xp], ["maxCombo", card.maxCombo], ["playTimeMs", card.playTimeMs]])
+    if (v !== undefined && v !== null && !isInt(v, 0, V.maxBig)) return `${k} ${v}`;
+  const name = card.name ?? meta.n;
+  if (name !== undefined && name !== null && !validName(name)) return "name";
+  return null;
+}
+
+/** A public card's numbers made safe to show (anything impossible becomes the empty value). */
+function safeCard(card) {
+  const c = card && typeof card === "object" && !Array.isArray(card) ? card : {};
+  return {
+    ...c,
+    name: validName(c.name) ? c.name : undefined,
+    pp: isNum(c.pp, 0, V.maxTotalPR) ? c.pp : 0,
+    accuracy: isNum(c.accuracy, 0, 100) ? c.accuracy : 0,
+    level: isInt(c.level, 1, V.maxLevel) ? c.level : 1,
+    levelProgress: isNum(c.levelProgress, 0, 1) ? c.levelProgress : 0,
+    playCount: cleanInt(c.playCount, 0, V.maxPlays, 0),
+    totalScore: cleanInt(c.totalScore, 0, V.maxBig, 0),
+    xp: cleanInt(c.xp, 0, V.maxBig, 0),
+    fullCombos: cleanInt(c.fullCombos, 0, V.maxPlays, 0),
+    maxCombo: cleanInt(c.maxCombo, 0, V.maxCombo, 0),
+    playTimeMs: cleanInt(c.playTimeMs, 0, V.maxPlayTimeMs, 0),
+    rank: cleanInt(c.rank, 0, 10_000_000, 0),
+    bio: cleanBio(c.bio),
+    achievements: cleanAchievements(c.achievements),
+    avatar: typeof c.avatar === "string" && /^[A-Za-z0-9_-]{0,80}$/.test(c.avatar) ? c.avatar : "",
+    version: typeof c.version === "string" && /^\d{1,3}\.\d{1,3}\.\d{1,4}$/.test(c.version) ? c.version : "",
+    ppVersion: isInt(c.ppVersion, 0, 100) ? c.ppVersion : 2,
+  };
+}
+
+/** Bad ranking entries seen this hour (so each is taken off and written down once). */
+const purged = new Map();
+async function purgeEntry(env, cfg, playerId, why) {
+  const last = purged.get(playerId);
+  if (last && Date.now() - last < 3_600_000) return;
+  purged.set(playerId, Date.now());
+  try { await admin(env, "DELETE", `${cfg.scores}/players/${encodeURIComponent(playerId)}`); } catch (e) { console.log("purge", playerId, e.message); }
+  await flagPlayer(env, playerId, "ranking entry removed: " + why);
+}
+/** Writes down something a player's game sent that couldn't be real (the moderator view shows it). */
+async function flagPlayer(env, playerId, what) {
+  try {
+    await r2update(env, "rank/flags.json", () => ({ flags: [] }), (d) => {
+      d.flags = (d.flags || []).filter((f) => Date.now() - Date.parse(f.at) < 90 * 86_400_000);
+      d.flags.push({ playerId, what: String(what).slice(0, 200), at: new Date().toISOString() });
+      if (d.flags.length > 2000) d.flags = d.flags.slice(-2000);
+    });
+  } catch (e) { console.log("flag", e.message); }
+}
+const flagsOf = async (env, playerId) => ((await r2json(env, "rank/flags.json", { flags: [] })).flags || []).filter((f) => f.playerId === playerId).slice(-20);
+
+/** Writes the server's own copy of something (ranking entry, public card): needs the service account's write roles. */
+async function serverWrite(fn) {
+  try { return await fn(); }
+  catch (e) {
+    if (e.status === 401 || e.status === 403) {
+      const err = new HttpError(503, "The server can't write rankings yet (the Unity service account needs the Leaderboards and Cloud Save write roles).");
+      err.code = "server-writes-unavailable";
+      throw err;
+    }
+    throw e;
+  }
+}
+
+/**
+ * The ranking from a player's own plays, worked out and checked here. Returns what to publish and why
+ * anything was left out.
+ */
+async function rankFromPlays(env, cfg, playerId) {
+  const [priv, resetRec] = await Promise.all([
+    privateItems(env, playerId, ["scores"]).catch(() => ({})),
+    r2json(env, `rank/reset/${playerId}.json`, null),
+  ]);
+  const resetAt = resetRec ? Date.parse(resetRec.at) || 0 : 0;
+  const data = priv.scores && typeof priv.scores === "object" ? priv.scores : {};
+  const charts = data.charts && typeof data.charts === "object" ? Object.entries(data.charts).slice(0, V.maxCharts) : [];
+  const plays = [], problems = [];
+  let fullCombos = 0, bestCombo = 0, oldAfterReset = false;
+  // verified songs (OCTIVE's own, or checked by Senterra / Octive) give their full PR, every other chart a third
+  const verified = (await verifiedSongs(env).catch(() => ({ songs: {} }))).songs || {};
+  const prFactor = (key, c) => {
+    const ids = [typeof c.board === "string" ? c.board : null, String(key).split("/")[0]].filter(Boolean);
+    return ids.some((id) => officialSong(id) || (songIdOk(id) && verified[id])) ? 1 : 1 / 3;
+  };
+  for (const [key, c] of charts) {
+    if (!c || typeof c !== "object") continue;
+    if (resetAt && !(Date.parse(c.lastPlayed) > resetAt)) { oldAfterReset = true; continue; }
+    if (c.fullCombo === true) fullCombos++;
+    if (isInt(c.maxCombo, 0, V.maxCombo)) bestCombo = Math.max(bestCombo, c.maxCombo);
+    if (!(typeof c.bestPP === "number" && c.bestPP > 0)) continue;
+    const why =
+      !isNum(c.stars, 0, V.maxStars) ? `stars ${c.stars}` :
+      !isNum(c.ppAccuracy, 0, 100) ? `accuracy ${c.ppAccuracy}` :
+      !isNum(c.bestPP, 0, playPRMax(c.stars, c.ppAccuracy)) ? `${c.bestPP} PR on a ${c.stars}★ chart at ${c.ppAccuracy}%` :
+      c.bestScore !== undefined && !isInt(c.bestScore, 0, SCORE_MAX) ? `score ${c.bestScore}` :
+      c.bestAccuracy !== undefined && !isNum(c.bestAccuracy, 0, 100) ? `accuracy ${c.bestAccuracy}` : null;
+    if (why) { problems.push(`${String(key).slice(0, 60)}: ${why}`); continue; }
+    plays.push({ pp: round2(c.bestPP * prFactor(key, c)), acc: c.ppAccuracy });
+  }
+  // totals: after a reset the device must have started over; numbers from before don't count
+  const fresh = resetAt && oldAfterReset;
+  const xp = fresh ? 0 : cleanInt(data.xp, 0, V.maxBig, 0);
+  const playCount = fresh ? plays.length : Math.max(plays.length, cleanInt(data.totalPlays, 0, V.maxPlays, 0));
+  return {
+    pp: totalPR(plays.map((p) => p.pp)),
+    accuracy: weightedAccuracy(plays),
+    xp, level: levelOf(xp), levelProgress: levelProgress(xp),
+    playCount,
+    totalScore: fresh ? 0 : cleanInt(data.totalScore, 0, V.maxBig, 0),
+    playTimeMs: fresh ? 0 : cleanInt(data.playTimeMs, 0, V.maxPlayTimeMs, 0),
+    fullCombos, maxCombo: bestCombo,
+    ppVersion: isInt(data.ppVersion, 0, 100) && data.ppVersion >= PP_VERSION ? PP_VERSION : 2,
+    counted: plays.length, problems,
+  };
+}
+
+/**
+ * Holds a jump much bigger than a day of playing (PR or levels) until a moderator approves it: returns the
+ * values to publish and whether the new ones are waiting.
+ */
+async function paceCheck(env, cfg, playerId, now) {
+  const key = `rank/players/${playerId}.json`;
+  let rec = await r2json(env, key, null);
+  if (!rec) {
+    // the first check: start from what the ranking shows now (when that was possible)
+    let pp = 0, level = 1;
+    try {
+      const e = await api(`${cfg.scores}/players/${encodeURIComponent(playerId)}?includeMetadata=true`, cfg.auth);
+      let meta = {}; try { meta = e?.metadata ? JSON.parse(e.metadata) : {}; } catch { /* none */ }
+      if (e && isNum(e.score, 0, V.maxTotalPR)) pp = e.score;
+      if (isInt(meta.l, 1, V.maxLevel)) level = meta.l;
+    } catch { /* not ranked yet */ }
+    rec = { pp, level, hist: [] };
+  }
+  return { key, rec };
+}
+
 function cors(res) {
   const h = new Headers(res.headers);
   h.set("Access-Control-Allow-Origin", "*");
@@ -144,11 +366,23 @@ async function buildBoard(env) {
       cards.set(id, { card: items.card ?? null, seen: items.seen || "", platform: items.platform || "", at: now });
     } catch (e) { if (!cards.has(id)) cards.set(id, { card: null, seen: "", platform: "", at: 0 }); }
   }));
-  const players = entries.map((e, i) => {
-    const c = cards.get(e.playerId) || {};
-    const card = c.card || {};
+  // server validation: an entry no real game could have sent is left out and taken off the leaderboard
+  const bad = [];
+  const checked = entries.filter((e) => {
+    const raw = cards.get(e.playerId)?.card;
     let meta = {};
     try { meta = e.metadata ? JSON.parse(e.metadata) : {}; } catch { /* none */ }
+    const why = boardProblem(e, raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}, meta && typeof meta === "object" ? meta : {});
+    if (why) bad.push([e.playerId, why]);
+    return !why;
+  });
+  if (bad.length) await Promise.all(bad.map(([id, why]) => purgeEntry(env, cfg, id, why)));
+  const players = checked.map((e, i) => {
+    const c = cards.get(e.playerId) || {};
+    const card = safeCard(c.card);
+    let meta = {};
+    try { meta = e.metadata ? JSON.parse(e.metadata) : {}; } catch { /* none */ }
+    if (!meta || typeof meta !== "object") meta = {};
     const ov = moderation.overrides[e.playerId] || {};
     const seen = c.seen ? Date.parse(c.seen) : 0;
     let avatarHash = card.avatar || "";
@@ -632,8 +866,14 @@ async function account(request, env, route) {
       edits.at = now;
       const token = request.headers.get("Authorization").slice(7).trim();
       await saveAsPlayer(env, token, who.playerId, "webEdits", edits, false);
-      await saveAsPlayer(env, token, who.playerId, "card", card, true);
-      if (small) await saveAsPlayer(env, token, who.playerId, "avatar", small, true);
+      // the public card: written by the server (players can't write public items once Access Control is on)
+      try {
+        await serverWrite(async () => { await saveItem(env, who.playerId, "card", safeCard(card), true); if (small) await saveItem(env, who.playerId, "avatar", small, true); });
+      } catch (e) {
+        if (e.code !== "server-writes-unavailable") throw e;
+        await saveAsPlayer(env, token, who.playerId, "card", card, true);
+        if (small) await saveAsPlayer(env, token, who.playerId, "avatar", small, true);
+      }
       cards.delete(who.playerId); boardAt = 0;
       return reply(await me(env, who));
     }
@@ -734,7 +974,156 @@ async function account(request, env, route) {
         uploads, scoresSharedToday: rate && rate.day === new Date().toISOString().slice(0, 10) ? rate.n : 0,
         achievements: Object.keys(card.achievements || {}).length,
         stats: { pp: card.pp || 0, accuracy: card.accuracy || 0, level: card.level || 0, playCount: card.playCount || 0, playTimeMs: card.playTimeMs || 0, rank: card.rank || 0 },
+        flags: await flagsOf(env, id).catch(() => []),
+        held: (await r2json(env, `rank/players/${id}.json`, null).catch(() => null))?.held || null,
+        statsResetAt: (await r2json(env, `rank/reset/${id}.json`, null).catch(() => null))?.at || null,
       });
+    }
+    // ---- the ranking, worked out and written by the server (the game only says "I played")
+    case "rank/sync": {
+      const b = await bodyOf(request, 150_000);
+      const who = await signedIn(request, env);
+      const id = who.playerId, now = Date.now(), official = isOfficial(id);
+      const cfg = config(env);
+      await loadModeration(cfg);
+      if (moderation.bans[id]) fail(403, "This account is banned.");
+      const r = await rankFromPlays(env, cfg, id);
+      if (r.problems.length) await flagPlayer(env, id, `${r.problems.length} impossible play${r.problems.length === 1 ? "" : "s"} left out: ${r.problems.slice(0, 3).join("; ")}`);
+      // a jump bigger than a day of real playing waits for a moderator
+      const { key, rec } = await paceCheck(env, cfg, id, now);
+      rec.hist = (rec.hist || []).filter((h) => now - h.t < 86_400_000);
+      const basePR = Math.min(rec.pp, ...rec.hist.map((h) => h.pp));
+      const baseLv = Math.min(rec.level, ...rec.hist.map((h) => h.level));
+      const approved = rec.approvedUntil && Date.parse(rec.approvedUntil) > now;
+      let pub = r, held = null;
+      if (!official && !approved && (r.pp - basePR > V.dayPR || r.level - baseLv > V.dayLevels)) {
+        held = { pp: r.pp, level: r.level, at: new Date(now).toISOString() };
+        pub = { ...r, pp: Math.min(r.pp, rec.pp), level: Math.min(r.level, rec.level), levelProgress: r.level > rec.level ? 1 : r.levelProgress };
+        if (!rec.held || now - Date.parse(rec.held.at) > 86_400_000) await flagPlayer(env, id, `held: ${rec.pp} → ${r.pp} PR, level ${rec.level} → ${r.level} within a day`);
+        rec.held = rec.held && now - Date.parse(rec.held.at) <= 86_400_000 ? { ...held, at: rec.held.at } : held;
+      } else {
+        delete rec.held;
+        rec.pp = r.pp; rec.level = r.level;
+        rec.hist.push({ t: now, pp: r.pp, level: r.level });
+        if (rec.hist.length > 300) rec.hist = rec.hist.slice(-300);
+      }
+      if (official) pub = { ...pub, level: 1000, levelProgress: 1 };
+      // the public card: numbers from above, the rest checked
+      const avatarHash = typeof b.avatarHash === "string" && /^[A-Za-z0-9_-]{0,80}$/.test(b.avatarHash) ? b.avatarHash : "";
+      let avatarB64 = null;
+      if (typeof b.avatar === "string") {
+        if (b.avatar === "") avatarB64 = "";
+        else {
+          let bytes = null;
+          try { bytes = b64Bytes(b.avatar); } catch { /* not base64 */ }
+          if (!bytes || bytes.length > 80_000 || bytes[0] !== 0xFF || bytes[1] !== 0xD8) fail(400, "That profile picture can't be used.");
+          avatarB64 = b.avatar;
+        }
+      }
+      const name = validName(b.name) ? b.name : validName(who.username) ? who.username : "Player";
+      const card = {
+        name, pp: pub.pp, accuracy: pub.accuracy, level: pub.level, levelProgress: pub.levelProgress, avatar: avatarHash,
+        totalScore: pub.totalScore, xp: pub.xp, playCount: pub.playCount, fullCombos: pub.fullCombos, maxCombo: pub.maxCombo,
+        playTimeMs: pub.playTimeMs, bio: cleanBio(b.bio), devFriend: b.devFriend === true, rank: 0,
+        socials: badgesOf(id).includes("CREATOR") ? socialsOf({ socials: b.socials }) : {},
+        version: typeof b.version === "string" && /^\d{1,3}\.\d{1,3}\.\d{1,4}$/.test(b.version) ? b.version : "",
+        ppVersion: pub.ppVersion, achievements: cleanAchievements(b.achievements),
+      };
+      const platform = typeof b.platform === "string" && /^[a-z0-9-]{1,24}$/.test(b.platform) ? b.platform : "";
+      let rank = 0;
+      await serverWrite(async () => {
+        if (!official) {
+          const meta = { n: name, l: pub.level, lp: pub.levelProgress, a: pub.accuracy, av: avatarHash, ts: pub.totalScore, pc: pub.playCount, fc: pub.fullCombos, pv: pub.ppVersion };
+          const e = await admin(env, "POST", `${cfg.scores}/players/${encodeURIComponent(id)}`, { score: pub.pp, metadata: meta });
+          rank = isInt(e?.rank, 0, 1e9) ? e.rank + 1 : 0;
+        }
+        card.rank = rank;
+        await saveItem(env, id, "card", card, true);
+        if (avatarB64 !== null) await saveItem(env, id, "avatar", avatarB64, true);
+        await saveItem(env, id, "seen", b.hidden === true ? "" : new Date(now).toISOString(), true);
+        await saveItem(env, id, "platform", platform, true);
+      });
+      rec.at = new Date(now).toISOString();
+      await env.RELEASES.put(key, JSON.stringify(rec), { httpMetadata: { contentType: "application/json" } });
+      cards.delete(id);
+      return reply({ ok: true, pp: pub.pp, level: pub.level, rank, held, leftOut: r.problems.length, counted: r.counted });
+    }
+    case "rank/seen": {
+      // the online heartbeat (written by the server: nobody can make anyone else look online)
+      const b = await bodyOf(request, 2_000);
+      const who = await signedIn(request, env);
+      const platform = typeof b.platform === "string" && /^[a-z0-9-]{1,24}$/.test(b.platform) ? b.platform : "";
+      await serverWrite(async () => {
+        await saveItem(env, who.playerId, "seen", b.hidden === true ? "" : new Date().toISOString(), true);
+        await saveItem(env, who.playerId, "platform", platform, true);
+      });
+      return reply({ ok: true });
+    }
+    case "mod/moderation": {
+      // the developer's moderation list (bans, name and picture overrides, roles, badges)
+      const b = await bodyOf(request, 300_000);
+      const who = await signedIn(request, env);
+      if (!DEVELOPERS.includes(who.playerId)) fail(403, "Only the developer can change the moderation list.");
+      const d = b.data;
+      const idOk = (k) => /^[A-Za-z0-9_-]{8,64}$/.test(k);
+      if (!d || typeof d !== "object" || Array.isArray(d)) fail(400, "That moderation list isn't valid.");
+      for (const part of ["bans", "overrides", "roles", "badges"]) {
+        const m = d[part];
+        if (m === undefined || m === null) continue;
+        if (typeof m !== "object" || Array.isArray(m) || Object.keys(m).some((k) => !idOk(k))) fail(400, `The moderation list's ${part} aren't valid.`);
+      }
+      await serverWrite(() => saveItem(env, who.playerId, "moderation", JSON.stringify(d), true));
+      return reply({ ok: true });
+    }
+    case "mod/reset-stats": {
+      // a player's stats back to a new account's: ranking, plays, levels, achievements, chart leaderboards
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      const id = String(b.playerId || "");
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
+      const cfg = config(env);
+      const at = new Date().toISOString();
+      await serverWrite(async () => {
+        await admin(env, "DELETE", `${cfg.scores}/players/${encodeURIComponent(id)}`);
+        const pub = await publicItems(cfg, id, ["card"]).catch(() => ({}));
+        const old = safeCard(pub.card);
+        await saveItem(env, id, "card", { ...old, pp: 0, accuracy: 0, level: 1, levelProgress: 0, totalScore: 0, xp: 0, playCount: 0, fullCombos: 0, maxCombo: 0, playTimeMs: 0, rank: 0, achievements: {} }, true);
+        await saveItem(env, id, "scores", JSON.stringify({ version: 1, charts: {}, recent: [], totalPlays: 0, totalNotesHit: 0, totalScore: 0, xp: 0, playTimeMs: 0, ppVersion: PP_VERSION }), false);
+        // the game sees this, and starts that account over on every device
+        await saveItem(env, id, "statsReset", at, false);
+      });
+      await env.RELEASES.put(`rank/reset/${id}.json`, JSON.stringify({ at, by: who.playerId }), { httpMetadata: { contentType: "application/json" } });
+      await env.RELEASES.delete(`rank/players/${id}.json`);
+      // off every chart leaderboard too
+      let cursor, boardsTouched = 0;
+      do {
+        const list = await env.RELEASES.list({ prefix: "scores/", cursor });
+        for (const o of list.objects) {
+          if (o.key.startsWith("scores/rate/") || !o.key.endsWith(".json")) continue;
+          let had = false;
+          await r2update(env, o.key, () => ({ entries: [] }), (d) => { const n = (d.entries || []).length; d.entries = (d.entries || []).filter((e) => e.playerId !== id); had = d.entries.length !== n; if (!had) return false; });
+          if (had) { boardsTouched++; boards.delete(o.key); }
+        }
+        cursor = list.truncated ? list.cursor : undefined;
+      } while (cursor);
+      await flagPlayer(env, id, `stats reset by ${who.playerId === OWNER ? "Senterra" : "Octive"}`);
+      board = null; cards.delete(id);
+      return reply({ ok: true, at, boardsTouched });
+    }
+    case "mod/rank-approve": {
+      // lets a held PR / level jump through (for a day)
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      const id = String(b.playerId || "");
+      const key = `rank/players/${id}.json`;
+      const rec = await r2json(env, key, null);
+      if (!rec) fail(404, "Nothing is held for that player.");
+      rec.approvedUntil = new Date(Date.now() + 86_400_000).toISOString();
+      delete rec.held;
+      await env.RELEASES.put(key, JSON.stringify(rec), { httpMetadata: { contentType: "application/json" } });
+      return reply({ ok: true, approvedUntil: rec.approvedUntil });
     }
     case "mod/verify": {
       // verify (or un-verify) a song: its charts get a global leaderboard
@@ -970,8 +1359,8 @@ async function profileOf(env, playerId) {
   const ranked = board?.players?.find((p) => p.id === playerId);
   if (ranked) return ranked;
   const items = await publicItems(config(env), playerId, ["card", "seen", "platform"]);
-  const card = items.card;
-  if (!card || moderation.bans[playerId]) return null;
+  if (!items.card || moderation.bans[playerId]) return null;
+  const card = safeCard(items.card);
   const seen = items.seen ? Date.parse(items.seen) : 0;
   const ov = moderation.overrides[playerId] || {};
   return {
@@ -1303,16 +1692,7 @@ async function discordCommand(env, it) {
       // the newest shared items (all four channels, or one kind), with links to their posts and downloads
       const type = opt(data, "type"), q = String(opt(data, "search") || "").trim().toLowerCase();
       const db = await r2json(env, WS_DB, { items: [] });
-      const creator = url.searchParams.get("creator");
-    let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type) && (!creator || it.creatorId === creator));
-    // ?verified=1 / 0, ?customizable=1 (skins and styles anyone may change)
-    const ver = url.searchParams.get("verified");
-    if (ver === "1") items = items.filter((it) => !!it.verified); else if (ver === "0") items = items.filter((it) => !it.verified);
-    if (url.searchParams.get("customizable") === "1") items = items.filter((it) => it.type === "themes" || !(it.meta && it.meta.locked));
-    if (url.searchParams.get("builtin") === "1") items = items.filter((it) => !!it.builtin);
-    // ?song=<songId>: the upload holding that song (multiplayer: get the room's song)
-    const song = String(url.searchParams.get("song") || "");
-    if (song) items = items.filter((it) => (it.songIds || []).includes(song));
+      let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type));
       if (q) items = items.filter((it) => `${it.title} ${it.creator} ${it.description}`.toLowerCase().includes(q));
       items.sort((a, b) => b.at - a.at);
       const shown = items.slice(0, 8);
@@ -1580,10 +1960,10 @@ async function chartScores(request, env, url) {
       avatarHash: ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : String(card.avatar || ""),
       score, accuracy: Math.round(acc * 100) / 100,
       grade: String(b.grade || "").slice(0, 3),
-      maxCombo: Math.max(0, Math.round(Number(b.maxCombo) || 0)),
+      maxCombo: Math.min(V.maxCombo, Math.max(0, Math.round(Number(b.maxCombo) || 0))),
       fullCombo: !!b.fullCombo,
-      pp: Math.max(0, Math.round((Number(b.pp) || 0) * 100) / 100),
-      counts: Array.isArray(b.counts) ? b.counts.slice(0, 6).map((n) => Math.max(0, Math.round(Number(n) || 0))) : [],
+      pp: Math.min(playPRMax(V.maxStars), Math.max(0, Math.round((Number(b.pp) || 0) * 100) / 100)),
+      counts: Array.isArray(b.counts) ? b.counts.slice(0, 6).map((n) => Math.min(1_000_000, Math.max(0, Math.round(Number(n) || 0)))) : [],
       badges: badgesOf(who.playerId),
       date: new Date().toISOString(),
       version: String(b.version || "").slice(0, 12),
@@ -2475,6 +2855,27 @@ async function chatRoutes(request, env, url, ctx) {
 // preview. Only the channel and message ids are kept (Discord's file links expire): a download asks Discord for
 // the message again and caches the fresh link for up to 12 hours. Previews are kept in R2 for the item lists.
 const WS_TYPES = { ".oct": "charts", ".octskin": "skins", ".octtheme": "themes", ".octstyle": "styles" };
+/** Song tags people can pick when they share (filters in the Workshop). */
+const WS_TAGS = ["stream", "jumpstream", "handstream", "chordjack", "jacks", "speedjack", "technical", "ln", "hybrid", "sv", "stamina", "speed", "dump", "trills", "vibro", "gimmick", "fnf", "osu", "pack", "easy", "marathon"];
+const wsTags = (v) => [...new Set(String(v || "").toLowerCase().split(",").map((t) => t.trim()).filter((t) => WS_TAGS.includes(t)))].slice(0, 8);
+/** The most PR a song's hardest difficulty can give (100%, verified), for cards and sorting. */
+function wsTopPR(it) {
+  let best = 0;
+  for (const sg of (it.meta && it.meta.songs) || [])
+    for (const c of sg.charts || []) {
+      const st = Number(c.stars) || 0;
+      if (st <= 0) continue;
+      const pr = 8 * Math.pow(Math.max(st - 0.15, 0.05), 2.2) * (1 + 0.1 * Math.min(1, (Number(c.notes) || 0) / 1500));
+      if (pr > best) best = pr;
+    }
+  return Math.round(best);
+}
+/** Uploads a player can make a day: Senterra and Octive any number, supporters 10, everyone else 3. */
+async function wsDailyLimit(env, playerId) {
+  if (playerId === OWNER || isOfficial(playerId) || badgesOf(playerId).some((b) => b === "DEV" || b === "MOD")) return Infinity;
+  try { const sup = await supporters(env); if (sup[playerId]?.active) return 10; } catch { /* not known */ }
+  return 3;
+}
 const WS_CHANNEL = { charts: "octive-charts", skins: "octive-skins", themes: "octive-themes", styles: "octive-styles" };
 const WS_LABEL = { charts: "Chart", skins: "Skin", themes: "Theme", styles: "Style" };
 const WS_COLOR = { charts: 0x8b7bff, skins: 0xff5c8a, themes: 0x4fd6e8, styles: 0xffb84f };
@@ -2609,6 +3010,7 @@ async function wsMeta(kind, u8) {
         charts: (Array.isArray(m.charts) ? m.charts : []).slice(0, 60).map((c) => ({
           difficulty: String(c.difficulty || "").slice(0, 100), keys: Number(c.keyCount) || 0, stars: Math.round((Number(c.rating) || 0) * 100) / 100,
           notes: Number(c.noteCount) || 0, creator: String(c.creator || "").slice(0, 60),
+          od: Number.isFinite(Number(c.od)) && c.od !== null && Number(c.od) >= 0 && Number(c.od) <= 10 ? Number(c.od) : undefined,
         })),
       };
     }
@@ -2680,9 +3082,46 @@ const wsPublic = (it) => ({
   // verified by OCTIVE (its own content, or checked by Senterra / Octive); skins and styles not locked can be changed
   verified: !!it.verified, builtin: !!it.builtin, originalId: it.originalId || null, customizable: it.type === "themes" ? true : it.type === "skins" || it.type === "styles" ? !(it.meta && it.meta.locked) : undefined,
   songIds: it.songIds || [], songs: it.meta && it.meta.songs ? it.meta.songs : undefined,
+  tags: Array.isArray(it.tags) ? it.tags : [],
+  verifyRequested: it.verifyRequest && !it.verified ? it.verifyRequest.at : undefined,
   preview: it.preview ? `${WORKER_BASE}/api/preview/${it.id}` : null,
   discord: it.channelId && it.messageId && it.guildId ? `https://discord.com/channels/${it.guildId}/${it.channelId}/${it.messageId}` : null,
 });
+
+/** Reads an older upload's details (songs, difficulties, keys, stars, charters; a skin's lock) from its files once. */
+async function wsBackfill(env, it) {
+  if (it.meta || it.type === "themes" || !env.DISCORD_BOT_TOKEN) return it;
+  try {
+    const msg = await discordApi(env, "GET", `/channels/${it.channelId}/messages/${it.messageId}`);
+    const names = it.fileNames && it.fileNames.length ? it.fileNames : [it.fileName];
+    const metas = [], hashes = [];
+    for (const a of (msg.attachments || []).filter((x) => names.includes(x.filename)).slice(0, 9)) {
+      if (a.size > 60 * 1048576) continue;
+      const u8 = new Uint8Array(await (await fetch(a.url)).arrayBuffer());
+      metas.push(await wsMeta(it.type, u8)); hashes.push(await bytesHash(u8));
+    }
+    const meta = it.type === "charts" ? { songs: metas.filter(Boolean), locked: false } : (metas[0] || { locked: false });
+    const songIds = it.type === "charts" ? meta.songs.map((x) => x.songId).filter(Boolean) : [];
+    let out = it;
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === it.id); if (!x) return false; x.meta = meta; x.hashes = x.hashes || hashes; x.songIds = x.songIds || songIds; out = x; });
+    return out;
+  } catch (e) { console.log("workshop details", e && e.message); return null; }
+}
+async function wsBackfillSome(env, list) { for (const it of list) await wsBackfill(env, it); }
+
+/** The developer's import key (an HMAC of a server secret): uploads as the official account. Null without it. */
+async function officialImporter(request, env) {
+  const given = String(request.headers.get("X-Octive-Import") || "");
+  if (!given || !env.DISCORD_BOT_TOKEN) return null;
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.DISCORD_BOT_TOKEN), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode("octive-official-import-v1")));
+  const want = [...mac].map((b) => b.toString(16).padStart(2, "0")).join("");
+  if (given.length !== want.length) fail(403, "That import key isn't valid.");
+  let diff = 0;
+  for (let i = 0; i < want.length; i++) diff |= want.charCodeAt(i) ^ given.charCodeAt(i);
+  if (diff !== 0) fail(403, "That import key isn't valid.");
+  return { playerId: OFFICIAL_ID, username: "Octive", until: Date.now() + 60_000 };
+}
 
 async function workshopRoutes(request, env, url, ctx) {
   const path = url.pathname;
@@ -2698,10 +3137,54 @@ async function workshopRoutes(request, env, url, ctx) {
     const creator = String(url.searchParams.get("creator") || "").trim();
     let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type) && (!creator || it.creatorId === creator));
     if (q) items = items.filter((it) => `${it.title} ${it.creator} ${it.description}`.toLowerCase().includes(q));
-    items.sort(sort === "popular" ? (a, b) => (b.downloads || 0) - (a.downloads || 0) || b.at - a.at : (a, b) => b.at - a.at);
+    const sp = url.searchParams;
+    // ?verified=1 / 0, ?customizable=1 (skins and styles anyone may change), ?builtin=1 (OCTIVE's own content)
+    const ver = sp.get("verified");
+    if (ver === "1") items = items.filter((it) => !!it.verified); else if (ver === "0") items = items.filter((it) => !it.verified);
+    if (sp.get("customizable") === "1") items = items.filter((it) => it.type === "themes" || !(it.meta && it.meta.locked));
+    if (sp.get("builtin") === "1") items = items.filter((it) => !!it.builtin);
+    // ?song=<songId>: the upload holding that song (multiplayer: get the room's song)
+    const song = String(sp.get("song") || "").slice(0, 120);
+    if (song) items = items.filter((it) => (it.songIds || []).includes(song));
+    // ?by=<name>: uploads by a player whose name has these letters
+    const by = String(sp.get("by") || "").trim().toLowerCase().slice(0, 40);
+    if (by) items = items.filter((it) => String(it.creator || "").toLowerCase().includes(by));
+    // songs: ?charter=<name>, ?keys=4,7, ?minStars= / ?maxStars= (some difficulty matches all of them)
+    const charter = String(sp.get("charter") || "").trim().toLowerCase().slice(0, 60);
+    const keys = String(sp.get("keys") || "").split(",").map((k) => parseInt(k, 10)).filter((k) => k >= 1 && k <= 20).slice(0, 12);
+    const minS = Number(sp.get("minStars")), maxS = Number(sp.get("maxStars"));
+    const hasMin = Number.isFinite(minS) && minS > 0, hasMax = Number.isFinite(maxS) && maxS > 0;
+    let pending = 0;
+    if (charter || keys.length || hasMin || hasMax) {
+      // older uploads get their details read in the background (they show once that's done)
+      const missing = items.filter((it) => it.type === "charts" && !it.meta);
+      pending = missing.length;
+      if (missing.length && ctx) ctx.waitUntil(wsBackfillSome(env, missing.slice(0, 6)).catch(() => {}));
+      items = items.filter((it) => {
+        if (it.type !== "charts") return !charter && !keys.length && !hasMin && !hasMax;
+        const charts = ((it.meta && it.meta.songs) || []).flatMap((sg) => sg.charts || []);
+        return charts.some((c) => (!charter || String(c.creator || "").toLowerCase().includes(charter))
+          && (!keys.length || keys.includes(c.keys)) && (!hasMin || c.stars >= minS) && (!hasMax || c.stars <= maxS));
+      });
+    }
+    // ?tags=sv,ln: every one of them
+    const wantTags = wsTags(sp.get("tags"));
+    if (wantTags.length) items = items.filter((it) => wantTags.every((t) => (it.tags || []).includes(t)));
+    // ?requested=1: songs waiting for a verification check (Senterra and Octive)
+    if (sp.get("requested") === "1") items = items.filter((it) => it.verifyRequest && !it.verified);
+    const topStars = (it) => Math.max(0, ...((it.meta && it.meta.songs) || []).flatMap((sg) => (sg.charts || []).map((c) => c.stars || 0)));
+    items.sort(
+      sort === "popular" ? (a, b) => (b.downloads || 0) - (a.downloads || 0) || b.at - a.at
+      : sort === "title" ? (a, b) => String(a.title || "").localeCompare(String(b.title || ""), "en", { sensitivity: "base" })
+      : sort === "hardest" ? (a, b) => topStars(b) - topStars(a) || b.at - a.at
+      : sort === "easiest" ? (a, b) => (topStars(a) || 1e9) - (topStars(b) || 1e9) || b.at - a.at
+      : sort === "oldest" ? (a, b) => a.at - b.at
+      : sort === "pr" ? (a, b) => wsTopPR(b) - wsTopPR(a) || b.at - a.at
+      : sort === "requested" ? (a, b) => ((a.verifyRequest && Date.parse(a.verifyRequest.at)) || 0) - ((b.verifyRequest && Date.parse(b.verifyRequest.at)) || 0)
+      : (a, b) => b.at - a.at);
     const counts = {};
     for (const it of db.items || []) if (!it.removed) counts[it.type] = (counts[it.type] || 0) + 1;
-    return reply({ items: items.slice(0, 300).map(wsPublic), counts, maxBytes: await wsMaxBytes(env).catch(() => null) });
+    return reply({ items: items.slice(0, 300).map((it) => ({ ...wsPublic(it), keys: [...new Set(((it.meta && it.meta.songs) || []).flatMap((sg) => (sg.charts || []).map((c) => c.keys)))].filter(Boolean).sort((a, b) => a - b), topStars: it.type === "charts" ? topStars(it) : undefined, topPR: it.type === "charts" ? wsTopPR(it) : undefined })), counts, pending, tagList: WS_TAGS, maxBytes: await wsMaxBytes(env).catch(() => null) });
   }
 
   // ---- a file of an item, through this server (the browser version can't read Discord's files directly)
@@ -2725,22 +3208,27 @@ async function workshopRoutes(request, env, url, ctx) {
     const db = await r2json(env, WS_DB, { items: [] });
     let it = (db.items || []).find((x) => x.id === mi[1] && !x.removed);
     if (!it) fail(404, "That item isn't in the Workshop any more.");
-    if (!it.meta && it.type !== "themes" && env.DISCORD_BOT_TOKEN) {
-      try {
-        const msg = await discordApi(env, "GET", `/channels/${it.channelId}/messages/${it.messageId}`);
-        const names = it.fileNames && it.fileNames.length ? it.fileNames : [it.fileName];
-        const metas = [], hashes = [];
-        for (const a of (msg.attachments || []).filter((x) => names.includes(x.filename)).slice(0, 9)) {
-          if (a.size > 60 * 1048576) continue;
-          const u8 = new Uint8Array(await (await fetch(a.url)).arrayBuffer());
-          metas.push(await wsMeta(it.type, u8)); hashes.push(await bytesHash(u8));
-        }
-        const meta = it.type === "charts" ? { songs: metas.filter(Boolean), locked: false } : (metas[0] || { locked: false });
-        const songIds = it.type === "charts" ? meta.songs.map((x) => x.songId).filter(Boolean) : [];
-        await r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === it.id); if (!x) return false; x.meta = meta; x.hashes = x.hashes || hashes; x.songIds = x.songIds || songIds; it = x; });
-      } catch (e) { console.log("workshop details", e && e.message); }
-    }
+    if (!it.meta && it.type !== "themes" && env.DISCORD_BOT_TOKEN) it = (await wsBackfill(env, it)) || it;
     return reply({ item: { ...wsPublic(it), meta: it.meta || null } });
+  }
+
+  // ---- ask for a verification check (the uploader of a song)
+  mi = path.match(/^\/api\/items\/([a-z0-9]{16,40})\/request-verify$/);
+  if (mi && request.method === "POST") {
+    const who = await signedIn(request, env);
+    let out = null, why = null;
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      const x = (d.items || []).find((y) => y.id === mi[1] && !y.removed);
+      if (!x) { why = "That item isn't in the Workshop any more."; return false; }
+      if (x.creatorId !== who.playerId) { why = "Only the person who shared it can ask for that."; return false; }
+      if (x.type !== "charts") { why = "Only songs can be verified."; return false; }
+      if (x.verified) { why = "It's already verified."; return false; }
+      if (x.verifyRequest && Date.now() - Date.parse(x.verifyRequest.at) < 7 * 86_400_000) { out = x; return false; }
+      x.verifyRequest = { at: new Date().toISOString(), by: who.playerId };
+      out = x;
+    });
+    if (why) fail(400, why);
+    return reply({ ok: true, item: wsPublic(out) });
   }
 
   // ---- verify (Senterra and the official account): OCTIVE vouches for it
@@ -2750,7 +3238,7 @@ async function workshopRoutes(request, env, url, ctx) {
     if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can verify Workshop items.");
     const b = await bodyOf(request);
     let out = null;
-    await r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === mi[1]); if (!x) return false; x.verified = b.verified !== false; out = x; });
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === mi[1]); if (!x) return false; x.verified = b.verified !== false; if (x.verified) delete x.verifyRequest; out = x; });
     if (!out) fail(404, "That item isn't in the Workshop any more.");
     // a verified song's charts get global leaderboards too
     if (out.verified && out.type === "charts") {
@@ -2802,7 +3290,10 @@ async function workshopRoutes(request, env, url, ctx) {
   // ---- upload from the game
   if (path === "/api/upload" && request.method === "POST") {
     if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID) fail(503, "Uploads aren't set up on the server.");
-    const who = await signedIn(request, env);
+    // OCTIVE's own content can also be published by the developer's tools as the official account (with a key
+    // only the server's owner can make); it can only publish OCTIVE content (builtin), nothing else
+    const importer = await officialImporter(request, env);
+    const who = importer || await signedIn(request, env);
     const cfg = config(env);
     await loadModeration(cfg);
     if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
@@ -2811,14 +3302,15 @@ async function workshopRoutes(request, env, url, ctx) {
     const rateKey = `workshop/rate/${who.playerId}.json`;
     const rate = await r2json(env, rateKey, { day, n: 0 });
     if (rate.day !== day) { rate.day = day; rate.n = 0; }
-    const isStaff = badgesOf(who.playerId).some((b) => b === "DEV" || b === "MOD") || who.playerId === OWNER || isOfficial(who.playerId);
-    if (rate.n >= 15 && !isStaff) fail(429, "You've uploaded a lot today. Try again tomorrow.");
+    const limit = await wsDailyLimit(env, who.playerId);
+    if (rate.n >= limit) fail(429, limit === 3 ? "You've shared 3 uploads today (supporters can share 10). Try again tomorrow, or update one you already shared." : `You've shared ${limit} uploads today. Try again tomorrow.`);
 
     const max = await wsMaxBytes(env);
     const len = Number(request.headers.get("Content-Length") || 0);
     if (len > max + 200_000) fail(413, `That's too big: the OCTIVE Discord takes files up to ${Math.floor(max / 1048576)} MB right now.`);
     let form;
     try { form = await request.formData(); } catch { fail(400, "The upload wasn't readable (multipart/form-data expected)."); }
+    if (importer && form.get("builtin") !== "1") fail(403, "The import key only publishes OCTIVE's own content.");
     // one file, or (charts) the songs of one entry: a pack or speed copies, up to 9 songs in one item
     const files = form.getAll("file").filter((f) => f && typeof f !== "string");
     if (!files.length) fail(400, "No file was attached.");
@@ -2834,8 +3326,13 @@ async function workshopRoutes(request, env, url, ctx) {
       total += file.size;
       if (total > max) fail(413, `That's too big: the OCTIVE Discord takes up to ${Math.floor(max / 1048576)} MB in one post right now.`);
       const bytes = new Uint8Array(await file.arrayBuffer());
+      const hash = await bytesHash(bytes);
+      if (parts.some((x) => x.hash === hash)) continue; // the same file twice: once is enough
       const { preview } = await wsInspect(t, bytes);
-      parts.push({ fileName, bytes, preview, hash: await bytesHash(bytes), meta: await wsMeta(t, bytes) });
+      const meta1 = await wsMeta(t, bytes);
+      // the same song twice in one pack (another copy of it): once is enough
+      if (meta1 && meta1.songId && parts.some((x) => x.meta && x.meta.songId === meta1.songId)) continue;
+      parts.push({ fileName, bytes, preview, hash, meta: meta1 });
     }
     if (parts.length > 1 && type !== "charts") fail(400, "Only songs can be shared several at a time.");
     if (parts.length > 9) fail(400, "Share at most 9 songs in one post.");
@@ -2851,7 +3348,11 @@ async function workshopRoutes(request, env, url, ctx) {
     // the same file, or the same song, is only in the Workshop once
     const dbNow = await r2json(env, WS_DB, { items: [] });
     const dup = wsDuplicate(dbNow.items || [], hashes, songIds, null);
-    if (dup) fail(409, `That's already in the Workshop: "${dup.title}" by ${dup.creator}.${dup.creatorId === who.playerId ? " Use the edit button on it to upload a new version." : ""}`);
+    if (dup) {
+      // your own: the game asks whether this is an update of it
+      const mine = dup.creatorId === who.playerId;
+      return reply({ error: `That's already in the Workshop: "${dup.title}" by ${dup.creator}.`, code: "duplicate", duplicateId: dup.id, mine, item: wsPublic(dup) }, 409);
+    }
 
     const clean = (v, n) => String(v || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@\u200b$1").trim().slice(0, n);
     const card = (await publicItems(cfg, who.playerId, ["card"]).catch(() => ({}))).card || {};
@@ -2897,6 +3398,7 @@ async function workshopRoutes(request, env, url, ctx) {
       id, type, title, description, creator, creatorId: who.playerId, fileName, fileNames: parts.map((x) => x.fileName), size: total,
       channelId, messageId: posted.id, guildId: env.DISCORD_GUILD_ID, at: Date.now(), downloads: 0, preview: !!pType,
       hashes, songIds, meta, verified: isOfficial(who.playerId), // the official account's uploads are OCTIVE's own: verified
+      tags: type === "charts" ? wsTags(form.get("tags")) : undefined,
       // OCTIVE's own songs, skins and themes (once built into the game): every player gets them
       builtin: isOfficial(who.playerId) && form.get("builtin") === "1" ? true : undefined,
       originalId: isOfficial(who.playerId) && /^octive[.-][a-z0-9.-]{1,60}$/.test(String(form.get("originalId") || "")) ? String(form.get("originalId")) : undefined,
@@ -3007,23 +3509,32 @@ async function workshopRoutes(request, env, url, ctx) {
     const canCredit = who.playerId === OWNER || isOfficial(who.playerId);
     const creator = canCredit && form.get("creator") != null ? clean(form.get("creator"), 40) || it.creator : it.creator;
     const newCreatorId = canCredit && /^[A-Za-z0-9_-]{8,64}$/.test(String(form.get("creatorId") || "")) ? String(form.get("creatorId")) : it.creatorId;
-    const file = form.get("file");
-    let bytes = null, fileName = it.fileName, preview = null;
-    if (file && typeof file !== "string") {
-      fileName = String(file.name || it.fileName).replace(/[^A-Za-z0-9 ._()\[\]'&+,-]/g, "_").slice(0, 100);
-      const ext = (fileName.match(/\.[A-Za-z]+$/) || [""])[0].toLowerCase();
+    // a new version: one file, or (a pack) all its songs again
+    const upFiles = form.getAll("file").filter((f) => f && typeof f !== "string");
+    const upParts = [];
+    let upTotal = 0;
+    for (const file of upFiles.slice(0, 9)) {
+      const fn = String(file.name || it.fileName).replace(/[^A-Za-z0-9 ._()\[\]'&+,-]/g, "_").slice(0, 100);
+      const ext = (fn.match(/\.[A-Za-z]+$/) || [""])[0].toLowerCase();
       if (WS_TYPES[ext] !== it.type) fail(400, `An update must be the same kind of file (${WS_LABEL[it.type].toLowerCase()}).`);
-      if (file.size > max) fail(413, `That's too big: the OCTIVE Discord takes files up to ${Math.floor(max / 1048576)} MB right now.`);
-      bytes = new Uint8Array(await file.arrayBuffer());
-      ({ preview } = await wsInspect(it.type, bytes));
+      upTotal += file.size;
+      if (upTotal > max) fail(413, `That's too big: the OCTIVE Discord takes files up to ${Math.floor(max / 1048576)} MB right now.`);
+      const b8 = new Uint8Array(await file.arrayBuffer());
+      const h = await bytesHash(b8);
+      if (upParts.some((x) => x.hash === h)) continue;
+      const pv = (await wsInspect(it.type, b8)).preview;
+      const mt = await wsMeta(it.type, b8);
+      if (mt && mt.songId && upParts.some((x) => x.meta && x.meta.songId === mt.songId)) continue;
+      upParts.push({ fileName: fn, bytes: b8, preview: pv, hash: h, meta: mt });
     }
-    // a new version: its details again, and it mustn't be someone else's upload
+    let bytes = upParts.length ? upParts[0].bytes : null, fileName = upParts.length ? upParts[0].fileName : it.fileName, preview = (upParts.find((x) => x.preview) || {}).preview || null;
     let newHash = null, newMeta = null;
-    if (bytes) {
-      newHash = await bytesHash(bytes);
-      newMeta = await wsMeta(it.type, bytes);
-      const sid = it.type === "charts" && newMeta && newMeta.songId ? [newMeta.songId] : [];
-      const dup = wsDuplicate(db.items || [], [newHash], sid, it.id);
+    if (upParts.length) {
+      newHash = upParts[0].hash;
+      newMeta = upParts[0].meta;
+      // it mustn't be someone else's upload
+      const sids = it.type === "charts" ? upParts.map((x) => x.meta && x.meta.songId).filter(Boolean) : [];
+      const dup = wsDuplicate(db.items || [], upParts.map((x) => x.hash), sids, it.id);
       if (dup) fail(409, `That file is already in the Workshop: "${dup.title}" by ${dup.creator}.`);
     }
     // a few updates a day per player (they count with uploads)
@@ -3031,11 +3542,12 @@ async function workshopRoutes(request, env, url, ctx) {
     const rateKey = `workshop/rate/${who.playerId}.json`;
     const rate = await r2json(env, rateKey, { day, n: 0 });
     if (rate.day !== day) { rate.day = day; rate.n = 0; }
-    if (rate.n >= 30 && !staff) fail(429, "You've shared and updated a lot today. Try again tomorrow.");
+    rate.u = rate.u || 0;
+    if (rate.u >= 30 && !staff) fail(429, "You've updated a lot today. Try again tomorrow.");
 
     let creatorDiscord = null;
     try { const rec = await record(env, newCreatorId); creatorDiscord = rec.discord?.id || null; } catch { /* not linked */ }
-    const size = bytes ? bytes.length : it.size;
+    const size = upParts.length ? upTotal : it.size;
     const version = (it.version || 1) + (bytes ? 1 : 0);
     const pType = preview ? imageType(preview) : null;
     const hasOldPreview = !bytes && it.preview;
@@ -3045,8 +3557,8 @@ async function workshopRoutes(request, env, url, ctx) {
       author: { name: `by ${creator}`, url: `${SITE}#/u/${encodeURIComponent(newCreatorId)}` },
       fields: [
         ...(creatorDiscord ? [{ name: "Made by", value: `<@${creatorDiscord}>`, inline: true }] : []),
-        { name: "File", value: `${fileName} · ${(size / 1048576).toFixed(size < 1048576 ? 2 : 1)} MB`, inline: true },
-        { name: "Get it", value: `Download the file above, or [open it in OCTIVE](${SITE}#/open/workshop/${it.id})`, inline: true },
+        { name: upParts.length > 1 ? "Files" : "File", value: (upParts.length > 1 ? `${upParts.length} songs` : fileName) + ` · ${(size / 1048576).toFixed(size < 1048576 ? 2 : 1)} MB`, inline: true },
+        { name: "Get it", value: `Download the file${upParts.length > 1 ? "s" : ""} above, or [open it in OCTIVE](${SITE}#/open/workshop/${it.id})`, inline: true },
         { name: "Updated", value: `<t:${Math.floor(Date.now() / 1000)}:R>${version > 1 ? ` · version ${version}` : ""}`, inline: true },
       ],
       footer: { text: `Shared from OCTIVE · ${it.id}` },
@@ -3059,10 +3571,10 @@ async function workshopRoutes(request, env, url, ctx) {
       const fd = new FormData();
       fd.append("payload_json", JSON.stringify({
         embeds: [embed], allowed_mentions: { parse: [] },
-        attachments: [{ id: 0, filename: fileName }, ...(pType ? [{ id: 1, filename: `preview.${pType}` }] : [])],
+        attachments: [...upParts.map((x, k) => ({ id: k, filename: x.fileName })), ...(pType ? [{ id: upParts.length, filename: `preview.${pType}` }] : [])],
       }));
-      fd.append("files[0]", new Blob([bytes], { type: "application/octet-stream" }), fileName);
-      if (pType) fd.append("files[1]", new Blob([preview], { type: pType === "png" ? "image/png" : "image/jpeg" }), `preview.${pType}`);
+      upParts.forEach((x, k) => fd.append(`files[${k}]`, new Blob([x.bytes], { type: "application/octet-stream" }), x.fileName));
+      if (pType) fd.append(`files[${upParts.length}]`, new Blob([preview], { type: pType === "png" ? "image/png" : "image/jpeg" }), `preview.${pType}`);
       try { patched = await discordApi(env, "PATCH", `/channels/${it.channelId}/messages/${it.messageId}`, fd, true); }
       catch (e) { if (e.status === 413) fail(413, "Discord refused the file: it's too big for the server right now."); if (e.status === 404) fail(404, "That item's post was removed from Discord."); throw e; }
     } else {
@@ -3082,14 +3594,15 @@ async function workshopRoutes(request, env, url, ctx) {
       x.title = title; x.description = description; x.fileName = fileName; x.size = size; x.updatedAt = Date.now(); x.version = version;
       x.creator = creator; x.creatorId = newCreatorId;
       if (newHash) {
-        x.hashes = [newHash]; x.fileNames = [fileName];
-        x.meta = it.type === "charts" ? { songs: newMeta ? [newMeta] : [], locked: false } : (newMeta || { locked: false });
-        x.songIds = it.type === "charts" && newMeta && newMeta.songId ? [newMeta.songId] : [];
+        x.hashes = upParts.map((y) => y.hash); x.fileNames = upParts.map((y) => y.fileName);
+        x.meta = it.type === "charts" ? { songs: upParts.map((y) => y.meta).filter(Boolean), locked: false } : (newMeta || { locked: false });
+        x.songIds = it.type === "charts" ? upParts.map((y) => y.meta && y.meta.songId).filter(Boolean) : [];
       }
+      if (form.get("tags") != null && it.type === "charts") x.tags = wsTags(form.get("tags"));
       if (pType) x.preview = true;
       out = x;
     });
-    rate.n += 1;
+    rate.u += 1;
     await r2put(env, rateKey, rate);
     return reply({ ok: true, item: wsPublic(out || it), edited: !!patched });
   }
@@ -3345,7 +3858,7 @@ async function linkSig(env, file, exp) {
 async function testLinks(request, env) {
   try {
     if (!(await isTester(request, env))) return reply({ error: "Test builds are for testers." }, 403);
-  } catch (e) { return reply({ error: e.expose ? e.message : "Sign in first." }, e.status || 401); }
+  } catch (e) { return reply({ error: e.expose ? e.message : "Sign in first.", code: e.code || undefined }, e.status || 401); }
   const m = await r2json(env, "test.json", null);
   if (!m) return reply({ test: null });
   const exp = Math.floor(Date.now() / 1000) + 2 * 3600;
@@ -3370,7 +3883,7 @@ async function testRelease(request, env, key) {
   }
   try {
     if (!(await isTester(request, env))) return reply({ error: "Test builds are for testers." }, 403);
-  } catch (e) { return reply({ error: e.expose ? e.message : "Sign in first." }, e.status || 401); }
+  } catch (e) { return reply({ error: e.expose ? e.message : "Sign in first.", code: e.code || undefined }, e.status || 401); }
   const res = await release(env, key, request);
   const h = new Headers(res.headers);
   h.set("Cache-Control", "private, no-store");
@@ -3380,7 +3893,8 @@ async function testRelease(request, env, key) {
 export default {
   // every 6 hours: who still boosts the Discord server (wrangler.toml [triggers] crons)
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(Promise.all([refreshBoosters(env).catch((e) => console.log("boosters", e && e.message)), cleanDmFiles(env).catch((e) => console.log("dm files", e && e.message))]));
+    ctx.waitUntil(Promise.all([refreshBoosters(env).catch((e) => console.log("boosters", e && e.message)), cleanDmFiles(env).catch((e) => console.log("dm files", e && e.message)),
+      r2json(env, WS_DB, { items: [] }).then((db) => wsBackfillSome(env, (db.items || []).filter((it) => !it.removed && !it.meta && it.type !== "themes").slice(0, 25))).catch((e) => console.log("workshop details", e && e.message))]));
   },
 
   async fetch(request, env, ctx) {

@@ -711,13 +711,38 @@
   const WS_TYPES = [["charts", "Charts"], ["skins", "Skins"], ["themes", "Themes"], ["styles", "Styles"]];
   const WS_LABEL = { charts: "Chart", skins: "Skin", themes: "Theme", styles: "Style" };
   let wsType = "charts", wsSort = "new", wsQuery = ""; let wsVerified = "", wsCustom = false;
+  // every Workshop filter (the same as the game's Filters panel)
+  const wsF = { builtin: false, by: "", charter: "", keys: new Set(), minStars: "", maxStars: "", tags: new Set() };
+  const WS_TAGS = [["stream", "Stream"], ["jumpstream", "Jumpstream"], ["handstream", "Handstream"], ["chordjack", "Chordjack"], ["jacks", "Jacks"], ["speedjack", "Speedjack"],
+    ["technical", "Technical"], ["ln", "LN (long notes)"], ["hybrid", "Hybrid"], ["sv", "SV"], ["stamina", "Stamina"], ["speed", "Speed"], ["dump", "Dump"],
+    ["trills", "Trills"], ["vibro", "Vibro"], ["gimmick", "Gimmick"], ["fnf", "FNF"], ["osu", "osu! map"], ["pack", "Pack"], ["easy", "Beginner friendly"], ["marathon", "Marathon"]];
+  const wsTagName = (t) => (WS_TAGS.find((x) => x[0] === t) || [, t])[1];
+  function wsQueryString() {
+    const q = [`type=${wsType}`, `sort=${wsSort}`];
+    if (wsQuery) q.push("q=" + encodeURIComponent(wsQuery));
+    if (wsVerified && wsType === "charts") q.push("verified=" + wsVerified);
+    if (wsCustom && (wsType === "skins" || wsType === "styles")) q.push("customizable=1");
+    if (wsF.builtin) q.push("builtin=1");
+    if (wsF.by) q.push("by=" + encodeURIComponent(wsF.by));
+    if (wsType === "charts") {
+      if (wsF.charter) q.push("charter=" + encodeURIComponent(wsF.charter));
+      if (wsF.keys.size) q.push("keys=" + [...wsF.keys].sort((a, b) => a - b).join(","));
+      if (Number(wsF.minStars) > 0) q.push("minStars=" + Number(wsF.minStars));
+      if (Number(wsF.maxStars) > 0) q.push("maxStars=" + Number(wsF.maxStars));
+      if (wsF.tags.size) q.push("tags=" + [...wsF.tags].join(","));
+    }
+    return q.join("&");
+  }
+  const wsActive = () => (wsVerified && wsType === "charts" ? 1 : 0) + (wsCustom && (wsType === "skins" || wsType === "styles") ? 1 : 0) + (wsF.builtin ? 1 : 0) + (wsF.by ? 1 : 0)
+    + (wsType === "charts" ? (wsF.charter ? 1 : 0) + (wsF.keys.size ? 1 : 0) + (Number(wsF.minStars) > 0 || Number(wsF.maxStars) > 0 ? 1 : 0) + (wsF.tags.size ? 1 : 0) : 0);
 
   function workshopCard(it) {
     const pic = h("div.ws-pic" + (it.type === "skins" || it.type === "styles" ? ".contain" : ""));
     if (it.preview) { const img = h("img", { src: it.preview, alt: "", loading: "lazy" }); img.onerror = () => img.remove(); pic.append(img); }
     else pic.append(h("span.ws-type", { text: WS_LABEL[it.type] || "" }));
     const kb = it.size / 1048576;
-    if (it.verified) pic.append(h("span.ws-verified", { text: "✓ VERIFIED", title: "Verified by OCTIVE" }));
+    if (it.verified && it.type === "charts") pic.append(h("span.ws-verified", { text: "✓ VERIFIED", title: "Verified by OCTIVE: global leaderboards and full PR" }));
+    if (it.type === "charts" && it.topStars > 0) pic.append(h("span.ws-stars", { text: "★ " + it.topStars.toFixed(2), style: `background:${starColor(it.topStars)}` }));
     if (it.customizable && (it.type === "skins" || it.type === "styles")) pic.append(h("span.ws-custom", { text: "CUSTOMIZABLE", title: "Its maker allows changes" }));
     pic.addEventListener("click", () => { location.hash = "#/workshop/" + it.id; });
     pic.title = "Details";
@@ -727,6 +752,10 @@
         h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
         h("h3", {}, h("a", { href: "#/workshop/" + it.id, text: it.title, title: it.title })),
         h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
+        it.type === "charts" ? h("p.ws-facts", {},
+          it.topPR > 0 ? h("b", { text: `${fmt0.format(Math.round(it.verified ? it.topPR : it.topPR / 3))} PR`, title: it.verified ? "The most PR its hardest difficulty gives" : "Not verified: a third of the PR a verified song gives" }) : null,
+          (it.keys || []).length ? h("span", { text: (it.topPR > 0 ? " · " : "") + it.keys.map((k) => k + "K").join(" ") }) : null) : null,
+        (it.tags || []).length ? h("div.ws-tags", {}, it.tags.slice(0, 4).map((t) => h("span.ws-tag", { text: wsTagName(t) }))) : null,
         h("p.ws-desc", { text: it.description || "", title: it.description || undefined }),
         h("span.ws-meta", { text: `${kb.toFixed(kb < 1 ? 2 : 1)} MB · ${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"} · ${new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })}` }),
         h("div.ws-actions", {},
@@ -775,45 +804,81 @@
     const grid = h("div.ws-grid", {}, h("p.empty", { text: "Loading…" }));
     const status = h("p.ws-status");
     const search = h("input.help-search.ws-search", { type: "search", placeholder: "Search titles and creators…", value: wsQuery });
-    const sort = h("select.ws-sort", {}, h("option", { value: "new", text: "Newest" }), h("option", { value: "popular", text: "Most downloaded" }));
+    const sort = h("select.ws-sort", {}, h("option", { value: "new", text: "Newest" }), h("option", { value: "popular", text: "Most downloaded" }),
+      h("option", { value: "hardest", text: "Stars: highest" }), h("option", { value: "easiest", text: "Stars: lowest" }), h("option", { value: "pr", text: "Most PR" }),
+      h("option", { value: "title", text: "Title (A–Z)" }), h("option", { value: "oldest", text: "Oldest" }));
     sort.value = wsSort;
-    const verSel = h("select.ws-sort", {}, h("option", { value: "", text: "Everything" }), h("option", { value: "1", text: "✓ Verified" }), h("option", { value: "0", text: "Not verified" }));
-    verSel.value = wsVerified;
-    const customBox = h("input", { type: "checkbox" }); customBox.checked = wsCustom;
-    const customLbl = h("label.ws-custom-filter", { title: "Only skins and styles their makers allow you to change" }, customBox, " Customizable");
+    const filterBtn = h("button.btn.small.ws-filter-btn", { type: "button" }, "Filters");
+    const panel = h("div.ws-filters");
+    panel.hidden = wsActive() === 0;
+    filterBtn.addEventListener("click", () => { panel.hidden = !panel.hidden; paintFilters(); });
+    let typed = null;
+    const later = () => { clearTimeout(typed); typed = setTimeout(load, 350); };
+    function chip(text, on, click, title) { const b = h("button.ws-chip" + (on ? ".on" : ""), { type: "button", title }, text); b.addEventListener("click", click); return b; }
+    function line(caption, ...kids) { return h("div.ws-fline", {}, h("span.ws-fcap", { text: caption }), h("div.ws-fkids", {}, ...kids)); }
+    function paintFilters() {
+      const n = wsActive();
+      filterBtn.textContent = n ? `Filters (${n})` : "Filters";
+      if (panel.hidden) return;
+      const changed = () => { paintFilters(); load(); };
+      const rows = [];
+      const show = [];
+      if (wsType === "charts") show.push(chip("Everything", !wsVerified, () => { wsVerified = ""; changed(); }), chip("✓ Verified", wsVerified === "1", () => { wsVerified = "1"; changed(); }, "Checked by OCTIVE: global leaderboards and full PR"), chip("Not verified", wsVerified === "0", () => { wsVerified = "0"; changed(); }));
+      show.push(chip("OCTIVE's own", wsF.builtin, () => { wsF.builtin = !wsF.builtin; changed(); }, "OCTIVE's official songs, skins and themes"));
+      if (wsType === "skins" || wsType === "styles") show.push(chip("Customizable", wsCustom, () => { wsCustom = !wsCustom; changed(); }, "Only ones their makers allow you to change"));
+      rows.push(line("show", ...show));
+      const by = h("input.ws-ftext", { type: "search", placeholder: "Type a player's name", value: wsF.by });
+      by.addEventListener("input", () => { wsF.by = by.value.trim(); filterBtn.textContent = wsActive() ? `Filters (${wsActive()})` : "Filters"; later(); });
+      rows.push(line("uploaded by", by));
+      if (wsType === "charts") {
+        const ch = h("input.ws-ftext", { type: "search", placeholder: "Type a charter's name", value: wsF.charter });
+        ch.addEventListener("input", () => { wsF.charter = ch.value.trim(); filterBtn.textContent = wsActive() ? `Filters (${wsActive()})` : "Filters"; later(); });
+        rows.push(line("charter", ch));
+        rows.push(line("keys", ...[4, 5, 6, 7, 8, 9, 10].map((k) => chip(k + "K", wsF.keys.has(k), () => { wsF.keys.has(k) ? wsF.keys.delete(k) : wsF.keys.add(k); changed(); }))));
+        const mn = h("input.ws-ftext.short", { type: "number", min: 0, max: 99, step: 0.1, placeholder: "from ★", value: wsF.minStars });
+        const mx = h("input.ws-ftext.short", { type: "number", min: 0, max: 99, step: 0.1, placeholder: "up to ★", value: wsF.maxStars });
+        mn.addEventListener("input", () => { wsF.minStars = mn.value; later(); });
+        mx.addEventListener("input", () => { wsF.maxStars = mx.value; later(); });
+        rows.push(line("stars", mn, h("span.ws-to", { text: "to" }), mx));
+        rows.push(line("tags", ...WS_TAGS.map(([id, name]) => chip(name, wsF.tags.has(id), () => { wsF.tags.has(id) ? wsF.tags.delete(id) : wsF.tags.add(id); changed(); }))));
+      }
+      const clear = h("button.btn.ghost.small", { type: "button" }, "Clear filters");
+      clear.addEventListener("click", () => { wsVerified = ""; wsCustom = false; wsF.builtin = false; wsF.by = ""; wsF.charter = ""; wsF.keys.clear(); wsF.minStars = ""; wsF.maxStars = ""; wsF.tags.clear(); changed(); });
+      panel.replaceChildren(...rows, h("div.ws-fend", {}, clear));
+    }
     let counts = {};
     const paintTabs = () => tabs.replaceChildren(...WS_TYPES.map(([id, name]) => {
       const b = h("button.ws-tab" + (id === wsType ? ".on" : ""), { type: "button" }, name, counts[id] ? h("span.ws-count", { text: String(counts[id]) }) : null);
-      b.addEventListener("click", () => { wsType = id; paintTabs(); load(); });
+      b.addEventListener("click", () => { wsType = id; paintTabs(); paintFilters(); load(); });
       return b;
     }));
-    const paintCustom = () => { customLbl.hidden = !(wsType === "skins" || wsType === "styles"); };
     let gen = 0;
-    const load = () => {
+    function load() {
       const g = ++gen;
       status.textContent = "Loading…";
-      paintCustom();
-      fetch(`${worker}/api/items?type=${wsType}&sort=${wsSort}${wsQuery ? "&q=" + encodeURIComponent(wsQuery) : ""}${wsVerified ? "&verified=" + wsVerified : ""}${wsCustom && (wsType === "skins" || wsType === "styles") ? "&customizable=1" : ""}`, { cache: "no-cache" })
+      fetch(`${worker}/api/items?${wsQueryString()}`, { cache: "no-cache" })
         .then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
           if (g !== gen || !grid.isConnected) return;
           if (!d) { status.textContent = "The Workshop can't be reached right now."; grid.replaceChildren(); return; }
           counts = d.counts || {}; paintTabs();
           const what = (WS_TYPES.find((t) => t[0] === wsType) || [, "items"])[1].toLowerCase();
-          status.textContent = d.items.length ? `${d.items.length} ${what}` : (wsQuery ? `No ${what} match "${wsQuery}".` : `No ${what} shared yet.`);
+          const n = wsActive();
+          status.textContent = d.items.length ? `${d.items.length} ${what}${n ? ` · ${n} filter${n === 1 ? "" : "s"} on` : ""}${d.pending ? ` · ${d.pending} older upload${d.pending === 1 ? " is" : "s are"} still being read for these filters` : ""}`
+            : (wsQuery ? `No ${what} match "${wsQuery}".` : n ? `No ${what} match these filters.` : `No ${what} shared yet.`);
           grid.replaceChildren(...d.items.map(workshopCard));
         });
-    };
+    }
     let t = null;
     search.addEventListener("input", () => { wsQuery = search.value.trim(); clearTimeout(t); t = setTimeout(load, 250); });
     sort.addEventListener("change", () => { wsSort = sort.value; load(); });
-    verSel.addEventListener("change", () => { wsVerified = verSel.value; load(); });
-    customBox.addEventListener("change", () => { wsCustom = customBox.checked; load(); });
+
     app.replaceChildren(h("div.ws-page", {},
       h("section.page-head", {}, h("h1", { text: "Workshop" }),
         h("p.sub", { text: "Charts, skins, themes and styles made by players. Download them here and open them with OCTIVE, or get them in the game (Play → Workshop). To share yours, use Share in the game: it's posted in the OCTIVE Discord too." })),
-      h("div.ws-bar", {}, tabs, h("div.ws-tools", {}, search, sort, verSel, customLbl)),
-      status, grid));
+      h("div.ws-bar", {}, tabs, h("div.ws-tools", {}, search, sort, filterBtn)),
+      panel, status, grid));
     paintTabs();
+    paintFilters();
     load();
   }
 
@@ -1662,6 +1727,7 @@
       ["Profile effects", "Sparkles, snow, hearts, embers, stars, aurora or rain over your profile card."],
       ["Animated picture", "A GIF profile picture (up to 8 MB) that's animated everywhere it shows."],
       ["Name changes any time", "No waiting between name changes."],
+      ["More Workshop uploads", "Share 10 songs, packs, skins, themes or styles to the Workshop a day (3 without supporter)."],
       ["Leaderboard border", "A pink supporter border on your leaderboard rows."],
       ["Lifetime statistics", "Your total time supporting shows on your profile and never resets, even with gaps."],
     ];
