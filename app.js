@@ -79,7 +79,7 @@
     data.error = error || data.error;
     data.players = (data.players || []).slice().sort((a, b) => a.rank - b.rank);
     // avatars come from the Worker (by picture version) or from the avatars folder
-    for (const p of data.players)
+    for (const p of data.official ? [...data.players, data.official] : data.players) // the official account isn't ranked
       if (worker && p.avatarHash) p.avatar = `${worker}/avatar/${encodeURIComponent(p.id)}?v=${encodeURIComponent(p.avatarHash)}`;
     if (data.updated) {
       const when = new Date(data.updated);
@@ -738,7 +738,7 @@
     setTimeout(() => {
       window.removeEventListener("blur", away);
       if (left || document.hidden) return;
-      const note = h("div.open-hint", {}, h("b", { text: "Didn't open?" }), " Open in OCTIVE needs OCTIVE for Windows installed (version 1.5 or newer). ",
+      const note = h("div.open-hint", {}, h("b", { text: "Didn't open?" }), " Open in OCTIVE needs OCTIVE 1.5 or newer installed on Windows or Android. ",
         h("a", { href: "#/download" }, "Download OCTIVE"), h("button.btn.ghost.small", { type: "button", onclick: () => note.remove() }, "OK"));
       document.querySelector(".open-hint")?.remove();
       document.body.append(note);
@@ -1972,6 +1972,7 @@
       ["How is PR worked out?", "Like osu!mania: each chart has a star rating, and a play's PR grows with the stars and needs high accuracy (osu!mania accuracy: Marvelous 320, Perfect 300, Great 200, Good 100, Bad 50). Your total is your best plays, each worth 95% of the one before, plus a small bonus for the number of charts played."],
       ["Why did my PR change?", "Version 1.3.3 reworked PR: vibro and spam charts are rated more fairly and accuracy counts more. Your past plays were recalculated the first time you opened the new version."],
       ["What do mods do?", "Pick them in Song Select (Mods, or F1). Easy widens the timing windows (PP ×0.5), Hard Rock tightens them (PP ×1.1), Hidden and Fade In hide the notes in different ways (PP ×1.06), Half Time and Double Time change the song speed (the stars are worked out at that speed), and Mirror flips the chart."],
+      ["Can I change the speed without changing the pitch?", "Yes. In Song Select → Mods, turn off Pitch shift under the song speed: the song then keeps its own pitch at any speed (it takes a moment to prepare when the play starts). On, faster songs sound higher, like osu!'s Nightcore. The chart editor has the same switch next to its speed menu."],
       ["Which charts give PR?", "Every chart you finish, built-in or imported. OCTIVE Official charts also have an online leaderboard per chart."],
     ]],
     ["Multiplayer and friends", [
@@ -1988,6 +1989,8 @@
       ["How do I share something?", "Sign in, then in the game: Play → Workshop → Share, and pick a chart from your list, or use Share to the Workshop in Settings → Style for your skin, theme or whole style. Add a title and a description; a preview picture is made for you."],
       ["Can I try a skin before getting it?", "Yes. Click a skin, theme or style in the Workshop to preview it: skins play live with the song that's on, themes show the menus, and styles have pages for each part. Previews are only kept until you close OCTIVE."],
       ["How do I remove my upload?", "The bin button on your own card in the Workshop removes it from the Workshop and deletes its post in the OCTIVE Discord. Moderators can remove uploads that break the rules."],
+      ["What does Open in OCTIVE do?", "On a Workshop item on this website (or in its Discord post), Open in OCTIVE starts OCTIVE (or switches to it if it's already open), opens the Workshop and downloads that item for you. It works with OCTIVE 1.5 or newer on Windows and Android."],
+      ["Can I update something I shared?", "Yes. The edit button on your own card in the Workshop changes its title or description, or uploads a new version. The post in the OCTIVE Discord is updated in place, and everyone who gets it afterwards gets the new version."],
       ["How big can a file be?", "As big as the OCTIVE Discord allows right now (it depends on the server's boost level; usually 50 MB)."],
     ]],
     ["Discord", [

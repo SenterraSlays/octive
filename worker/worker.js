@@ -243,7 +243,11 @@ async function officialStatus(env) {
 async function officialProfile(env) {
   try {
     const p = await profileOf(env, OFFICIAL_ID);
-    return p ? { ...p, rank: 0, official: true } : null;
+    if (!p) return null;
+    // the official account has every achievement (secret ones too)
+    const all = {};
+    for (const d of await achievementDefs()) all[d.id] = (p.achievements && p.achievements[d.id]) || "2026-11-12T00:00:00Z";
+    return { ...p, rank: 0, official: true, achievements: all };
   } catch { return null; }
 }
 
