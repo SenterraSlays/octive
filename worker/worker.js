@@ -2290,9 +2290,9 @@ async function dmRoutes(request, env, url) {
     // the receiver's own friend list decides; before their game uploaded it, the sender's does
     const friendly = theirs.synced ? (theirs.friends || []).some((f) => f.id === me) : (mine.friends || []).some((f) => f.id === to);
     if (!friendly) fail(403, "You can only message your friends.");
-    const kind = b.kind === "replay" ? "replay" : "chat";
-    const data = kind === "replay" && /^[a-f0-9]{32}$/.test(String(b.data || "")) ? String(b.data) : undefined;
-    if (kind === "replay" && !data) fail(400, "That replay wasn't uploaded.");
+    const kind = b.kind === "replay" ? "replay" : b.kind === "file" ? "file" : "chat";
+    const data = kind !== "chat" && /^[a-f0-9]{32}$/.test(String(b.data || "")) ? String(b.data) : undefined;
+    if (kind !== "chat" && !data) fail(400, kind === "replay" ? "That replay wasn't uploaded." : "That file wasn't uploaded.");
     const msg = { id, from: me, text, at: now, ...(kind !== "chat" ? { kind, data } : {}) };
     let dup = false;
     await r2update(env, dmThreadKey(me, to), () => ({ msgs: [] }), (t) => {
@@ -2304,7 +2304,7 @@ async function dmRoutes(request, env, url) {
     if (!dup) {
       const myName = mine.name || dmName(b.name) || who.username || "Player";
       const theirName = theirs.name || (mine.friends || []).find((f) => f.id === to)?.name || "Player";
-      const preview = (kind === "replay" ? "🎬 " : "") + text.slice(0, 140);
+      const preview = (kind === "replay" ? "🎬 " : kind === "file" ? "🎨 " : "") + text.slice(0, 140);
       await Promise.all([
         r2update(env, dmInboxKey(to), dmEmptyInbox, (box) => {
           box.threads = box.threads || {};
