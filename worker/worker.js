@@ -33,6 +33,14 @@ const BADGE_ORDER = ["DEV", "MOD", "CREATOR", "CHARTER", "VIP", "TESTER"];
 const SOCIAL_KEYS = ["youtube", "twitch", "tiktok", "x", "instagram", "bluesky", "discord", "website"];
 
 /** Every badge of a player, most important first (DEV is built in; others come from the developers' list). */
+/** The check beside a name: "official" (OCTIVE's own accounts), "verified" (known people) or null. */
+function checkOf(id) {
+  const granted = moderation.badges[id] || [];
+  if (id === "o2quUJmLzZujIpPomajHJ7oW07aI" || granted.includes("OFFICIAL")) return "official";
+  if (DEVELOPERS.includes(id) || granted.includes("VERIFIED")) return "verified";
+  return null;
+}
+
 function badgesOf(id) {
   const list = DEVELOPERS.includes(id) ? ["DEV"] : [];
   const granted = moderation.badges[id] || (moderation.roles[id] ? [moderation.roles[id]] : []);
@@ -123,7 +131,7 @@ async function buildBoard(env) {
   const page = await api(`${cfg.scores}?offset=0&limit=${TOP + 10}`, cfg.auth);
   if (!page) throw new Error(`Leaderboard "${LEADERBOARD}" not found: create it in the Unity dashboard.`);
   await loadModeration(cfg);
-  const entries = (page.results ?? []).filter((e) => !moderation.bans[e.playerId]).slice(0, TOP);
+  const entries = (page.results ?? []).filter((e) => !moderation.bans[e.playerId] && !isOfficial(e.playerId)).slice(0, TOP);
   const now = Date.now();
 
   const stale = entries.map((e) => e.playerId)
@@ -165,7 +173,7 @@ async function buildBoard(env) {
       achievements: card.achievements && typeof card.achievements === "object" ? card.achievements : {},
       devFriend: !!card.devFriend,
       role: DEVELOPERS.includes(e.playerId) ? "DEV" : (badgesOf(e.playerId)[0] || moderation.roles[e.playerId] || null),
-      badges: badgesOf(e.playerId),
+      badges: badgesOf(e.playerId), check: checkOf(e.playerId),
       socials: badgesOf(e.playerId).includes("CREATOR") ? socialsOf(card) : {},
       online: seen > 0 && now - seen < ONLINE_MS,
       lastSeen: seen > 0 ? new Date(seen).toISOString() : null,
@@ -180,6 +188,10 @@ async function buildBoard(env) {
   players.forEach((p, i) => { p.rank = i + 1; });
   return { updated: new Date(now).toISOString(), leaderboard: LEADERBOARD, total: players.length, online: players.filter((p) => p.online).length, players };
 }
+
+// the official OCTIVE account: never ranked, can message anyone (and anyone can answer it), level 1000
+const OFFICIAL_ID = "o2quUJmLzZujIpPomajHJ7oW07aI";
+const isOfficial = (id) => id === OFFICIAL_ID;
 
 async function leaderboard(env) {
   if (board && Date.now() - boardAt < BOARD_TTL) return board;
@@ -461,6 +473,7 @@ async function me(env, who) {
     username: who.username,
     name: ov.name || card?.name || who.username,
     hasCard: !!card,
+    check: checkOf(who.playerId),
     card: card ? {
       pp: card.pp ?? 0, accuracy: card.accuracy ?? 0, level: card.level ?? 1, levelProgress: card.levelProgress ?? 0,
       totalScore: card.totalScore ?? 0, xp: card.xp ?? 0, playCount: card.playCount ?? 0, fullCombos: card.fullCombos ?? 0,
@@ -820,9 +833,9 @@ async function profileOf(env, playerId) {
   const ov = moderation.overrides[playerId] || {};
   return {
     id: playerId, rank: card.rank || 0, pp: card.pp || 0, name: ov.name || card.name || "Player", accuracy: card.accuracy || 0,
-    level: card.level || 1, levelProgress: card.levelProgress || 0, playCount: card.playCount || 0, maxCombo: card.maxCombo || 0,
+    level: isOfficial(playerId) ? 1000 : card.level || 1, levelProgress: isOfficial(playerId) ? 1 : card.levelProgress || 0, playCount: card.playCount || 0, maxCombo: card.maxCombo || 0,
     fullCombos: card.fullCombos || 0, playTimeMs: card.playTimeMs || 0, totalScore: card.totalScore || 0, bio: card.bio || "", achievements: card.achievements || {},
-    badges: badgesOf(playerId), online: seen > 0 && Date.now() - seen < ONLINE_MS, lastSeen: seen ? new Date(seen).toISOString() : null,
+    badges: badgesOf(playerId), check: checkOf(playerId), online: seen > 0 && Date.now() - seen < ONLINE_MS, lastSeen: seen ? new Date(seen).toISOString() : null,
     platform: items.platform || "", status: seen > 0 && Date.now() - seen < ONLINE_MS ? platformStatus(items.platform) : null,
     avatarHash: ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : (card.avatar || ""),
   };
@@ -1234,7 +1247,7 @@ async function discordCommand(env, it) {
       }
       const rec = await record(env, c.playerId);
       if (rec.discord && rec.discord.id !== user.id) await env.RELEASES.delete(`discord/${rec.discord.id}.json`);
-      rec.discord = { id: user.id, name: user.global_name || user.username || "", at: new Date().toISOString() };
+      rec.discord = { id: user.id, name: user.global_name || user.username || "", username: user.username || "", at: new Date().toISOString() };
       if (env.DISCORD_GUILD_ID && it.guild_id === env.DISCORD_GUILD_ID && it.member) await setBooster(env, c.playerId, user.id, it.member.premium_since || null);
       await saveRecord(env, c.playerId, rec);
       await env.RELEASES.put(`discord/${user.id}.json`, JSON.stringify({ playerId: c.playerId, at: rec.discord.at }), { httpMetadata: { contentType: "application/json" } });
@@ -1377,7 +1390,7 @@ async function chartScores(request, env, url) {
     if (Date.now() - boardAt > BOARD_TTL) { try { await loadModeration(config(env)); } catch { /* keep */ } }
     let sup = {};
     try { sup = await supporters(env); } catch { /* none */ }
-    const entries = data.entries.filter((e) => !moderation.bans[e.playerId]).slice(0, 50).map((e, i) => ({ ...e, rank: i + 1, supporter: !!sup[e.playerId]?.active }));
+    const entries = data.entries.filter((e) => !moderation.bans[e.playerId] && !isOfficial(e.playerId)).slice(0, 50).map((e, i) => ({ ...e, rank: i + 1, supporter: !!sup[e.playerId]?.active }));
     return reply({ official: true, entries, total: data.entries.length });
   }
   if (url.pathname === "/scores/submit") {
@@ -1978,9 +1991,19 @@ async function supportRoutes(request, env, url, ctx) {
     if (h.startsWith("Bearer ")) { try { const who = await signedIn(request, env); youFollow = (await followingOf(env, who.playerId)).includes(id); } catch { /* signed out */ } }
     let friends = null;
     try { friends = ((await r2json(env, dmInboxKey(id), dmEmptyInbox())).friends || []).length; } catch { /* none */ }
-    let discord = null;
-    try { const rec = await record(env, id); if (rec.discord?.id && rec.discordPrefs?.show) discord = rec.discord.name || null; } catch { /* none */ }
-    return reply({ following, followers, friends, youFollow, owner: OWNER, discord });
+    let discord = null, discordUser = null;
+    try {
+      const rec = await record(env, id);
+      if (rec.discord?.id && rec.discordPrefs?.show) {
+        discord = rec.discord.name || null;
+        // the username (what people type to add them); links made before 1.5 get it from Discord once
+        if (!rec.discord.username && env.DISCORD_BOT_TOKEN) {
+          try { const u = await discordApi(env, "GET", `/users/${rec.discord.id}`); if (u && u.username) { rec.discord.username = u.username; await saveRecord(env, id, rec); } } catch { /* later */ }
+        }
+        discordUser = rec.discord.username || null;
+      }
+    } catch { /* none */ }
+    return reply({ following, followers, friends, youFollow, owner: OWNER, discord, discordUser });
   }
   if (path === "/follow") {
     const b = await bodyOf(request);
@@ -2087,7 +2110,7 @@ async function chatIdentity(cfg, playerId, fallbackName) {
   const ov = moderation.overrides[playerId] || {};
   const name = String(ov.name || card.name || fallbackName || "Player").slice(0, 40);
   const avatarHash = ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : String(card.avatar || "");
-  return { id: playerId, name, badges: badgesOf(playerId), avatar: avatarHash ? `${WORKER_BASE}/avatar/${encodeURIComponent(playerId)}?v=${encodeURIComponent(avatarHash)}` : null };
+  return { id: playerId, name, badges: badgesOf(playerId), check: checkOf(playerId), avatar: avatarHash ? `${WORKER_BASE}/avatar/${encodeURIComponent(playerId)}?v=${encodeURIComponent(avatarHash)}` : null };
 }
 
 /** Discord markdown as plain text (bold, code, timestamps, custom emoji). */
@@ -2266,6 +2289,17 @@ async function discordApi(env, method, path, body, isForm) {
   try { data = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
   if (!res.ok) { const e = new Error(`Discord ${res.status}: ${(data && data.message) || text.slice(0, 200)}`); e.status = res.status; throw e; }
   return data;
+}
+
+const scoreShareAt = new Map();
+let scoresChannel = null, scoresChannelAt = 0;
+/** #octive-scores, found by name (cached 10 minutes). */
+async function scoresChannelId(env) {
+  if (scoresChannel && Date.now() - scoresChannelAt < 600_000) return scoresChannel;
+  const list = await discordApi(env, "GET", `/guilds/${env.DISCORD_GUILD_ID}/channels`);
+  const c = (list || []).find((x) => x.name === "octive-scores" && (x.type === 0 || x.type === 5));
+  scoresChannel = c ? c.id : null; scoresChannelAt = Date.now();
+  return scoresChannel;
 }
 
 /** The four channels, found by name (cached 10 minutes). */
@@ -2490,7 +2524,7 @@ async function workshopRoutes(request, env, url, ctx) {
         // a linked Discord gets the credit (shown as their name, no ping)
         ...(creatorDiscord ? [{ name: "Made by", value: `<@${creatorDiscord}>`, inline: true }] : []),
         { name: "File", value: `${fileName} · ${(bytes.length / 1048576).toFixed(bytes.length < 1048576 ? 2 : 1)} MB`, inline: true },
-        { name: "Get it", value: `Download the file below, or in OCTIVE: Play → Workshop`, inline: true },
+        { name: "Get it", value: `Download the file above, or in OCTIVE: Play → Workshop`, inline: true },
       ],
       footer: { text: `Shared from OCTIVE · ${id}` },
       timestamp: new Date().toISOString(),
@@ -2513,6 +2547,80 @@ async function workshopRoutes(request, env, url, ctx) {
     rate.n += 1;
     await r2put(env, rateKey, rate);
     return reply({ ok: true, item: wsPublic(item) });
+  }
+
+  // ---- a score shared from the results screen: the picture goes to #octive-scores
+  if (path === "/api/score-share" && request.method === "POST") {
+    if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID) fail(503, "Score sharing isn't set up on the server.");
+    const who = await signedIn(request, env);
+    const cfg = config(env);
+    await loadModeration(cfg);
+    if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+    // one share every 20 seconds, 40 a day
+    const now = Date.now();
+    const last = scoreShareAt.get(who.playerId) || 0;
+    if (now - last < 20_000) fail(429, "Wait a few seconds before sharing another score.");
+    const day = new Date().toISOString().slice(0, 10);
+    const rateKey = `scores/rate/${who.playerId}.json`;
+    const rate = await r2json(env, rateKey, { day, n: 0 });
+    if (rate.day !== day) { rate.day = day; rate.n = 0; }
+    if (rate.n >= 40) fail(429, "You've shared a lot of scores today. Try again tomorrow.");
+    const len = Number(request.headers.get("Content-Length") || 0);
+    if (len > 8_500_000) fail(413, "That picture is too big.");
+    let form;
+    try { form = await request.formData(); } catch { fail(400, "The share wasn't readable (multipart/form-data expected)."); }
+    const file = form.get("image");
+    if (!file || typeof file === "string") fail(400, "No picture was attached.");
+    if (file.size > 8_000_000) fail(413, "That picture is too big.");
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const kind = imageType(bytes);
+    if (kind !== "png" && kind !== "jpg") fail(400, "The picture must be a PNG or JPG.");
+    let info = {};
+    try { info = JSON.parse(String(form.get("info") || "{}")) || {}; } catch { /* none */ }
+    const clean = (v, n) => String(v ?? "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@\u200b$1").replace(/[*_~`|>]/g, "").trim().slice(0, n);
+    const num = (v, lo, hi) => { const x = Number(v); return Number.isFinite(x) ? Math.min(hi, Math.max(lo, x)) : null; };
+    const card = (await publicItems(cfg, who.playerId, ["card"]).catch(() => ({}))).card || {};
+    const name = clean(moderation.overrides[who.playerId]?.name || card.name || who.username || "Player", 40);
+    const title = clean(info.title, 120) || "A song";
+    const sub = clean(info.subtitle, 160);
+    const grade = clean(info.grade, 4);
+    const score = num(info.score, 0, 10_000_000), acc = num(info.accuracy, 0, 100), pr = num(info.pp, 0, 100_000), stars = num(info.stars, 0, 100);
+    const combo = num(info.maxCombo, 0, 1_000_000), notes = num(info.notes, 0, 1_000_000);
+    const tags = (Array.isArray(info.tags) ? info.tags : []).map((t) => clean(t, 20)).filter(Boolean).slice(0, 4);
+    let discordId = null;
+    try { const rec = await record(env, who.playerId); discordId = rec.discord?.id || null; } catch { /* not linked */ }
+
+    const channelId = await scoresChannelId(env);
+    if (!channelId) fail(503, "The #octive-scores channel wasn't found on the OCTIVE Discord.");
+    const avatarHash = moderation.overrides[who.playerId]?.avatar ? "mod-" + Date.parse(moderation.overrides[who.playerId].at) : (card.avatar || "");
+    const gradeColor = { X: 0x7FF5FF, SS: 0x7FF5FF, S: 0xF2C14E, A: 0x3DDC84, B: 0x5DA9FF, C: 0xB69BFF, D: 0xFF6F6F }[grade] || C_ACCENT;
+    const fields = [
+      ...(score !== null ? [{ name: "Score", value: Math.round(score).toLocaleString("en-US"), inline: true }] : []),
+      ...(acc !== null ? [{ name: "Accuracy", value: `${acc.toFixed(2)}%${grade ? ` · ${grade}` : ""}`, inline: true }] : []),
+      ...(pr !== null ? [{ name: "Performance", value: `${Math.round(pr).toLocaleString("en-US")} PR${stars !== null ? ` · ★${stars.toFixed(2)}` : ""}`, inline: true }] : []),
+      ...(combo !== null ? [{ name: "Max combo", value: `${Math.round(combo).toLocaleString("en-US")}x${notes ? ` / ${Math.round(notes).toLocaleString("en-US")}` : ""}`, inline: true }] : []),
+      ...(tags.length ? [{ name: "\u200b", value: tags.map((t) => `**${t}**`).join(" · "), inline: true }] : []),
+    ];
+    const embed = {
+      color: gradeColor,
+      author: { name, url: `${SITE}#/u/${encodeURIComponent(who.playerId)}`, ...(avatarHash ? { icon_url: `${WORKER_BASE}/avatar/${encodeURIComponent(who.playerId)}?v=${encodeURIComponent(avatarHash)}` } : {}) },
+      title: title.slice(0, 256), description: sub || undefined, fields,
+      image: { url: `attachment://score.${kind}` },
+      footer: { text: "Shared from OCTIVE" }, timestamp: new Date().toISOString(),
+    };
+    const fd = new FormData();
+    fd.append("payload_json", JSON.stringify({
+      content: discordId ? `<@${discordId}> shared a score` : undefined,
+      embeds: [embed], allowed_mentions: { parse: [] },
+      attachments: [{ id: 0, filename: `score.${kind}` }],
+    }));
+    fd.append("files[0]", new Blob([bytes], { type: kind === "png" ? "image/png" : "image/jpeg" }), `score.${kind}`);
+    const posted = await discordApi(env, "POST", `/channels/${channelId}/messages`, fd, true);
+    scoreShareAt.set(who.playerId, now);
+    if (scoreShareAt.size > 5000) scoreShareAt.delete(scoreShareAt.keys().next().value);
+    rate.n += 1;
+    await r2put(env, rateKey, rate);
+    return reply({ ok: true, url: `https://discord.com/channels/${env.DISCORD_GUILD_ID}/${channelId}/${posted.id}` });
   }
 
   // ---- remove (the creator, or developers and moderators): the Discord message goes too
@@ -2588,7 +2696,7 @@ async function dmRoutes(request, env, url) {
     const theirs = await r2json(env, dmInboxKey(to), dmEmptyInbox());
     const mine = await r2json(env, dmInboxKey(me), dmEmptyInbox());
     if ((theirs.blocked || []).includes(me)) fail(403, "This player isn't taking messages from you.");
-    const friendly = theirs.synced ? (theirs.friends || []).some((f) => f.id === me) : (mine.friends || []).some((f) => f.id === to);
+    const friendly = isOfficial(me) || isOfficial(to) || (theirs.synced ? (theirs.friends || []).some((f) => f.id === me) : (mine.friends || []).some((f) => f.id === to));
     if (!friendly) fail(403, "You can only send files to your friends.");
     const len = Number(request.headers.get("Content-Length") || 0);
     if (len > 40 * 1048576) fail(413, "That file is too big to send (40 MB at most).");
@@ -2660,7 +2768,7 @@ async function dmRoutes(request, env, url) {
     const [mine, theirs] = await Promise.all([r2json(env, dmInboxKey(me), dmEmptyInbox()), r2json(env, dmInboxKey(to), dmEmptyInbox())]);
     if ((theirs.blocked || []).includes(me)) fail(403, "This player isn't taking messages from you.");
     // the receiver's own friend list decides; before their game uploaded it, the sender's does
-    const friendly = theirs.synced ? (theirs.friends || []).some((f) => f.id === me) : (mine.friends || []).some((f) => f.id === to);
+    const friendly = isOfficial(me) || isOfficial(to) || (theirs.synced ? (theirs.friends || []).some((f) => f.id === me) : (mine.friends || []).some((f) => f.id === to));
     if (!friendly) fail(403, "You can only message your friends.");
     const kind = b.kind === "replay" ? "replay" : b.kind === "file" ? "file" : "chat";
     const data = kind !== "chat" && /^[a-f0-9]{32}$/.test(String(b.data || "")) ? String(b.data) : undefined;

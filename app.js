@@ -4,6 +4,20 @@
 (() => {
   "use strict";
 
+  // an empty slot (null, undefined or false) adds nothing, instead of the text "null"
+  for (const proto of [Element.prototype, DocumentFragment.prototype]) {
+    for (const fn of ["append", "prepend", "replaceChildren"]) {
+      const orig = proto[fn];
+      if (orig) proto[fn] = function (...kids) { return orig.apply(this, kids.filter((k) => k !== null && k !== undefined && k !== false)); };
+    }
+  }
+
+  /** The official OCTIVE account: never ranked, always level 1000. */
+  const OFFICIAL_ID = "o2quUJmLzZujIpPomajHJ7oW07aI";
+  /** The check beside a name ("official" or "verified"), from the server or the built-in list. */
+  const checkOf = (p) => p ? (p.check || (p.id === OFFICIAL_ID ? "official" : ROLES[p.id]?.badge === "DEV" ? "verified" : null)) : null;
+  const checkEl = (p) => { const c = checkOf(p); return c ? h("span.check." + c, { title: c === "official" ? "Official OCTIVE account" : "Verified: this is really them", role: "img", "aria-label": c }) : null; };
+
   /** Built-in special accounts by Unity player ID (same list as the game's PlayerRoles). */
   const ROLES = {
     "PlwcYVKV9y7NBFWfUaC263XpCFbE": { badge: "DEV", title: "OCTIVE developer" }, // Senterra
@@ -270,7 +284,7 @@
     }
     const view = clone("tpl-player");
     const card = view.querySelector(".card");
-    view.querySelector(".card-name").textContent = p.name || "Player";
+    nameInto(view.querySelector(".card-name"), p);
     view.querySelector(".card-rank").textContent = "#" + fmt0.format(p.rank);
     setAvatar(view.querySelector(".card-avatar"), p);
     const role = setRole(card, view.querySelector(".badge"), p);
@@ -566,11 +580,11 @@
     const go = (d) => {
       demoData = d;
       song.firstChild.textContent = `${d.artist} - ${d.title}`;
-      song.lastChild.textContent = `${d.difficulty} · ${d.keys}K · ★${d.rating}`;
+      song.lastChild.textContent = `${d.difficulty} · ${d.keys}K · ★${Number(d.rating).toFixed(2)}`;
       requestAnimationFrame(frame);
     };
     if (demoData) go(demoData);
-    else fetch("data/demo.json", { cache: "force-cache" }).then((r) => r.ok ? r.json() : null).then((d) => { if (d) go(d); else song.firstChild.textContent = ""; }).catch(() => { song.firstChild.textContent = ""; });
+    else fetch("data/demo.json?v=1.5.0", { cache: "force-cache" }).then((r) => r.ok ? r.json() : null).then((d) => { if (d) go(d); else song.firstChild.textContent = ""; }).catch(() => { song.firstChild.textContent = ""; });
     sound.addEventListener("click", () => {
       if (!audio) {
         audio = new Audio("data/demo.mp3"); audio.loop = true; audio.volume = 0.6;
@@ -674,9 +688,9 @@
       pic,
       h("div.ws-body", {},
         h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
-        h("h3", { text: it.title }),
+        h("h3", { text: it.title, title: it.title }),
         h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
-        it.description ? h("p.ws-desc", { text: it.description.length > 180 ? it.description.slice(0, 180) + "…" : it.description }) : null,
+        h("p.ws-desc", { text: it.description || "", title: it.description || undefined }),
         h("span.ws-meta", { text: `${kb.toFixed(kb < 1 ? 2 : 1)} MB · ${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"} · ${new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })}` }),
         h("div.ws-actions", {},
           h("a.btn.primary.small", { href: `${worker}/api/download/${it.id}?redirect=1` }, "Download"),
@@ -842,13 +856,31 @@
   }
 
   function updateAccountNav() {
+    // signed in: your name and picture open your public profile; the gear opens your account settings
     const a = document.querySelector('[data-nav="account"]');
-    if (a) a.textContent = me ? me.name : "Sign in";
+    if (a) {
+      const name = a.querySelector(".side-name"), av = a.querySelector(".side-av");
+      if (name) name.replaceChildren(me ? me.name : "Sign in", me ? checkEl({ id: me.playerId, check: me.check }) : null);
+      else a.textContent = me ? me.name : "Sign in";
+      a.setAttribute("href", me && me.hasCard && !me.banned ? "#/u/" + encodeURIComponent(me.playerId) : "#/account");
+      a.dataset.nav = me && me.hasCard && !me.banned ? "me" : "account";
+      a.title = me ? "Your public profile" : "Sign in";
+      if (av) {
+        const img = av.querySelector("img");
+        if (me && me.avatarHash) {
+          const src = `${worker}/avatar/${encodeURIComponent(me.playerId)}?v=${encodeURIComponent(me.avatarHash)}`;
+          if (img) img.src = src; else av.replaceChildren(h("img", { src, alt: "" }));
+        } else if (img) av.replaceChildren(...new DOMParser().parseFromString('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>', "image/svg+xml").childNodes);
+      }
+    }
+    const gear = document.querySelector(".nav-settings");
+    if (gear) gear.hidden = !me;
     const m = document.querySelector('[data-nav="messages"]');
     if (m) {
       m.hidden = !me;
-      m.textContent = "Messages";
-      if (me && dmUnread > 0) m.append(h("span.nav-count", { text: String(dmUnread) }));
+      const label = m.querySelector(".nav-msg-label");
+      if (label) { m.querySelector(".nav-count")?.remove(); if (me && dmUnread > 0) m.append(h("span.nav-count", { text: String(dmUnread) })); }
+      else { m.textContent = "Messages"; if (me && dmUnread > 0) m.append(h("span.nav-count", { text: String(dmUnread) })); }
     }
   }
 
@@ -1259,6 +1291,8 @@
   function nameInto(el, p) {
     const style = p.supporter && p.supporter.active && p.supporter.nameStyle;
     if (style) renderBio(el, style); else el.textContent = p.name || "Player";
+    el.querySelector(".check")?.remove();
+    const c = checkEl(p); if (c) el.append(c);
   }
 
   /** The animated GIF picture of a supporter, else their normal picture. */
@@ -1421,11 +1455,14 @@
         youFollow = isOwner || s.youFollow === true;
         paint();
         // their Discord, when they chose to show it (Settings → Profile → Discord in the game)
-        if (s.discord) {
-          const chip = h("button.fc-discord", { type: "button", title: "Click to copy their Discord name" }, h("img.dc-logo", { src: "discord.png", alt: "Discord" }), h("b", { text: s.discord }), h("span.dc-copy", { text: "Copy" }));
+        if (s.discord || s.discordUser) {
+          // shows their Discord name; copies the username (what you type to add them)
+          const user = s.discordUser || s.discord;
+          const shown = s.discordUser && s.discord && s.discord.toLowerCase() !== s.discordUser.toLowerCase() ? `${s.discord} · @${s.discordUser}` : (s.discord || s.discordUser);
+          const chip = h("button.fc-discord", { type: "button", title: "Click to copy their Discord username" }, h("img.dc-logo", { src: "discord.png", alt: "Discord" }), h("b", { text: shown }), h("span.dc-copy", { text: "Copy" }));
           chip.addEventListener("click", async () => {
-            try { await navigator.clipboard.writeText(s.discord); chip.querySelector(".dc-copy").textContent = "Copied!"; }
-            catch { chip.querySelector(".dc-copy").textContent = s.discord; }
+            try { await navigator.clipboard.writeText(user); chip.querySelector(".dc-copy").textContent = "Copied!"; }
+            catch { chip.querySelector(".dc-copy").textContent = user; }
             setTimeout(() => { chip.querySelector(".dc-copy").textContent = "Copy"; }, 1800);
           });
           row.append(chip);
@@ -1748,9 +1785,9 @@
 
   // ---------------------------------------------------------------- achievements (public, from the player's card)
   let achDefs = null;
-  const loadAchDefs = () => achDefs ??= fetch("data/achievements.json?v=1.4.6-1").then((r) => r.json()).catch(() => []);
-  const ACH_COLOURS = { Milestones: "#8b7bff", Skill: "#4fd6e8", Supporter: "#ff6fae", "OCTIVE Remixes": "#f2c14e" };
-  const ACH_ICONS = { Milestones: "★", Skill: "✔", Supporter: "♥", "OCTIVE Remixes": "♪" };
+  const loadAchDefs = () => achDefs ??= fetch("data/achievements.json?v=1.5.0-1").then((r) => r.json()).catch(() => []);
+  const ACH_COLOURS = { Milestones: "#8b7bff", Skill: "#4fd6e8", Supporter: "#ff6fae", "OCTIVE Remixes": "#f2c14e", Community: "#5865f2" };
+  const ACH_ICONS = { Milestones: "★", Skill: "✔", Supporter: "♥", "OCTIVE Remixes": "♪", Community: "☺" };
 
   function achievementsSection(p) {
     const box = h("section.ach-section", {}, h("p.panel-sub", { text: "Loading achievements…" }));
@@ -1868,10 +1905,35 @@
       ["How do I play with just one friend?", "Open Friends (F8), click your friend and choose Play together. OCTIVE makes a private room for the two of you and sends them the invite."],
       ["Can people watch me play?", "Friends can watch your plays live if you allow it in Settings → Profile & data."],
     ]],
+    ["Workshop", [
+      ["What is the Workshop?", "A place to share and get charts, note skins, menu themes and whole styles made by players. Open it in the game (Play → Workshop) or on this website (Workshop in the menu). Everything shared is also posted in the OCTIVE Discord (#octive-charts, #octive-skins, #octive-themes and #octive-styles)."],
+      ["How do I share something?", "Sign in, then in the game: Play → Workshop → Share, and pick a chart from your list, or use Share to the Workshop in Settings → Style for your skin, theme or whole style. Add a title and a description; a preview picture is made for you."],
+      ["Can I try a skin before getting it?", "Yes. Click a skin, theme or style in the Workshop to preview it: skins play live with the song that's on, themes show the menus, and styles have pages for each part. Previews are only kept until you close OCTIVE."],
+      ["How do I remove my upload?", "The bin button on your own card in the Workshop removes it from the Workshop and deletes its post in the OCTIVE Discord. Moderators can remove uploads that break the rules."],
+      ["How big can a file be?", "As big as the OCTIVE Discord allows right now (it depends on the server's boost level; usually 50 MB)."],
+    ]],
+    ["Discord", [
+      ["How do I link my Discord?", "Account → Preferences on this website (or Settings → Profile → Discord in the game): you get a code, then type /link with it in the OCTIVE Discord."],
+      ["What does linking give me?", "Your Discord on your OCTIVE profile (if you switch it on) so people can copy your username and add you, credit on your Workshop uploads, a DM from the OCTIVE bot when a friend messages you, pings for new updates, /profile, /compare and /achievements in Discord, the supporter role while you boost the server, and the Connected achievement."],
+      ["How do I share a score?", "Finish a song while signed in, then press Share score on the results screen. A picture of your results, with your name and picture big at the top, is posted in #octive-scores in the OCTIVE Discord."],
+      ["What does copying a Discord name copy?", "Clicking someone's Discord on their profile copies their Discord username (the one you type to add them), not their display name."],
+      ["Is the global chat the same as Discord?", "Yes: the Chat tab in Friends (F8) is linked with #octive-chat in the OCTIVE Discord. Messages from the game show in Discord, and the other way round."],
+    ]],
+    ["Profiles and checks", [
+      ["What do the check marks mean?", "A blue check means a known person whose account is really theirs. The navy and gold check is for official OCTIVE accounts. Only the OCTIVE developer gives them out."],
+      ["What is the OCTIVE account?", "The official OCTIVE account. It isn't on the ranking, it can message any player (and you can answer it) and it's always level 1000."],
+      ["I switched accounts and my picture or bio looked wrong", "Fixed in 1.5: each account on a computer keeps its own picture, bio, links, friends and followers. Signing in to another account loads that account's own."],
+    ]],
+    ["Style: skins, themes and HUD", [
+      ["Where are skins and themes?", "Settings → Style has everything about how OCTIVE looks: your whole style, the HUD layout, note skins (with the skin maker) and menu themes."],
+      ["What is a style?", "One .octstyle file with your note skin, menu theme, HUD layout and mouse cursor, like an osu! skin. Send it to a friend or share it to the Workshop, and they look exactly like you."],
+      ["Can I use osu! skins?", "Yes. Import an .osk in Settings → Style → Import. They're converted as well as possible; some unusual skins may not look quite right."],
+    ]],
     ["Accounts and scores", [
       ["I signed in to another account and my scores were gone", "Scores on a computer belong to one account. When someone else signs in, your scores are put aside and come back when you sign in again. Plays made while signed out are only added to an account if you say yes when it asks."],
       ["I forgot my password", "Use Forgot password on the Account page. It needs an email linked to your account (link one on the Account page while signed in)."],
-      ["Can I change my name?", "Yes, once a week in the game (Profile → Change name). Supporters can change it any time."],
+      ["Can I change my name?", "Yes, once a week in the game (Profile → Name). Supporters can change it any time."],
+      ["Where are my account settings on the website?", "In the menu on the left: your name and picture open your public profile, and the gear button next to it opens your account settings (picture, bio, email, password, Discord and preferences)."],
     ]],
     ["Supporter and payments", [
       ["What does supporting give?", "A supporter badge with anniversary art, a profile banner, coloured names, profile effects, an animated GIF picture, free name changes and a pink border on leaderboards. It's cosmetic only and never affects scores."],
@@ -2141,8 +2203,9 @@
 
   function route(fromHashChange) {
     const pg = page();
-    for (const a of document.querySelectorAll("[data-nav]")) a.classList.toggle("active", a.dataset.nav === (pg === "player" ? "rankings" : pg));
-    document.querySelector(".nav-more-btn")?.classList.toggle("active", pg === "supporter" || pg === "help");
+    const mine = pg === "player" && me && decodeURIComponent(location.hash.slice(4)) === me.playerId;
+    const navKey = pg === "player" ? (mine ? "me" : "rankings") : pg === "account" ? "settings" : pg;
+    for (const a of document.querySelectorAll("[data-nav]")) a.classList.toggle("active", a.dataset.nav === navKey || (navKey === "settings" && a.dataset.nav === "account"));
     if ((pg === "rankings" || pg === "player") && !data) { app.replaceChildren(h("p.empty", { text: "Loading the ranking…" })); return; }
     if (pg === "player") player(decodeURIComponent(location.hash.slice(4)));
     else if (pg === "rankings") rankings();
@@ -2165,9 +2228,10 @@
     more.querySelector(".nav-more-btn").addEventListener("click", (e) => { e.stopPropagation(); more.classList.toggle("open"); });
     document.addEventListener("click", (e) => { if (!more.contains(e.target)) more.classList.remove("open"); });
   }
-  // phones: the links fold into a menu button
+  // phones: the sidebar slides in from the menu button; a tap outside closes it
   const menuBtn = document.querySelector(".menu-btn");
   if (menuBtn) menuBtn.addEventListener("click", () => document.body.classList.toggle("menu-open"));
+  document.querySelector(".side-scrim")?.addEventListener("click", () => document.body.classList.remove("menu-open"));
   route();
   load();
   // stay signed in: show the name in the menu

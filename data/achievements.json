@@ -21,6 +21,97 @@
   "secret": false
  },
  {
+  "id": "friend-first",
+  "title": "Better Together",
+  "desc": "Make your first friend.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "friends-10",
+  "title": "Squad",
+  "desc": "Have 10 friends.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "friends-25",
+  "title": "Popular",
+  "desc": "Have 25 friends.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "chat-first",
+  "title": "Say Hi",
+  "desc": "Send a message to a friend.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "global-chat",
+  "title": "Town Square",
+  "desc": "Say something in the global chat.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "score-share",
+  "title": "Show-Off",
+  "desc": "Share a score to #octive-scores in the OCTIVE Discord.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "replay-send",
+  "title": "Watch This",
+  "desc": "Send a replay to a friend.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "file-send",
+  "title": "Care Package",
+  "desc": "Send a skin, theme or style to a friend.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "spectate",
+  "title": "Spectator",
+  "desc": "Watch a friend play.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "follow-first",
+  "title": "Fan",
+  "desc": "Follow a player.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "workshop-get",
+  "title": "Collector",
+  "desc": "Get something from the Workshop.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "discord-updates",
+  "title": "In the Loop",
+  "desc": "Get pinged for OCTIVE updates in Discord (Preferences → Discord).",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "official-chat",
+  "title": "Straight From the Source",
+  "desc": "Get a message from the official OCTIVE account.",
+  "group": "Community",
+  "secret": true
+ },
+ {
   "id": "plays-10",
   "title": "Warming Up",
   "desc": "Finish 10 songs.",
