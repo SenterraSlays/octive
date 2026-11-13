@@ -727,7 +727,40 @@
         h("span.ws-meta", { text: `${kb.toFixed(kb < 1 ? 2 : 1)} MB · ${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"} · ${new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })}` }),
         h("div.ws-actions", {},
           h("a.btn.primary.small", { href: `${worker}/api/download/${it.id}?redirect=1` }, "Download"),
-          it.discord ? h("a.btn.small", { href: it.discord, target: "_blank", rel: "noopener" }, "On Discord") : null)));
+          h("a.btn.small.ws-open", { href: `octive://workshop/${it.id}`, title: "Opens OCTIVE (starting it if it's closed), goes to the Workshop and gets this", onclick: () => openHint() }, "Open in OCTIVE"))));
+  }
+
+  /** After "Open in OCTIVE": if the game didn't take the link (not installed), say where to get it. */
+  function openHint() {
+    let left = false;
+    const away = () => { left = true; };
+    window.addEventListener("blur", away, { once: true });
+    setTimeout(() => {
+      window.removeEventListener("blur", away);
+      if (left || document.hidden) return;
+      const note = h("div.open-hint", {}, h("b", { text: "Didn't open?" }), " Open in OCTIVE needs OCTIVE for Windows installed (version 1.5 or newer). ",
+        h("a", { href: "#/download" }, "Download OCTIVE"), h("button.btn.ghost.small", { type: "button", onclick: () => note.remove() }, "OK"));
+      document.querySelector(".open-hint")?.remove();
+      document.body.append(note);
+      setTimeout(() => note.remove(), 9000);
+    }, 1800);
+  }
+
+  /** #/open/workshop/<id>: a web address for "Open in OCTIVE" (Discord only links to web pages). */
+  function openPage() {
+    const m = (location.hash || "").match(/^#\/open\/workshop\/([a-z0-9]{16,40})/);
+    document.title = "Open in OCTIVE";
+    if (!m) { location.hash = "#/workshop"; return; }
+    const link = `octive://workshop/${m[1]}`;
+    app.replaceChildren(h("section.open-page", {},
+      h("img", { src: "logo.svg", alt: "", width: 72, height: 72 }),
+      h("h1", { text: "Opening OCTIVE…" }),
+      h("p.sub", { text: "OCTIVE opens on the Workshop and gets this item for you." }),
+      h("div.open-actions", {},
+        h("a.btn.primary", { href: link, onclick: () => openHint() }, "Open in OCTIVE"),
+        h("a.btn", { href: `${worker}/api/download/${m[1]}?redirect=1` }, "Download the file"),
+        h("a.btn.ghost", { href: "#/download" }, "Get OCTIVE"))));
+    setTimeout(() => { location.href = link; openHint(); }, 400);
   }
 
   function workshopPage() {
@@ -1294,7 +1327,9 @@
   }
 
   const MONTHLY = 250;
-  const discountFor = (m) => m >= 24 ? 0.4 : m >= 12 ? 0.3 : m >= 6 ? 0.2 : m >= 3 ? 0.1 : 0;
+  /** Same as the server: longer blocks cost less, never more than 50% off. */
+  const discountFor = (m) => Math.min(0.5, m >= 36 ? 0.5 : m >= 24 ? 0.4 : m >= 12 ? 0.3 : m >= 6 ? 0.2 : m >= 3 ? 0.1 : 0);
+  const MAX_MONTHS = 120;
   const priceFor = (m) => Math.round(MONTHLY * m * (1 - discountFor(m)));
   const usd = (cents) => "$" + (cents / 100).toFixed(2);
   const MILESTONE_ART = [[36, "3y", "36 months"], [12, "1y", "12 months"], [6, "6m", "6 months"], [3, "3m", "3 months"], [1, "1m", "1 month"], [0, "new", "New supporter"]];
@@ -1568,20 +1603,29 @@
     ];
 
     const total = h("b.price-total"), each = h("span.price-each"), save = h("span.price-save");
-    const slider = h("input.months-slider", { type: "range", min: 1, max: 24, step: 1, value: months, "aria-label": "Months" });
+    const slider = h("input.months-slider", { type: "range", min: 1, max: 36, step: 1, value: months, "aria-label": "Months" });
     const monthsLabel = h("b.months-label");
-    const quick = h("div.quick-months", {}, [1, 3, 6, 12, 24].map((m) => h("button.chip", { type: "button", "data-m": m, onclick: () => { months = m; slider.value = m; upd(); } }, m === 1 ? "1 month" : `${m} months`)));
+    // any number of months: type it (up to 10 years)
+    const custom = h("input.months-custom", { type: "number", min: 1, max: MAX_MONTHS, step: 1, value: months, inputmode: "numeric", "aria-label": "Custom number of months", title: `Any number of months, 1 to ${MAX_MONTHS}` });
+    const setMonths = (m, from) => {
+      months = Math.max(1, Math.min(MAX_MONTHS, Math.round(Number(m) || 1)));
+      if (from !== "slider") slider.value = Math.min(36, months);
+      if (from !== "custom") custom.value = months;
+      upd();
+    };
+    const quick = h("div.quick-months", {}, [1, 3, 6, 12, 24, 36].map((m) => h("button.chip", { type: "button", "data-m": m, onclick: () => setMonths(m) }, m === 1 ? "1 month" : m === 36 ? "36 months · 50% off" : `${m} months`)));
     const upd = () => {
-      months = Number(slider.value);
       monthsLabel.textContent = months === 1 ? "1 month" : `${months} months`;
       const cents = priceFor(months), pct = Math.round(discountFor(months) * 100);
       total.textContent = usd(cents);
       each.textContent = `${usd(cents / months)} a month`;
-      save.textContent = pct ? `${pct}% off · you save ${usd(MONTHLY * months - cents)}` : "No discount below 3 months";
+      save.textContent = pct ? `${pct}% off${pct >= 50 ? " (the most)" : ""} · you save ${usd(MONTHLY * months - cents)}` : "No discount below 3 months";
       save.classList.toggle("on", pct > 0);
       for (const b of quick.children) b.classList.toggle("on", Number(b.dataset.m) === months);
     };
-    slider.addEventListener("input", upd);
+    slider.addEventListener("input", () => setMonths(slider.value, "slider"));
+    custom.addEventListener("input", () => { if (custom.value !== "") setMonths(custom.value, "custom"); });
+    custom.addEventListener("change", () => setMonths(custom.value, null));
 
     // who it's for: me, or a gift to another player
     const forMe = h("button.seg", { type: "button" }, "For me");
@@ -1651,9 +1695,9 @@
       h("div.sup-grid", {},
         h("section.panel.buy-panel", {},
           h("h2", { text: "Choose your time" }),
-          h("p.panel-sub", { text: "$2.50 a month. Longer blocks cost less: 3+ months 10% off, 6+ 20%, 12+ 30%, 24 months 40%. One-time payment, nothing renews." }),
+          h("p.panel-sub", { text: "$2.50 a month, any number of months (type your own). Longer blocks cost less: 3+ months 10% off, 6+ 20%, 12+ 30%, 24+ 40%, and 36+ 50% (the most). One-time payment, nothing renews." }),
           h("div.seg-row", {}, forMe, forGift), giftBox,
-          h("div.months-row", {}, monthsLabel, slider), quick,
+          h("div.months-row", {}, monthsLabel, slider, h("label.months-custom-wrap", {}, h("span", { text: "Custom" }), custom)), quick,
           h("div.price-box", {}, total, h("div", {}, each, save)),
           buy, freeBtn, out, signHint,
           h("p.fine", { text: "Payments are handled by Stripe; OCTIVE never sees your card. Time adds onto any time you already have. See the Terms for refunds." })),
@@ -2251,6 +2295,7 @@
     else if (pg === "updates") updatesPage();
     else if (pg === "workshop") workshopPage();
     else if (pg === "messages") messagesPage();
+    else if (pg === "open") openPage();
     else home();
     if (fromHashChange) window.scrollTo(0, 0);
   }

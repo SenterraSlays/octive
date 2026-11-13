@@ -1541,14 +1541,15 @@ function withWeb(p, web) {
 // Secrets: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET (Tools/stripe_setup.py sets both).
 const MONTH_MS = 30.4375 * 86_400_000;
 const PRICE_CENTS = 250;
-const MAX_MONTHS = 24;
+const MAX_MONTHS = 120; // any number of months (up to 10 years) for yourself or as a gift
 const GIF_MAX = 8 * 1048576; // supporters' animated pictures
 const LIFETIME_SUPPORTERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE"]; // Senterra
 const OWNER = "PlwcYVKV9y7NBFWfUaC263XpCFbE"; // everyone follows the developer
 const MILESTONES = [[0, "new"], [1, "1 month"], [3, "3 months"], [6, "6 months"], [12, "1 year"], [24, "2 years"], [36, "3 years"], [48, "4 years"], [60, "5 years"], [120, "10 years"]];
 const EFFECTS = ["none", "sparkles", "snow", "hearts", "embers", "stars", "aurora", "rain"];
 
-function discountFor(m) { return m >= 24 ? 0.4 : m >= 12 ? 0.3 : m >= 6 ? 0.2 : m >= 3 ? 0.1 : 0; }
+// longer blocks cost less, never more than 50% off
+function discountFor(m) { return Math.min(0.5, m >= 36 ? 0.5 : m >= 24 ? 0.4 : m >= 12 ? 0.3 : m >= 6 ? 0.2 : m >= 3 ? 0.1 : 0); }
 function priceFor(m) { return Math.round(PRICE_CENTS * m * (1 - discountFor(m))); }
 
 async function r2json(env, key, fallback) {
@@ -2470,7 +2471,7 @@ async function wsInspect(kind, u8) {
 
 const wsPublic = (it) => ({
   id: it.id, type: it.type, title: it.title, description: it.description, creator: it.creator, creatorId: it.creatorId,
-  fileName: it.fileName, size: it.size, at: it.at, downloads: it.downloads || 0,
+  fileName: it.fileName, size: it.size, at: it.at, downloads: it.downloads || 0, updated: it.updatedAt || null, version: it.version || 1,
   preview: it.preview ? `${WORKER_BASE}/api/preview/${it.id}` : null,
   discord: it.channelId && it.messageId && it.guildId ? `https://discord.com/channels/${it.guildId}/${it.channelId}/${it.messageId}` : null,
 });
@@ -2485,7 +2486,9 @@ async function workshopRoutes(request, env, url, ctx) {
     const q = String(url.searchParams.get("q") || "").trim().toLowerCase();
     const sort = url.searchParams.get("sort") || "new";
     const db = await r2json(env, WS_DB, { items: [] });
-    let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type));
+    // ?creator=<playerId>: only that player's uploads (their profile and their Workshop page)
+    const creator = String(url.searchParams.get("creator") || "").trim();
+    let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type) && (!creator || it.creatorId === creator));
     if (q) items = items.filter((it) => `${it.title} ${it.creator} ${it.description}`.toLowerCase().includes(q));
     items.sort(sort === "popular" ? (a, b) => (b.downloads || 0) - (a.downloads || 0) || b.at - a.at : (a, b) => b.at - a.at);
     const counts = {};
@@ -2578,7 +2581,7 @@ async function workshopRoutes(request, env, url, ctx) {
         // a linked Discord gets the credit (shown as their name, no ping)
         ...(creatorDiscord ? [{ name: "Made by", value: `<@${creatorDiscord}>`, inline: true }] : []),
         { name: "File", value: `${fileName} · ${(bytes.length / 1048576).toFixed(bytes.length < 1048576 ? 2 : 1)} MB`, inline: true },
-        { name: "Get it", value: `Download the file above, or in OCTIVE: Play → Workshop`, inline: true },
+        { name: "Get it", value: `Download the file above, or [open it in OCTIVE](${SITE}#/open/workshop/${id})`, inline: true },
       ],
       footer: { text: `Shared from OCTIVE · ${id}` },
       timestamp: new Date().toISOString(),
@@ -2675,6 +2678,100 @@ async function workshopRoutes(request, env, url, ctx) {
     rate.n += 1;
     await r2put(env, rateKey, rate);
     return reply({ ok: true, url: `https://discord.com/channels/${env.DISCORD_GUILD_ID}/${channelId}/${posted.id}` });
+  }
+
+  // ---- update (the creator, or developers and moderators): a new file, title or description. The post in the
+  // OCTIVE Discord is edited in place (same link), and downloads get the new file at once.
+  m = path.match(/^\/api\/items\/([a-z0-9]{16,40})\/update$/);
+  if (m && request.method === "POST") {
+    if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID) fail(503, "Uploads aren't set up on the server.");
+    const who = await signedIn(request, env);
+    const cfg = config(env);
+    await loadModeration(cfg);
+    if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+    const db = await r2json(env, WS_DB, { items: [] });
+    const it = (db.items || []).find((x) => x.id === m[1] && !x.removed);
+    if (!it) fail(404, "That item isn't available any more.");
+    const staff = badgesOf(who.playerId).some((b) => b === "DEV" || b === "MOD") || who.playerId === OWNER;
+    if (it.creatorId !== who.playerId && !staff) fail(403, "Only the person who shared it can update it.");
+    const max = await wsMaxBytes(env);
+    const len = Number(request.headers.get("Content-Length") || 0);
+    if (len > max + 200_000) fail(413, `That's too big: the OCTIVE Discord takes files up to ${Math.floor(max / 1048576)} MB right now.`);
+    let form;
+    try { form = await request.formData(); } catch { fail(400, "The update wasn't readable (multipart/form-data expected)."); }
+    const clean = (v, n) => String(v || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@\u200b$1").trim().slice(0, n);
+    const title = form.get("title") != null ? clean(form.get("title"), 80) || it.title : it.title;
+    const description = form.get("description") != null ? clean(form.get("description"), 1000) : it.description;
+    const file = form.get("file");
+    let bytes = null, fileName = it.fileName, preview = null;
+    if (file && typeof file !== "string") {
+      fileName = String(file.name || it.fileName).replace(/[^A-Za-z0-9 ._()\[\]'&+,-]/g, "_").slice(0, 100);
+      const ext = (fileName.match(/\.[A-Za-z]+$/) || [""])[0].toLowerCase();
+      if (WS_TYPES[ext] !== it.type) fail(400, `An update must be the same kind of file (${WS_LABEL[it.type].toLowerCase()}).`);
+      if (file.size > max) fail(413, `That's too big: the OCTIVE Discord takes files up to ${Math.floor(max / 1048576)} MB right now.`);
+      bytes = new Uint8Array(await file.arrayBuffer());
+      ({ preview } = await wsInspect(it.type, bytes));
+    }
+    // a few updates a day per player (they count with uploads)
+    const day = new Date().toISOString().slice(0, 10);
+    const rateKey = `workshop/rate/${who.playerId}.json`;
+    const rate = await r2json(env, rateKey, { day, n: 0 });
+    if (rate.day !== day) { rate.day = day; rate.n = 0; }
+    if (rate.n >= 30 && !staff) fail(429, "You've shared and updated a lot today. Try again tomorrow.");
+
+    let creatorDiscord = null;
+    try { const rec = await record(env, it.creatorId); creatorDiscord = rec.discord?.id || null; } catch { /* not linked */ }
+    const size = bytes ? bytes.length : it.size;
+    const version = (it.version || 1) + (bytes ? 1 : 0);
+    const pType = preview ? imageType(preview) : null;
+    const hasOldPreview = !bytes && it.preview;
+    const embed = {
+      title: `${WS_LABEL[it.type]}: ${title}`.slice(0, 256), color: WS_COLOR[it.type],
+      description: description || undefined,
+      author: { name: `by ${it.creator}`, url: `${SITE}#/u/${encodeURIComponent(it.creatorId)}` },
+      fields: [
+        ...(creatorDiscord ? [{ name: "Made by", value: `<@${creatorDiscord}>`, inline: true }] : []),
+        { name: "File", value: `${fileName} · ${(size / 1048576).toFixed(size < 1048576 ? 2 : 1)} MB`, inline: true },
+        { name: "Get it", value: `Download the file above, or [open it in OCTIVE](${SITE}#/open/workshop/${it.id})`, inline: true },
+        { name: "Updated", value: `<t:${Math.floor(Date.now() / 1000)}:R>${version > 1 ? ` · version ${version}` : ""}`, inline: true },
+      ],
+      footer: { text: `Shared from OCTIVE · ${it.id}` },
+      timestamp: new Date(it.at).toISOString(),
+    };
+    if (pType) embed.image = { url: `attachment://preview.${pType}` };
+    else if (hasOldPreview) embed.image = { url: `${WORKER_BASE}/api/preview/${it.id}?v=${it.version || 1}` };
+    let patched;
+    if (bytes) {
+      const fd = new FormData();
+      fd.append("payload_json", JSON.stringify({
+        embeds: [embed], allowed_mentions: { parse: [] },
+        attachments: [{ id: 0, filename: fileName }, ...(pType ? [{ id: 1, filename: `preview.${pType}` }] : [])],
+      }));
+      fd.append("files[0]", new Blob([bytes], { type: "application/octet-stream" }), fileName);
+      if (pType) fd.append("files[1]", new Blob([preview], { type: pType === "png" ? "image/png" : "image/jpeg" }), `preview.${pType}`);
+      try { patched = await discordApi(env, "PATCH", `/channels/${it.channelId}/messages/${it.messageId}`, fd, true); }
+      catch (e) { if (e.status === 413) fail(413, "Discord refused the file: it's too big for the server right now."); if (e.status === 404) fail(404, "That item's post was removed from Discord."); throw e; }
+    } else {
+      // only the words changed: keep the attachments as they are
+      const old = await discordApi(env, "GET", `/channels/${it.channelId}/messages/${it.messageId}`).catch(() => null);
+      const keep = (old?.attachments || []).map((a) => ({ id: a.id }));
+      const prevAtt = (old?.attachments || []).find((a) => /^preview\./i.test(a.filename));
+      if (prevAtt) embed.image = { url: `attachment://${prevAtt.filename}` };
+      patched = await discordApi(env, "PATCH", `/channels/${it.channelId}/messages/${it.messageId}`, { embeds: [embed], allowed_mentions: { parse: [] }, attachments: keep });
+    }
+    if (pType) await env.RELEASES.put(`workshop/previews/${it.id}`, preview, { httpMetadata: { contentType: pType === "png" ? "image/png" : "image/jpeg" } });
+    wsUrls.delete(it.id);
+    let out = null;
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      const x = (d.items || []).find((y) => y.id === it.id);
+      if (!x) return false;
+      x.title = title; x.description = description; x.fileName = fileName; x.size = size; x.updatedAt = Date.now(); x.version = version;
+      if (pType) x.preview = true;
+      out = x;
+    });
+    rate.n += 1;
+    await r2put(env, rateKey, rate);
+    return reply({ ok: true, item: wsPublic(out || it), edited: !!patched });
   }
 
   // ---- remove (the creator, or developers and moderators): the Discord message goes too
