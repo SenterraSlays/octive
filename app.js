@@ -280,6 +280,16 @@
     status.classList.toggle("on", !!p.online);
     decorateCard(card, p);
     card.after(socialRow(p));
+    // what they shared to the Workshop
+    const uploads = h("section.ws-profile", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: "Workshop uploads" }), h("a.more", { href: "#/workshop" }, "Workshop →")), h("div.ws-grid"));
+    card.parentNode.appendChild(uploads);
+    fetch(`${worker}/api/items?creator=${encodeURIComponent(p.id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+      const items = (d && d.items) || [];
+      if (!items.length || !uploads.isConnected) return;
+      uploads.querySelector(".section-title").textContent = `Workshop uploads · ${items.length}`;
+      uploads.querySelector(".ws-grid").replaceChildren(...items.map(workshopCard));
+      uploads.hidden = false;
+    });
     const set = (sel, v) => { view.querySelector(sel).textContent = v; };
     set(".c-pp", fmt0.format(p.pp || 0) + " PR");
     set(".c-acc", fmt2.format(p.accuracy || 0) + "%");
@@ -1046,7 +1056,27 @@
         const un = h("button.btn.ghost", { type: "button", onclick: () => busy(un, async () => {
           try { me = await callApi("discord/unlink", {}, true); setMsg(out, "Discord unlinked.", true); render(); } catch (e) { setMsg(out, e.message); }
         }) }, "Unlink");
-        box.append(h("div.email-row", {}, h("span.email-ok", { text: "✓" }), h("b", { text: me.discord.name || "Linked" }), h("span.field-hint", { text: "Discord linked" }), un));
+        box.append(h("div.email-row", {}, h("img.dc-logo", { src: "discord.png", alt: "" }), h("b", { text: me.discord.name || "Linked" }), h("span.field-hint", { text: "Discord linked" }), un));
+        // the Discord options (the same as in the game's Settings → Profile → Discord)
+        const opts = h("div.dc-opts", {}, h("p.field-hint", { text: "Loading your Discord options…" }));
+        box.append(opts);
+        callApi("discord/status", {}, true).then((st) => {
+          const p = st.prefs || {};
+          const opt = (key, title, hint) => {
+            const cb = h("input", { type: "checkbox" }); cb.checked = !!p[key];
+            cb.addEventListener("change", async () => {
+              cb.disabled = true;
+              try { const r = await callApi("discord/prefs", { [key]: cb.checked }, true); setMsg(out, r.note || "Saved.", true); }
+              catch (e) { cb.checked = !cb.checked; setMsg(out, e.message); }
+              cb.disabled = false;
+            });
+            return h("label.dc-opt", {}, cb, h("span", {}, h("b", { text: title }), h("span.field-hint", { text: hint })));
+          };
+          opts.replaceChildren(
+            opt("show", "Show my Discord on my profile", "Players see your Discord name on your OCTIVE profile and can copy it to add you."),
+            opt("dmAlerts", "Message me on Discord", "The OCTIVE bot DMs you when a friend sends you a message (at most once per friend every 10 minutes)."),
+            opt("updates", "Ping me for updates", "Gives you the @Octive Updates role in the OCTIVE Discord, pinged when a new version is out."));
+        }).catch((e) => opts.replaceChildren(h("p.field-hint", { text: "Couldn't load your Discord options: " + e.message })));
         return;
       }
       const codeBox = h("div.link-code", { hidden: true });
@@ -1064,7 +1094,16 @@
       box.append(h("div.panel-actions", { style: "justify-content:flex-start" }, get), codeBox);
     };
     render();
-    return section("Discord", "Link your Discord: /profile in the OCTIVE Discord shows your stats, and boosting the server makes you a supporter. You get a code here, then use /link in Discord.", box, out);
+    const perks = h("ul.dc-perks", {}, [
+      "Your Discord on your OCTIVE profile, so friends can add you in one click",
+      "Your Workshop uploads credit your Discord account in the server",
+      "A DM from the OCTIVE bot when a friend messages you",
+      "Pings for new OCTIVE updates (the @Octive Updates role)",
+      "/profile, /compare and /achievements in Discord show your stats",
+      "Boost the server: you're a supporter while you boost (with the role)",
+      "The \"Connected\" achievement in the game",
+    ].map((t) => h("li", { text: t })));
+    return section("Discord", "Link your Discord: you get a code here, then use /link in the OCTIVE Discord.", me.discord ? null : h("div.dc-why", {}, h("div.dc-why-head", {}, h("img.dc-logo", { src: "discord.png", alt: "" }), h("b", { text: "What you get when you link" })), perks), box, out);
   }
 
   /** Preferences: connections (Discord) and shortcuts; the game's own options are in its Settings → Profile. */
@@ -1382,7 +1421,15 @@
         youFollow = isOwner || s.youFollow === true;
         paint();
         // their Discord, when they chose to show it (Settings → Profile → Discord in the game)
-        if (s.discord) row.append(h("div.fc-discord", {}, h("span", { text: "Discord" }), h("b", { text: s.discord })));
+        if (s.discord) {
+          const chip = h("button.fc-discord", { type: "button", title: "Click to copy their Discord name" }, h("img.dc-logo", { src: "discord.png", alt: "Discord" }), h("b", { text: s.discord }), h("span.dc-copy", { text: "Copy" }));
+          chip.addEventListener("click", async () => {
+            try { await navigator.clipboard.writeText(s.discord); chip.querySelector(".dc-copy").textContent = "Copied!"; }
+            catch { chip.querySelector(".dc-copy").textContent = s.discord; }
+            setTimeout(() => { chip.querySelector(".dc-copy").textContent = "Copy"; }, 1800);
+          });
+          row.append(chip);
+        }
       } catch { followers.textContent = "—"; following.textContent = "—"; }
     })();
     return row;
@@ -1701,7 +1748,7 @@
 
   // ---------------------------------------------------------------- achievements (public, from the player's card)
   let achDefs = null;
-  const loadAchDefs = () => achDefs ??= fetch("data/achievements.json?v=1.4.0-2").then((r) => r.json()).catch(() => []);
+  const loadAchDefs = () => achDefs ??= fetch("data/achievements.json?v=1.4.6-1").then((r) => r.json()).catch(() => []);
   const ACH_COLOURS = { Milestones: "#8b7bff", Skill: "#4fd6e8", Supporter: "#ff6fae", "OCTIVE Remixes": "#f2c14e" };
   const ACH_ICONS = { Milestones: "★", Skill: "✔", Supporter: "♥", "OCTIVE Remixes": "♪" };
 

@@ -1147,7 +1147,8 @@ async function discordCommand(env, it) {
       // the newest shared items (all four channels, or one kind), with links to their posts and downloads
       const type = opt(data, "type"), q = String(opt(data, "search") || "").trim().toLowerCase();
       const db = await r2json(env, WS_DB, { items: [] });
-      let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type));
+      const creator = url.searchParams.get("creator");
+    let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type) && (!creator || it.creatorId === creator));
       if (q) items = items.filter((it) => `${it.title} ${it.creator} ${it.description}`.toLowerCase().includes(q));
       items.sort((a, b) => b.at - a.at);
       const shown = items.slice(0, 8);
@@ -2474,6 +2475,8 @@ async function workshopRoutes(request, env, url, ctx) {
     const title = clean(form.get("title"), 80) || fileName.replace(/\.[^.]+$/, "");
     const description = clean(form.get("description"), 1000);
     const id = crypto.randomUUID().replace(/-/g, "").slice(0, 20);
+    let creatorDiscord = null;
+    try { const rec = await record(env, who.playerId); creatorDiscord = rec.discord?.id || null; } catch { /* not linked */ }
 
     const channels = await wsChannelIds(env);
     const channelId = channels[type];
@@ -2484,6 +2487,8 @@ async function workshopRoutes(request, env, url, ctx) {
       description: description || undefined,
       author: { name: `by ${creator}`, url: `${SITE}#/u/${encodeURIComponent(who.playerId)}` },
       fields: [
+        // a linked Discord gets the credit (shown as their name, no ping)
+        ...(creatorDiscord ? [{ name: "Made by", value: `<@${creatorDiscord}>`, inline: true }] : []),
         { name: "File", value: `${fileName} · ${(bytes.length / 1048576).toFixed(bytes.length < 1048576 ? 2 : 1)} MB`, inline: true },
         { name: "Get it", value: `Download the file below, or in OCTIVE: Play → Workshop`, inline: true },
       ],

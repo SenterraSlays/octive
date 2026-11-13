@@ -7,6 +7,20 @@
   "secret": false
  },
  {
+  "id": "discord-linked",
+  "title": "Connected",
+  "desc": "Link your Discord to your OCTIVE account.",
+  "group": "Community",
+  "secret": false
+ },
+ {
+  "id": "workshop-share",
+  "title": "Sharing Is Caring",
+  "desc": "Share a chart, skin, theme or style to the Workshop.",
+  "group": "Community",
+  "secret": false
+ },
+ {
   "id": "plays-10",
   "title": "Warming Up",
   "desc": "Finish 10 songs.",
