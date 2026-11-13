@@ -2696,7 +2696,7 @@ async function workshopRoutes(request, env, url, ctx) {
     const db = await r2json(env, WS_DB, { items: [] });
     const it = (db.items || []).find((x) => x.id === m[1] && !x.removed);
     if (!it) fail(404, "That item isn't available any more.");
-    const staff = badgesOf(who.playerId).some((b) => b === "DEV" || b === "MOD") || who.playerId === OWNER;
+    const staff = badgesOf(who.playerId).some((b) => b === "DEV" || b === "MOD") || who.playerId === OWNER || isOfficial(who.playerId);
     if (it.creatorId !== who.playerId && !staff) fail(403, "Only the person who shared it can update it.");
     const max = await wsMaxBytes(env);
     const len = Number(request.headers.get("Content-Length") || 0);
@@ -2706,6 +2706,10 @@ async function workshopRoutes(request, env, url, ctx) {
     const clean = (v, n) => String(v || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@\u200b$1").trim().slice(0, n);
     const title = form.get("title") != null ? clean(form.get("title"), 80) || it.title : it.title;
     const description = form.get("description") != null ? clean(form.get("description"), 1000) : it.description;
+    // the developer and the official account can change who it's credited to
+    const canCredit = who.playerId === OWNER || isOfficial(who.playerId);
+    const creator = canCredit && form.get("creator") != null ? clean(form.get("creator"), 40) || it.creator : it.creator;
+    const newCreatorId = canCredit && /^[A-Za-z0-9_-]{8,64}$/.test(String(form.get("creatorId") || "")) ? String(form.get("creatorId")) : it.creatorId;
     const file = form.get("file");
     let bytes = null, fileName = it.fileName, preview = null;
     if (file && typeof file !== "string") {
@@ -2724,7 +2728,7 @@ async function workshopRoutes(request, env, url, ctx) {
     if (rate.n >= 30 && !staff) fail(429, "You've shared and updated a lot today. Try again tomorrow.");
 
     let creatorDiscord = null;
-    try { const rec = await record(env, it.creatorId); creatorDiscord = rec.discord?.id || null; } catch { /* not linked */ }
+    try { const rec = await record(env, newCreatorId); creatorDiscord = rec.discord?.id || null; } catch { /* not linked */ }
     const size = bytes ? bytes.length : it.size;
     const version = (it.version || 1) + (bytes ? 1 : 0);
     const pType = preview ? imageType(preview) : null;
@@ -2732,7 +2736,7 @@ async function workshopRoutes(request, env, url, ctx) {
     const embed = {
       title: `${WS_LABEL[it.type]}: ${title}`.slice(0, 256), color: WS_COLOR[it.type],
       description: description || undefined,
-      author: { name: `by ${it.creator}`, url: `${SITE}#/u/${encodeURIComponent(it.creatorId)}` },
+      author: { name: `by ${creator}`, url: `${SITE}#/u/${encodeURIComponent(newCreatorId)}` },
       fields: [
         ...(creatorDiscord ? [{ name: "Made by", value: `<@${creatorDiscord}>`, inline: true }] : []),
         { name: "File", value: `${fileName} · ${(size / 1048576).toFixed(size < 1048576 ? 2 : 1)} MB`, inline: true },
@@ -2770,6 +2774,7 @@ async function workshopRoutes(request, env, url, ctx) {
       const x = (d.items || []).find((y) => y.id === it.id);
       if (!x) return false;
       x.title = title; x.description = description; x.fileName = fileName; x.size = size; x.updatedAt = Date.now(); x.version = version;
+      x.creator = creator; x.creatorId = newCreatorId;
       if (pType) x.preview = true;
       out = x;
     });

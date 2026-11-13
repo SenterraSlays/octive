@@ -1475,6 +1475,9 @@
         gifts.map(([, key, label]) => h("figure", { title: `${monthsGiftedText(gifted)} gifted to other players` }, h("img", { src: `badges/gifter-${key}.png`, alt: "" }), h("figcaption", { text: label })))));
   }
 
+  /** Names of people opened from a profile's Message button (not friends, so not in the inbox yet). */
+  const dmNames = {};
+
   /** Followers / following, a Follow button and Gift supporter. */
   function socialRow(p) {
     const followers = h("b", { text: "…" }), following = h("b", { text: "…" });
@@ -1499,6 +1502,10 @@
       } catch (e) { out.textContent = e.message; }
       followBtn.disabled = false; paint();
     });
+    // the official account messages anyone, and anyone can message it (no friendship needed)
+    const msgBtn = h("a.btn.msg", { href: "#/messages/" + encodeURIComponent(p.id), hidden: true, title: "Send a message" }, "✉ Message");
+    msgBtn.hidden = !(me && me.playerId !== p.id && (me.playerId === OFFICIAL_ID || p.id === OFFICIAL_ID));
+    msgBtn.addEventListener("click", (e) => { if (!me) { e.preventDefault(); location.hash = "#/account"; } else dmNames[p.id] = p.name; });
     const gift = h("a.btn.gift", { href: "#/supporter?gift=" + encodeURIComponent(p.id), hidden: !!(me && me.playerId === p.id) || !!(p.supporter && p.supporter.lifetime) }, "♥ Gift supporter");
     const friends = h("b", { text: "…" });
     let row;
@@ -1511,7 +1518,7 @@
         tile("followers", followers, "Followers", "See who follows " + (p.name || "them"), '<path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1"/><circle cx="9" cy="8" r="3.5"/><path d="M22 19v-1a4 4 0 0 0-3-3.9M16 4.2a3.5 3.5 0 0 1 0 6.6"/>'),
         tile("following", following, "Following", "See who " + (p.name || "they") + " follows", '<path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/>'),
         tile("friends", friends, "Friends", "See " + (p.name || "their") + "'s friends", '<circle cx="12" cy="8" r="4"/><path d="M4 20c0-3.3 3.6-6 8-6s8 2.7 8 6"/>')),
-      h("div.fc-actions", {}, out, followBtn, gift));
+      h("div.fc-actions", {}, out, msgBtn, followBtn, gift));
     paint();
     (async () => {
       try {
@@ -2167,7 +2174,7 @@
     app.replaceChildren(root);
     let box = null, thread = [], since = 0;
 
-    const nameOf = (id) => (box?.threads || []).find((t) => t.with === id)?.name || (box?.friends || []).find((f) => f.id === id)?.name || "Player";
+    const nameOf = (id) => (box?.threads || []).find((t) => t.with === id)?.name || (box?.friends || []).find((f) => f.id === id)?.name || dmNames[id] || findPlayer(id)?.name || (id === OFFICIAL_ID ? "Octive" : "Player");
 
     function paintList() {
       const seen = new Set();
