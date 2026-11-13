@@ -2185,6 +2185,296 @@ async function chatRoutes(request, env, url, ctx) {
   fail(404, "Not found.");
 }
 
+// ---------------------------------------------------------------- workshop: charts, skins, themes and styles shared from the game
+// The game uploads a file (POST /api/upload, multipart); the bot posts it to the matching read-only channel
+// (#octive-charts / -skins / -themes / -styles) with the file attached and an embed with the details and a
+// preview. Only the channel and message ids are kept (Discord's file links expire): a download asks Discord for
+// the message again and caches the fresh link for up to 12 hours. Previews are kept in R2 for the item lists.
+const WS_TYPES = { ".oct": "charts", ".octskin": "skins", ".octtheme": "themes", ".octstyle": "styles" };
+const WS_CHANNEL = { charts: "octive-charts", skins: "octive-skins", themes: "octive-themes", styles: "octive-styles" };
+const WS_LABEL = { charts: "Chart", skins: "Skin", themes: "Theme", styles: "Style" };
+const WS_COLOR = { charts: 0x8b7bff, skins: 0xff5c8a, themes: 0x4fd6e8, styles: 0xffb84f };
+const WS_DB = "workshop/items.json";
+const WS_URL_TTL = 12 * 3600_000;
+let wsChannels = null, wsChannelsAt = 0, wsTier = null, wsTierAt = 0;
+const wsUrls = new Map(); // item id -> { url, until }
+
+async function discordApi(env, method, path, body, isForm) {
+  const headers = { Authorization: "Bot " + env.DISCORD_BOT_TOKEN, "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" };
+  if (body !== undefined && !isForm) headers["Content-Type"] = "application/json";
+  const res = await fetch("https://discord.com/api/v10" + path, { method, headers, body: body === undefined ? undefined : isForm ? body : JSON.stringify(body) });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
+  if (!res.ok) { const e = new Error(`Discord ${res.status}: ${(data && data.message) || text.slice(0, 200)}`); e.status = res.status; throw e; }
+  return data;
+}
+
+/** The four channels, found by name (cached 10 minutes). */
+async function wsChannelIds(env) {
+  if (wsChannels && Date.now() - wsChannelsAt < 600_000) return wsChannels;
+  const list = await discordApi(env, "GET", `/guilds/${env.DISCORD_GUILD_ID}/channels`);
+  const out = {};
+  for (const [type, name] of Object.entries(WS_CHANNEL)) { const c = (list || []).find((x) => x.name === name && (x.type === 0 || x.type === 5)); if (c) out[type] = c.id; }
+  wsChannels = out; wsChannelsAt = Date.now();
+  return out;
+}
+
+/** The biggest file the server takes now (it follows the boost level, checked every 10 minutes), less a safety margin. */
+async function wsMaxBytes(env) {
+  if (wsTier === null || Date.now() - wsTierAt > 600_000) {
+    try { const g = await discordApi(env, "GET", `/guilds/${env.DISCORD_GUILD_ID}`); wsTier = Number(g.premium_tier || 0); wsTierAt = Date.now(); }
+    catch { wsTier = wsTier ?? 0; }
+  }
+  const limitMB = wsTier >= 3 ? 100 : wsTier === 2 ? 50 : 10;
+  return limitMB * 1048576 - 1_000_000; // room for the preview and the message itself
+}
+
+// ---- zip archives, read in memory (only what's needed: the file list and one picture)
+
+/** The entries of a zip; throws on anything unsafe (paths that climb out, absolute paths, too many files). */
+function zipEntries(u8) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  let eocd = -1;
+  for (let i = u8.length - 22; i >= Math.max(0, u8.length - 65_557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) fail(400, "That file isn't a valid OCTIVE package (not a zip archive).");
+  const count = dv.getUint16(eocd + 10, true), cdOff = dv.getUint32(eocd + 16, true);
+  if (count > 20000) fail(400, "That package has too many files.");
+  const dec = new TextDecoder();
+  const out = [];
+  let p = cdOff;
+  for (let n = 0; n < count; n++) {
+    if (p + 46 > u8.length || dv.getUint32(p, true) !== 0x02014b50) fail(400, "That package is damaged (its file list is broken).");
+    const method = dv.getUint16(p + 10, true), comp = dv.getUint32(p + 20, true), size = dv.getUint32(p + 24, true);
+    const nl = dv.getUint16(p + 28, true), xl = dv.getUint16(p + 30, true), cl = dv.getUint16(p + 32, true), local = dv.getUint32(p + 42, true);
+    const name = dec.decode(u8.subarray(p + 46, p + 46 + nl));
+    // Zip Slip: nothing may climb out of the folder it's unpacked into
+    const parts = name.replace(/\\/g, "/").split("/");
+    if (!name || name.includes("\0") || /^[\\/]/.test(name) || /^[A-Za-z]:/.test(name) || parts.includes("..")) fail(400, `That package has an unsafe path inside ("${name.slice(0, 80)}").`);
+    out.push({ name: name.replace(/\\/g, "/"), method, comp, size, local });
+    p += 46 + nl + xl + cl;
+  }
+  return out;
+}
+
+async function zipRead(u8, e, max = 8 * 1048576) {
+  if (e.size > max || e.comp > max) return null;
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  if (e.local + 30 > u8.length || dv.getUint32(e.local, true) !== 0x04034b50) return null;
+  const start = e.local + 30 + dv.getUint16(e.local + 26, true) + dv.getUint16(e.local + 28, true);
+  const raw = u8.subarray(start, start + e.comp);
+  if (e.method === 0) return raw;
+  if (e.method !== 8) return null;
+  const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  const buf = new Uint8Array(await new Response(stream).arrayBuffer());
+  return buf.length > max ? null : buf;
+}
+
+const isImageName = (n) => /\.(png|jpe?g)$/i.test(n);
+const imageType = (b) => b && b.length > 4 && b[0] === 0x89 && b[1] === 0x50 ? "png" : b && b.length > 3 && b[0] === 0xff && b[1] === 0xd8 ? "jpg" : null;
+
+/** The preview of a package: preview.png/.jpg, else the song's cover / the skin's note picture. */
+async function zipPreview(u8, entries, kind) {
+  const by = new Map(entries.map((e) => [e.name.toLowerCase(), e]));
+  const tryName = async (n) => { const e = n && by.get(String(n).replace(/\\/g, "/").toLowerCase()); if (!e) return null; const b = await zipRead(u8, e); return imageType(b) ? b : null; };
+  for (const n of ["preview.png", "preview.jpg", "preview.jpeg"]) { const b = await tryName(n); if (b) return b; }
+  const anyPreview = entries.find((e) => /(^|\/)preview\.(png|jpe?g)$/i.test(e.name));
+  if (anyPreview) { const b = await tryName(anyPreview.name); if (b) return b; }
+  // what the package's manifest points at
+  const man = by.get(kind === "skins" ? "skin.json" : "manifest.json");
+  if (man) {
+    try {
+      const m = JSON.parse(new TextDecoder().decode(await zipRead(u8, man, 2 * 1048576)));
+      const wanted = kind === "skins"
+        ? [m.images?.note, m.images?.receptor, m.images?.background]
+        : [m.song?.cover, m.song?.background, m.cover, m.artwork?.cover, m.song?.artwork?.cover, m.background];
+      for (const n of wanted) { const b = await tryName(n); if (b) return b; }
+    } catch { /* no manifest picture */ }
+  }
+  const guess = entries.filter((e) => isImageName(e.name) && /cover|bg|background|note/i.test(e.name)).sort((a, b) => a.size - b.size)[0];
+  return guess ? await tryName(guess.name) : null;
+}
+
+/** Checks a file and finds its preview; returns { preview } or throws a readable error. */
+async function wsInspect(kind, u8) {
+  if (kind === "charts" || kind === "skins") {
+    const entries = zipEntries(u8);
+    const need = kind === "skins" ? "skin.json" : "manifest.json";
+    if (!entries.some((e) => e.name.toLowerCase() === need)) fail(400, `That doesn't look like an OCTIVE ${kind === "skins" ? "skin" : "song"}: ${need} is missing.`);
+    return { preview: await zipPreview(u8, entries, kind) };
+  }
+  // themes and styles are JSON
+  let o;
+  try { o = JSON.parse(new TextDecoder().decode(u8)); } catch { fail(400, `That ${kind === "themes" ? "theme" : "style"} file isn't valid.`); }
+  if (kind === "styles") {
+    if (o.format !== "octive.style") fail(400, "That isn't an OCTIVE style (.octstyle).");
+    // a style's skin is inside it: its preview is the skin's
+    if (typeof o.skin === "string" && o.skin.length < 60_000_000) {
+      try {
+        const bin = Uint8Array.from(atob(o.skin), (c) => c.charCodeAt(0));
+        const entries = zipEntries(bin);
+        return { preview: await zipPreview(bin, entries, "skins") };
+      } catch (e) { if (e.status) throw e; }
+    }
+    return { preview: null };
+  }
+  if (!o || typeof o !== "object" || !(o.colors || o.Colors)) fail(400, "That isn't an OCTIVE theme (.octtheme).");
+  return { preview: null };
+}
+
+const wsPublic = (it) => ({
+  id: it.id, type: it.type, title: it.title, description: it.description, creator: it.creator, creatorId: it.creatorId,
+  fileName: it.fileName, size: it.size, at: it.at, downloads: it.downloads || 0,
+  preview: it.preview ? `${WORKER_BASE}/api/preview/${it.id}` : null,
+  discord: it.channelId && it.messageId && it.guildId ? `https://discord.com/channels/${it.guildId}/${it.channelId}/${it.messageId}` : null,
+});
+
+async function workshopRoutes(request, env, url, ctx) {
+  const path = url.pathname;
+  if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
+
+  // ---- list
+  if (path === "/api/items" && request.method === "GET") {
+    const type = url.searchParams.get("type");
+    const q = String(url.searchParams.get("q") || "").trim().toLowerCase();
+    const sort = url.searchParams.get("sort") || "new";
+    const db = await r2json(env, WS_DB, { items: [] });
+    let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type));
+    if (q) items = items.filter((it) => `${it.title} ${it.creator} ${it.description}`.toLowerCase().includes(q));
+    items.sort(sort === "popular" ? (a, b) => (b.downloads || 0) - (a.downloads || 0) || b.at - a.at : (a, b) => b.at - a.at);
+    const counts = {};
+    for (const it of db.items || []) if (!it.removed) counts[it.type] = (counts[it.type] || 0) + 1;
+    return reply({ items: items.slice(0, 300).map(wsPublic), counts, maxBytes: await wsMaxBytes(env).catch(() => null) });
+  }
+
+  // ---- a preview picture (kept in R2, so lists never depend on Discord's expiring links)
+  let m = path.match(/^\/api\/preview\/([a-z0-9]{16,40})$/);
+  if (m && request.method === "GET") {
+    const o = await env.RELEASES.get(`workshop/previews/${m[1]}`);
+    if (!o) return cors(new Response("Not found", { status: 404 }));
+    return cors(new Response(o.body, { headers: { "Content-Type": o.httpMetadata?.contentType || "image/png", "Cache-Control": "public, max-age=86400" } }));
+  }
+
+  // ---- download: a fresh Discord link (cached up to 12 hours)
+  m = path.match(/^\/api\/download\/([a-z0-9]{16,40})$/);
+  if (m && request.method === "GET") {
+    const db = await r2json(env, WS_DB, { items: [] });
+    const it = (db.items || []).find((x) => x.id === m[1] && !x.removed);
+    if (!it) fail(404, "That item isn't available any more.");
+    let c = wsUrls.get(it.id);
+    if (!c || c.until < Date.now()) {
+      let msg;
+      try { msg = await discordApi(env, "GET", `/channels/${it.channelId}/messages/${it.messageId}`); }
+      catch (e) { if (e.status === 404) fail(404, "That item was removed from Discord."); throw e; }
+      const att = (msg.attachments || []).find((a) => a.filename === it.fileName) || (msg.attachments || []).find((a) => !/^preview\./i.test(a.filename));
+      if (!att) fail(404, "That item's file is missing on Discord.");
+      // Discord's links say when they run out (ex=hex seconds); never keep one past that
+      let until = Date.now() + WS_URL_TTL;
+      const ex = (att.url.match(/[?&]ex=([0-9a-f]+)/) || [])[1];
+      if (ex) until = Math.min(until, parseInt(ex, 16) * 1000 - 300_000);
+      c = { url: att.url, until };
+      wsUrls.set(it.id, c);
+      if (wsUrls.size > 2000) wsUrls.delete(wsUrls.keys().next().value);
+    }
+    ctx.waitUntil(r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === it.id); if (!x) return false; x.downloads = (x.downloads || 0) + 1; }).catch(() => {}));
+    if (url.searchParams.get("redirect") === "1") return cors(Response.redirect(c.url, 302));
+    return reply({ url: c.url, fileName: it.fileName, size: it.size, type: it.type, title: it.title });
+  }
+
+  // ---- upload from the game
+  if (path === "/api/upload" && request.method === "POST") {
+    if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID) fail(503, "Uploads aren't set up on the server.");
+    const who = await signedIn(request, env);
+    const cfg = config(env);
+    await loadModeration(cfg);
+    if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+    // a few uploads a day per player
+    const day = new Date().toISOString().slice(0, 10);
+    const rateKey = `workshop/rate/${who.playerId}.json`;
+    const rate = await r2json(env, rateKey, { day, n: 0 });
+    if (rate.day !== day) { rate.day = day; rate.n = 0; }
+    const isStaff = badgesOf(who.playerId).some((b) => b === "DEV" || b === "MOD");
+    if (rate.n >= 15 && !isStaff) fail(429, "You've uploaded a lot today. Try again tomorrow.");
+
+    const max = await wsMaxBytes(env);
+    const len = Number(request.headers.get("Content-Length") || 0);
+    if (len > max + 200_000) fail(413, `That's too big: the OCTIVE Discord takes files up to ${Math.floor(max / 1048576)} MB right now.`);
+    let form;
+    try { form = await request.formData(); } catch { fail(400, "The upload wasn't readable (multipart/form-data expected)."); }
+    const file = form.get("file");
+    if (!file || typeof file === "string") fail(400, "No file was attached.");
+    const fileName = String(file.name || "item").replace(/[^A-Za-z0-9 ._()\[\]'&+,-]/g, "_").slice(0, 100);
+    const ext = (fileName.match(/\.[A-Za-z]+$/) || [""])[0].toLowerCase();
+    const type = WS_TYPES[ext];
+    if (!type) fail(400, "Only .oct (charts), .octskin (skins), .octtheme (themes) and .octstyle (styles) files can be shared.");
+    if (file.size > max) fail(413, `That's too big: the OCTIVE Discord takes files up to ${Math.floor(max / 1048576)} MB right now.`);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const { preview } = await wsInspect(type, bytes);
+
+    const clean = (v, n) => String(v || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@​$1").trim().slice(0, n);
+    const card = (await publicItems(cfg, who.playerId, ["card"]).catch(() => ({}))).card || {};
+    const creator = clean(moderation.overrides[who.playerId]?.name || card.name || form.get("creator") || who.username || "Player", 40);
+    const title = clean(form.get("title"), 80) || fileName.replace(/\.[^.]+$/, "");
+    const description = clean(form.get("description"), 1000);
+    const id = crypto.randomUUID().replace(/-/g, "").slice(0, 20);
+
+    const channels = await wsChannelIds(env);
+    const channelId = channels[type];
+    if (!channelId) fail(503, `The #${WS_CHANNEL[type]} channel wasn't found on the OCTIVE Discord.`);
+    const pType = imageType(preview);
+    const embed = {
+      title: `${WS_LABEL[type]}: ${title}`.slice(0, 256), color: WS_COLOR[type],
+      description: description || undefined,
+      author: { name: `by ${creator}`, url: `${SITE}#/u/${encodeURIComponent(who.playerId)}` },
+      fields: [
+        { name: "File", value: `${fileName} · ${(bytes.length / 1048576).toFixed(bytes.length < 1048576 ? 2 : 1)} MB`, inline: true },
+        { name: "Get it", value: `Download the file below, or in OCTIVE: Play → Workshop`, inline: true },
+      ],
+      footer: { text: `Shared from OCTIVE · ${id}` },
+      timestamp: new Date().toISOString(),
+    };
+    if (pType) embed.image = { url: `attachment://preview.${pType}` };
+    const fd = new FormData();
+    fd.append("payload_json", JSON.stringify({
+      embeds: [embed], allowed_mentions: { parse: [] },
+      attachments: [{ id: 0, filename: fileName }, ...(pType ? [{ id: 1, filename: `preview.${pType}` }] : [])],
+    }));
+    fd.append("files[0]", new Blob([bytes], { type: "application/octet-stream" }), fileName);
+    if (pType) fd.append("files[1]", new Blob([preview], { type: pType === "png" ? "image/png" : "image/jpeg" }), `preview.${pType}`);
+    let posted;
+    try { posted = await discordApi(env, "POST", `/channels/${channelId}/messages`, fd, true); }
+    catch (e) { if (e.status === 413) fail(413, "Discord refused the file: it's too big for the server right now."); throw e; }
+
+    if (pType) await env.RELEASES.put(`workshop/previews/${id}`, preview, { httpMetadata: { contentType: pType === "png" ? "image/png" : "image/jpeg" } });
+    const item = { id, type, title, description, creator, creatorId: who.playerId, fileName, size: bytes.length, channelId, messageId: posted.id, guildId: env.DISCORD_GUILD_ID, at: Date.now(), downloads: 0, preview: !!pType };
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => { d.items = d.items || []; d.items.push(item); });
+    rate.n += 1;
+    await r2put(env, rateKey, rate);
+    return reply({ ok: true, item: wsPublic(item) });
+  }
+
+  // ---- remove (the creator, or developers and moderators): the Discord message goes too
+  m = path.match(/^\/api\/items\/([a-z0-9]{16,40})\/remove$/);
+  if (m && request.method === "POST") {
+    const who = await signedIn(request, env);
+    await loadModeration(config(env));
+    const staff = badgesOf(who.playerId).some((b) => b === "DEV" || b === "MOD") || who.playerId === OWNER;
+    let gone = null;
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      const x = (d.items || []).find((y) => y.id === m[1] && !y.removed);
+      if (!x) return false;
+      if (x.creatorId !== who.playerId && !staff) return false;
+      x.removed = true; gone = x;
+    });
+    if (!gone) fail(404, "That item isn't yours, or it's already gone.");
+    ctx.waitUntil(discordApi(env, "DELETE", `/channels/${gone.channelId}/messages/${gone.messageId}`).catch(() => {}));
+    ctx.waitUntil(env.RELEASES.delete(`workshop/previews/${gone.id}`).catch(() => {}));
+    wsUrls.delete(gone.id);
+    return reply({ ok: true });
+  }
+  fail(404, "Not found.");
+}
+
 async function dmRoutes(request, env, url) {
   const path = url.pathname;
   let m;
@@ -2432,6 +2722,10 @@ export default {
     }
     if (/^\/(support\/|stripe\/webhook$|looks\/|social\/|follow$)/.test(url.pathname)) {
       try { const r = await supportRoutes(request, env, url, ctx); if (r) return r; }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+    }
+    if (url.pathname.startsWith("/api/")) {
+      try { return await workshopRoutes(request, env, url, ctx); }
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/chat/")) {

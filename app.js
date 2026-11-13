@@ -442,29 +442,39 @@
 
   function home() {
     const players = data ? data.players : [];
-    const version = h("div.home-meta");
-    const hero = h("section.home-hero",
-      {},
-      h("div.home-copy", {},
-        h("span.eyebrow", { text: "Free rhythm game · Windows and Android" }),
-        h("h1", {}, "Hit every note.", h("br"), h("span.grad", { text: "Climb the ranking." })),
-        h("p.lead", { text: "OCTIVE is a vertical scrolling rhythm game for 1 to 20 keys. Bring your osu!mania library, play with friends online and earn performance rating (PR) on a global ranking." }),
-        h("div.cta", {},
-          h("a.btn.primary", { href: "#/download" }, "Download free"),
-          h("a.btn.play", { href: "play/" }, "▶ Play in browser"),
-          h("a.btn", { href: "#/rankings" }, "See the rankings")),
-        version),
-      h("div.home-art", {}, playfield(), emblemSvg()));
-    const stat = (label, value, cls) => h("div.hstat", {}, h("b" + (cls ? "." + cls : ""), { text: value }), h("span", { text: label }));
+    const online = players.filter((p) => p.online).length;
     const top = players[0];
-    const stats = h("section.home-stats", {},
-      stat("Ranked players", data ? fmt0.format(players.length) : "…"),
-      stat("Online now", data ? fmt0.format(players.filter((p) => p.online).length) : "…", "online-count"),
-      stat("Top performance", top ? fmt0.format(top.pp) + " PR" : "—"),
-      stat("Latest version", "…"));
-    const features = h("section.features", {},
-      h("h2.section-title", { text: "Everything a rhythm game player wants" }),
-      h("div.feature-grid", {}, FEATURES.map(([id, title, text]) => h("article.feature", {}, icon(id), h("h3", { text: title }), h("p", { text })))));
+    const verPill = h("span.h2-pill", {}, h("span.h2-dot"), "Free · Windows, Android and your browser");
+    const hero = h("section.h2-hero", {},
+      h("div.h2-glow"),
+      h("div.h2-copy", {},
+        verPill,
+        h("h1", {}, "The rhythm game", h("br"), h("span.grad", { text: "you make your own." })),
+        h("p.lead", { text: "OCTIVE is a vertical scrolling rhythm game for 1 to 20 keys. Play your osu!mania library, chart your own songs, share skins and charts in the Workshop, and climb a global ranking with friends." }),
+        h("div.cta", {},
+          h("a.btn.primary.big", { href: "#/download" }, "Download free"),
+          h("a.btn.big", { href: "play/" }, "▶ Play in browser"))),
+      h("div.h2-art", {}, h("div.h2-frame", {}, playfield()), emblemSvg(64)));
+    const live = (label, value, cls) => h("div.h2-live" + (cls ? "." + cls : ""), {}, h("b", { text: value }), h("span", { text: label }));
+    const vEl = live("Latest version", "…");
+    const strip = h("section.h2-strip", {},
+      live("Online now", data ? fmt0.format(online) : "…", "on"),
+      live("Ranked players", data ? fmt0.format(players.length) : "…"),
+      live("Top performance", top ? fmt0.format(top.pp) + " PR" : "—"),
+      vEl);
+
+    // what's new: the latest release and its notes
+    const news = h("article.h2-card.h2-news", {}, h("p.empty", { text: "Loading the latest update…" }));
+    // fresh from the Workshop
+    const shelf = h("div.h2-shelf", {}, h("p.empty", { text: "Loading the Workshop…" }));
+    const row2 = h("section.h2-row", {},
+      h("div.h2-col", {}, h("div.section-head", {}, h("h2.section-title", { text: "What's new" }), h("a.more", { href: "#/updates" }, "All updates →")), news),
+      h("div.h2-col.wide", {}, h("div.section-head", {}, h("h2.section-title", { text: "Fresh in the Workshop" }), h("a.more", { href: "#/workshop" }, "Browse →")), shelf));
+
+    const features = h("section.h2-features", {},
+      h("h2.section-title", { text: "Everything you need to play, make and share" }),
+      h("div.h2-bento", {}, FEATURES.map(([id, title, text], i) => h("article.h2-feature" + (i < 2 ? ".big" : ""), {}, icon(id), h("h3", { text: title }), h("p", { text })))));
+
     const podium = h("section.home-top", {},
       h("div.section-head", {}, h("h2.section-title", { text: "Top players" }), h("a.more", { href: "#/rankings" }, "Full ranking →")),
       h("div.podium", {}, players.slice(0, 3).map((p) => {
@@ -478,17 +488,95 @@
         setRole(a, a.querySelector(".badge"), p);
         return a;
       }), !players.length ? h("p.empty", { text: data ? "No ranked players yet. Be the first!" : "Loading the ranking…" }) : null));
-    const end = h("section.home-end", {},
-      emblemSvg(84),
-      h("div", {}, h("h2", { text: "Ready to play?" }), h("p", { text: "OCTIVE is free. The installer always gets you the newest version, and the game updates itself." })),
-      h("a.btn.primary", { href: "#/download" }, "Download OCTIVE"));
-    app.replaceChildren(hero, stats, features, podium, end);
-    document.title = "OCTIVE · Free vertical scrolling rhythm game";
+    const end = h("section.h2-end", {},
+      emblemSvg(72),
+      h("div", {}, h("h2", { text: "Ready to play?" }), h("p", { text: "It's free. The installer always gets the newest version, and the game updates itself." })),
+      h("div.cta", {}, h("a.btn.primary.big", { href: "#/download" }, "Download OCTIVE")));
+    app.replaceChildren(hero, strip, row2, features, podium, end);
+    document.title = "OCTIVE · The rhythm game you make your own";
+
     loadRelease().then((m) => {
       if (!m || !hero.isConnected) return;
-      stats.lastChild.querySelector("b").textContent = "v" + m.version;
-      version.textContent = `Version ${m.version} · ${new Date(m.published).toLocaleDateString(undefined, { dateStyle: "medium" })}`;
+      vEl.querySelector("b").textContent = "v" + m.version;
+      verPill.lastChild.textContent = `Free · v${m.version} · Windows, Android and your browser`;
     });
+    fetch(worker + "/releases/history.json", { cache: "no-cache" }).then((r) => r.ok ? r.json() : []).catch(() => []).then((hist) => {
+      if (!news.isConnected) return;
+      const x = (Array.isArray(hist) ? hist : []).find((y) => y && y.version && !/test/i.test(y.version));
+      if (!x) { news.replaceChildren(h("p.empty", { text: "No updates yet." })); return; }
+      const when = x.published ? new Date(x.published).toLocaleDateString(undefined, { dateStyle: "long" }) : "";
+      const body = x.announcement ? markdown(x.announcement) : h("div.md", {}, h("p", { text: x.notes || "" }));
+      news.replaceChildren(h("header.h2-news-head", {}, h("b", { text: "OCTIVE " + x.version }), h("span", { text: when })), body, h("a.btn.small", { href: "#/updates/" + x.version }, "Read it all"));
+    });
+    fetch(worker + "/api/items?sort=new", { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+      if (!shelf.isConnected) return;
+      const items = (d && d.items) || [];
+      if (!items.length) { shelf.replaceChildren(h("p.empty", { text: "Nothing shared yet. Share yours from the game: Play → Workshop." })); return; }
+      shelf.replaceChildren(...items.slice(0, 6).map(workshopCard));
+    });
+  }
+
+  // ---------------------------------------------------------------- #/workshop: charts, skins, themes and styles players shared
+  const WS_TYPES = [["charts", "Charts"], ["skins", "Skins"], ["themes", "Themes"], ["styles", "Styles"]];
+  const WS_LABEL = { charts: "Chart", skins: "Skin", themes: "Theme", styles: "Style" };
+  let wsType = "charts", wsSort = "new", wsQuery = "";
+
+  function workshopCard(it) {
+    const pic = h("div.ws-pic" + (it.type === "skins" || it.type === "styles" ? ".contain" : ""));
+    if (it.preview) { const img = h("img", { src: it.preview, alt: "", loading: "lazy" }); img.onerror = () => img.remove(); pic.append(img); }
+    else pic.append(h("span.ws-type", { text: WS_LABEL[it.type] || "" }));
+    const kb = it.size / 1048576;
+    return h("article.ws-card", {},
+      pic,
+      h("div.ws-body", {},
+        h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
+        h("h3", { text: it.title }),
+        h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
+        it.description ? h("p.ws-desc", { text: it.description.length > 180 ? it.description.slice(0, 180) + "…" : it.description }) : null,
+        h("span.ws-meta", { text: `${kb.toFixed(kb < 1 ? 2 : 1)} MB · ${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"} · ${new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })}` }),
+        h("div.ws-actions", {},
+          h("a.btn.primary.small", { href: `${worker}/api/download/${it.id}?redirect=1` }, "Download"),
+          it.discord ? h("a.btn.small", { href: it.discord, target: "_blank", rel: "noopener" }, "On Discord") : null)));
+  }
+
+  function workshopPage() {
+    document.title = "Workshop · OCTIVE";
+    const tabs = h("div.ws-tabs");
+    const grid = h("div.ws-grid", {}, h("p.empty", { text: "Loading…" }));
+    const status = h("p.ws-status");
+    const search = h("input.help-search.ws-search", { type: "search", placeholder: "Search titles and creators…", value: wsQuery });
+    const sort = h("select.ws-sort", {}, h("option", { value: "new", text: "Newest" }), h("option", { value: "popular", text: "Most downloaded" }));
+    sort.value = wsSort;
+    let counts = {};
+    const paintTabs = () => tabs.replaceChildren(...WS_TYPES.map(([id, name]) => {
+      const b = h("button.ws-tab" + (id === wsType ? ".on" : ""), { type: "button" }, name, counts[id] ? h("span.ws-count", { text: String(counts[id]) }) : null);
+      b.addEventListener("click", () => { wsType = id; paintTabs(); load(); });
+      return b;
+    }));
+    let gen = 0;
+    const load = () => {
+      const g = ++gen;
+      status.textContent = "Loading…";
+      fetch(`${worker}/api/items?type=${wsType}&sort=${wsSort}${wsQuery ? "&q=" + encodeURIComponent(wsQuery) : ""}`, { cache: "no-cache" })
+        .then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+          if (g !== gen || !grid.isConnected) return;
+          if (!d) { status.textContent = "The Workshop can't be reached right now."; grid.replaceChildren(); return; }
+          counts = d.counts || {}; paintTabs();
+          const what = (WS_TYPES.find((t) => t[0] === wsType) || [, "items"])[1].toLowerCase();
+          status.textContent = d.items.length ? `${d.items.length} ${what}` : (wsQuery ? `No ${what} match "${wsQuery}".` : `No ${what} shared yet.`);
+          grid.replaceChildren(...d.items.map(workshopCard));
+        });
+    };
+    let t = null;
+    search.addEventListener("input", () => { wsQuery = search.value.trim(); clearTimeout(t); t = setTimeout(load, 250); });
+    sort.addEventListener("change", () => { wsSort = sort.value; load(); });
+    app.replaceChildren(h("div.ws-page", {},
+      h("section.page-head", {}, h("h1", { text: "Workshop" }),
+        h("p.sub", { text: "Charts, skins, themes and styles made by players. Download them here and open them with OCTIVE, or get them in the game (Play → Workshop). To share yours, use Share in the game: it's posted in the OCTIVE Discord too." })),
+      h("div.ws-bar", {}, tabs, h("div.ws-tools", {}, search, sort)),
+      status, grid));
+    paintTabs();
+    load();
   }
 
   // ---------------------------------------------------------------- downloads
@@ -1871,6 +1959,7 @@
   function route(fromHashChange) {
     const pg = page();
     for (const a of document.querySelectorAll("[data-nav]")) a.classList.toggle("active", a.dataset.nav === (pg === "player" ? "rankings" : pg));
+    document.querySelector(".nav-more-btn")?.classList.toggle("active", pg === "supporter" || pg === "help");
     if ((pg === "rankings" || pg === "player") && !data) { app.replaceChildren(h("p.empty", { text: "Loading the ranking…" })); return; }
     if (pg === "player") player(decodeURIComponent(location.hash.slice(4)));
     else if (pg === "rankings") rankings();
@@ -1880,12 +1969,19 @@
     else if (pg === "supporter") supporterPage();
     else if (pg === "help") helpPage();
     else if (pg === "updates") updatesPage();
+    else if (pg === "workshop") workshopPage();
     else if (pg === "messages") messagesPage();
     else home();
     if (fromHashChange) window.scrollTo(0, 0);
   }
 
-  window.addEventListener("hashchange", () => { route(true); document.body.classList.remove("menu-open"); });
+  window.addEventListener("hashchange", () => { route(true); document.body.classList.remove("menu-open"); document.querySelector(".nav-more")?.classList.remove("open"); });
+  // the More menu opens on click too (touch screens), and closes when you click elsewhere
+  const more = document.querySelector(".nav-more");
+  if (more) {
+    more.querySelector(".nav-more-btn").addEventListener("click", (e) => { e.stopPropagation(); more.classList.toggle("open"); });
+    document.addEventListener("click", (e) => { if (!more.contains(e.target)) more.classList.remove("open"); });
+  }
   // phones: the links fold into a menu button
   const menuBtn = document.querySelector(".menu-btn");
   if (menuBtn) menuBtn.addEventListener("click", () => document.body.classList.toggle("menu-open"));

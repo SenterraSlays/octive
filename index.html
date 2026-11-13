@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=1.4.2-1">
+  <link rel="stylesheet" href="style.css?v=1.4.6-1">
   <link rel="icon" href="logo.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="logo-512.png">
 </head>
@@ -18,17 +18,27 @@
       <img src="logo.svg" alt="" width="30" height="30">
       <span>OCTIVE</span>
     </a>
-    <nav>
-      <a href="#/" data-nav="home">Home</a>
+    <nav class="nav-main">
       <a href="#/rankings" data-nav="rankings">Rankings</a>
+      <a href="#/workshop" data-nav="workshop">Workshop</a>
       <a href="#/download" data-nav="download">Download</a>
       <a href="#/updates" data-nav="updates">Updates</a>
-      <a href="#/supporter" data-nav="supporter" class="nav-support">♥ Supporter</a>
-      <a href="#/help" data-nav="help">Help</a>
-      <a href="#/messages" data-nav="messages" hidden>Messages</a>
-      <a href="#/account" data-nav="account" class="nav-account">Sign in</a>
+      <div class="nav-more">
+        <button type="button" class="nav-more-btn" aria-haspopup="true">More <span aria-hidden="true">▾</span></button>
+        <div class="nav-menu">
+          <a href="#/supporter" data-nav="supporter" class="nav-support">♥ Supporter</a>
+          <a href="#/help" data-nav="help">Help</a>
+          <a href="play/">Play in browser</a>
+          <a href="privacy.html">Privacy</a>
+          <a href="terms.html">Terms</a>
+        </div>
+      </div>
     </nav>
-    <span class="updated" id="updated"></span>
+    <div class="nav-right">
+      <span class="updated" id="updated"></span>
+      <a href="#/messages" data-nav="messages" class="nav-msg" hidden>Messages</a>
+      <a href="#/account" data-nav="account" class="nav-account">Sign in</a>
+    </div>
     <button class="menu-btn" type="button" aria-label="Menu"><span></span><span></span><span></span></button>
   </header>
 
@@ -36,7 +46,7 @@
 
   <footer class="foot">
     <span>OCTIVE · a free vertical scrolling rhythm game</span>
-    <span><a href="#/download">Download</a> · <a href="#/updates">Updates</a> · <a href="#/rankings">Rankings</a> · <a href="#/supporter">Supporter</a> · <a href="#/help">Help</a> · <a href="#/account">Account</a> · <a href="privacy.html">Privacy</a> · <a href="terms.html">Terms</a></span>
+    <span><a href="#/download">Download</a> · <a href="#/workshop">Workshop</a> · <a href="#/updates">Updates</a> · <a href="#/rankings">Rankings</a> · <a href="#/supporter">Supporter</a> · <a href="#/help">Help</a> · <a href="#/account">Account</a> · <a href="privacy.html">Privacy</a> · <a href="terms.html">Terms</a></span>
   </footer>
 
   <template id="tpl-rankings">
@@ -116,6 +126,6 @@
     <section class="socials" hidden><h2>Socials</h2><div class="social-links"></div></section>
   </template>
 
-  <script src="app.js?v=1.4.2-1"></script>
+  <script src="app.js?v=1.4.6-1"></script>
 </body>
 </html>
