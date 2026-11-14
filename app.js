@@ -442,6 +442,7 @@
       if (title) { const row = card.querySelector(".card-name-row"); if (row) row.after(h("div.shop-title", { text: title })); }
       if (isOfficial(p)) return;
       const songs = (mine.showcase || []).filter((x) => x && x.kind !== "ach").slice(0, 3);
+      if (!mine.hasShowcase && !songs.length) return; // they haven't unlocked one
       const row = showcase.querySelector(".sc-row");
       for (let i = 0; i < 3; i++) row.append(songs[i] ? showcaseCard(songs[i]) : h("div.sc-empty", { text: "Empty" }));
       showcase.hidden = false;

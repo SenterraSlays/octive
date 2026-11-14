@@ -3191,7 +3191,7 @@ let cosmeticsCache = null, cosmeticsAt = 0;
 async function writeCosmetics(env, id, w) {
   let best = -1;
   for (const d of Object.values(w.dans || {})) { const i = DAN_LEVELS.indexOf(d.level); if (i > best) best = i; }
-  const e = { title: w.equipped.title || undefined, frame: w.equipped.frame || undefined, icon: w.equipped.icon || undefined,
+  const e = { title: w.equipped.title || undefined, frame: w.equipped.frame || undefined, icon: w.equipped.icon || undefined, hasShowcase: (w.owned || []).includes("showcase") || undefined,
     showcase: (w.showcase || []).length ? w.showcase : undefined, dan: best >= 0 ? DAN_LEVELS[best] : undefined, dans: Object.keys(w.dans || {}).length || undefined };
   const empty = Object.values(e).every((v) => v === undefined);
   await r2update(env, COSMETICS_KEY, () => ({ players: {} }), (d) => { d.players ||= {}; if (empty) delete d.players[id]; else d.players[id] = e; });
@@ -3218,7 +3218,7 @@ async function dailyOf(env, date) {
   const all = [];
   for (const it of (db.items || []).filter((x) => x.type === "charts" && x.verified && !x.removed && !x.dan && x.meta).sort((x, y) => String(x.id).localeCompare(String(y.id))))
     for (const sg of it.meta.songs || []) for (const c of sg.charts || [])
-      if (c.keys === 4 && c.notes > 0 && sg.songId) all.push({ it, sg, c });
+      if (c.keys === 4 && c.notes > 0 && sg.songId && !(it.dans || []).some((d) => d.songId === sg.songId && d.difficulty === c.difficulty)) all.push({ it, sg, c });
   const charts = {};
   for (const t of DAILY_TIERS) {
     const pool = all.filter((x) => x.c.stars >= t.min && x.c.stars <= t.max);
@@ -3341,7 +3341,13 @@ async function playRoutes(request, env, url) {
   }
   if (path === "/play/wallet" && request.method === "GET") {
     const who = await signedIn(request, env);
-    return reply({ wallet: walletPublic(await walletOf(env, who.playerId), who.playerId) });
+    const w = await walletOf(env, who.playerId);
+    // showcases bought before others could see who owns one
+    if (w.owned.includes("showcase")) {
+      const idx = (await r2json(env, COSMETICS_KEY, { players: {} })).players || {};
+      if (!(idx[who.playerId] && idx[who.playerId].hasShowcase)) await writeCosmetics(env, who.playerId, w);
+    }
+    return reply({ wallet: walletPublic(w, who.playerId) });
   }
   if (path === "/play/shop/buy" && request.method === "POST") {
     const who = await signedIn(request, env);
@@ -3383,11 +3389,13 @@ async function playRoutes(request, env, url) {
           x.spotlightUntil = new Date(from + 86_400_000).toISOString();
         });
       } else {
-        await walletUpdate(env, to, (w) => {
+        const got = await walletUpdate(env, to, (w) => {
           if (item.kind === "freeze") w.freezes = Math.min(2, (w.freezes || 0) + 1);
           else if (!w.owned.includes(item.id)) w.owned.push(item.id);
           if (giftTo) remember(w, { kind: "gift", item: item.id, from: who.playerId });
         });
+        // others see a showcase once it's owned
+        if (got && item.kind === "showcase") await writeCosmetics(env, to, got);
       }
     } catch (e) {
       if (!free) await walletUpdate(env, who.playerId, (w) => { w.balance += item.price; remember(w, { kind: "refund", item: item.id, price: item.price }); });
@@ -3464,8 +3472,10 @@ async function playRoutes(request, env, url) {
   // ---- dans: the Workshop songs marked as dans, and clearing one
   if (path === "/play/dans" && request.method === "GET") {
     const db = await r2json(env, WS_DB, { items: [] });
-    const dans = (db.items || []).filter((it) => it.dan && !it.removed).map((it) => ({ itemId: it.id, level: it.dan.level, title: it.title, songIds: it.songIds || [] }))
-      .sort((a, b) => DAN_LEVELS.indexOf(a.level) - DAN_LEVELS.indexOf(b.level));
+    const dans = [];
+    for (const it of (db.items || []).filter((x) => !x.removed && Array.isArray(x.dans)))
+      for (const d of it.dans) dans.push({ itemId: it.id, songId: d.songId, difficulty: d.difficulty, level: d.level, title: it.title });
+    dans.sort((a, b) => DAN_LEVELS.indexOf(a.level) - DAN_LEVELS.indexOf(b.level));
     return reply({ dans, levels: DAN_LEVELS, clearAcc: DAN_CLEAR_ACC });
   }
   if (path === "/play/dan/clear" && request.method === "POST") {
@@ -3473,25 +3483,28 @@ async function playRoutes(request, env, url) {
     const b = await bodyOf(request, 4_000);
     if (String(b.mods || "").trim()) fail(400, "Dans are played without mods.");
     const db = await r2json(env, WS_DB, { items: [] });
-    const it = (db.items || []).find((x) => x.dan && !x.removed && (x.songIds || []).includes(String(b.songId || "")));
-    if (!it) fail(404, "That song isn't a dan.");
-    const song = ((it.meta && it.meta.songs) || []).find((s) => s.songId === String(b.songId));
-    const chart = song && (song.charts || []).find((c) => c.difficulty === String(b.difficulty || ""));
-    if (!chart) fail(404, "That difficulty isn't part of the dan.");
+    const songId = String(b.songId || ""), difficulty = String(b.difficulty || "");
+    const it = (db.items || []).find((x) => !x.removed && Array.isArray(x.dans) && x.dans.some((d) => d.songId === songId && d.difficulty === difficulty));
+    if (!it) fail(404, "That difficulty isn't a dan.");
+    const dan = it.dans.find((d) => d.songId === songId && d.difficulty === difficulty);
+    const song = ((it.meta && it.meta.songs) || []).find((s) => s.songId === songId);
+    const chart = song && (song.charts || []).find((c) => c.difficulty === difficulty);
+    if (!chart) fail(404, "That difficulty isn't in the Workshop upload any more.");
     const acc = countsAccuracy(b.counts, chart.notes);
     if (acc === null) fail(400, "That play doesn't match the dan.");
     const cleared = acc >= DAN_CLEAR_ACC;
     let w = null;
     if (cleared) {
+      const key = `${songId}|${difficulty}`;
       w = await walletUpdate(env, who.playerId, (w) => {
-        const old = w.dans[it.id];
+        const old = w.dans[key];
         if (old && old.acc >= acc) return false;
-        w.dans[it.id] = { level: it.dan.level, acc: Math.round(acc * 100) / 100, at: new Date().toISOString() };
-        remember(w, { kind: "dan", level: it.dan.level, acc: Math.round(acc * 100) / 100 });
+        w.dans[key] = { level: dan.level, acc: Math.round(acc * 100) / 100, at: new Date().toISOString(), title: String(song.title || it.title || "").slice(0, 80), difficulty: difficulty.slice(0, 60) };
+        remember(w, { kind: "dan", level: dan.level, acc: Math.round(acc * 100) / 100 });
       });
       if (w) await writeCosmetics(env, who.playerId, w);
     }
-    return reply({ ok: true, cleared, level: it.dan.level, accuracy: Math.round(acc * 100) / 100, needed: DAN_CLEAR_ACC });
+    return reply({ ok: true, cleared, level: dan.level, accuracy: Math.round(acc * 100) / 100, needed: DAN_CLEAR_ACC });
   }
   fail(404, "Not found");
 }
@@ -3504,7 +3517,7 @@ const wsPublic = (it) => ({
   songIds: it.songIds || [], songs: it.meta && it.meta.songs ? it.meta.songs : undefined,
   tags: Array.isArray(it.tags) ? it.tags : [],
   verifyRequested: it.verifyRequest && !it.verified ? it.verifyRequest.at : undefined,
-  dan: it.dan ? it.dan.level : undefined,
+  dans: Array.isArray(it.dans) && it.dans.length ? it.dans.map((d) => ({ songId: d.songId, difficulty: d.difficulty, level: d.level })) : undefined,
   spotlight: it.spotlightUntil && Date.parse(it.spotlightUntil) > Date.now() ? it.spotlightUntil : undefined,
   preview: it.preview ? `${WORKER_BASE}/api/preview/${it.id}` : null,
   discord: it.channelId && it.messageId && it.guildId ? `https://discord.com/channels/${it.guildId}/${it.channelId}/${it.messageId}` : null,
@@ -3594,7 +3607,7 @@ async function workshopRoutes(request, env, url, ctx) {
     if (wantTags.length) items = items.filter((it) => wantTags.every((t) => (it.tags || []).includes(t)));
     // ?requested=1: songs waiting for a verification check (Senterra and Octive)
     if (sp.get("requested") === "1") items = items.filter((it) => it.verifyRequest && !it.verified);
-    if (sp.get("dan") === "1") items = items.filter((it) => !!it.dan);
+    if (sp.get("dan") === "1") items = items.filter((it) => Array.isArray(it.dans) && it.dans.length > 0);
     const topStars = (it) => Math.max(0, ...((it.meta && it.meta.songs) || []).flatMap((sg) => (sg.charts || []).map((c) => c.stars || 0)));
     items.sort(
       sort === "popular" ? (a, b) => (b.downloads || 0) - (a.downloads || 0) || b.at - a.at
@@ -3662,18 +3675,26 @@ async function workshopRoutes(request, env, url, ctx) {
   // ---- verify (Senterra and the official account): OCTIVE vouches for it
   mi = path.match(/^\/api\/items\/([a-z0-9]{16,40})\/dan$/);
   if (mi && request.method === "POST") {
+    // one difficulty of a song is a dan (a pack's 1st to 10th can each be one)
     const who = await signedIn(request, env);
     if (who.playerId !== OWNER && !isOfficial(who.playerId)) await freshModeration(env);
     if (who.playerId !== OWNER && !isOfficial(who.playerId) && !badgesOf(who.playerId).includes("CHARTER")) fail(403, "Only Senterra, the official OCTIVE account and charters can mark dans.");
     const b = await bodyOf(request);
     const level = b.level ? String(b.level) : null;
     if (level && !DAN_LEVELS.includes(level)) fail(400, "Pick a dan level.");
-    let out = null;
+    const songId = String(b.songId || ""), difficulty = String(b.difficulty || "");
+    let out = null, missing = false;
     await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
       const x = (d.items || []).find((y) => y.id === mi[1]); if (!x || x.type !== "charts") return false;
-      if (level) x.dan = { level, by: who.playerId, at: new Date().toISOString() }; else delete x.dan;
+      const sg = ((x.meta && x.meta.songs) || []).find((g) => g.songId === songId);
+      if (!sg || !(sg.charts || []).some((c) => c.difficulty === difficulty)) { missing = true; return false; }
+      delete x.dan; // the older whole-upload marking
+      x.dans = (x.dans || []).filter((e) => !(e.songId === songId && e.difficulty === difficulty));
+      if (level) x.dans.push({ songId, difficulty, level, by: who.playerId, at: new Date().toISOString() });
+      if (!x.dans.length) delete x.dans;
       out = x;
     });
+    if (missing) fail(404, "That difficulty isn't in this upload.");
     if (!out) fail(404, "That song isn't in the Workshop any more.");
     return reply({ ok: true, item: wsPublic(out) });
   }
