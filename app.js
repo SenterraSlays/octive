@@ -57,6 +57,8 @@
 
   const app = document.getElementById("app");
   const fmt0 = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
+// profile tile counts: 999, then 1.00k, then 1.00m (rounded down)
+const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" : n >= 1000 ? (Math.floor(n / 10) / 100).toFixed(2) + "k" : fmt0.format(n);
   const fmt2 = new Intl.NumberFormat(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   let data = null;
 
@@ -1739,7 +1741,7 @@
       followBtn.disabled = true;
       try {
         const r = await callApi("/follow", { playerId: p.id, follow: want }, true);
-        youFollow = want; followers.textContent = fmt0.format(r.followers);
+        youFollow = want; followers.textContent = fmtCount(r.followers);
       } catch (e) { out.textContent = e.message; }
       followBtn.disabled = false; paint();
     });
@@ -1766,9 +1768,9 @@
         const token = store.get("octive.token", true);
         const res = await fetch(`${worker}/social/${encodeURIComponent(p.id)}`, { headers: token ? { Authorization: "Bearer " + token } : {} });
         const s = await res.json();
-        followers.textContent = fmt0.format(s.followers || 0);
-        following.textContent = fmt0.format((s.following || []).length);
-        friends.textContent = s.friends != null ? fmt0.format(s.friends) : "—";
+        followers.textContent = fmtCount(s.followers || 0);
+        following.textContent = fmtCount((s.following || []).length);
+        friends.textContent = s.friends != null ? fmtCount(s.friends) : "—";
         youFollow = isOwner || s.youFollow === true;
         paint();
         // their Discord, when they chose to show it (Settings → Profile → Discord in the game)
