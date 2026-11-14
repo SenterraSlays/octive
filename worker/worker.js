@@ -25,7 +25,7 @@ const ONLINE_MS = 5 * 60_000;
 const PP_VERSION = 3;              // the game's PP formula (Performance.Version); older totals are listed after      // "online" when the game wrote its heartbeat this recently
 const DEVELOPERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE"]; // same list as the game's PlayerRoles
 
-let board = null, boardAt = 0, boardPromise = null;
+let board = null, boardAt = 0, boardBuildingAt = 0;
 const cards = new Map();           // playerId -> { card, seen, at }
 const avatars = new Map();         // playerId:hash -> Uint8Array
 let moderation = { bans: {}, overrides: {}, roles: {}, badges: {} };
@@ -514,12 +514,18 @@ async function officialProfile(env) {
 
 async function leaderboard(env) {
   if (board && Date.now() - boardAt < BOARD_TTL) return board;
-  // one refresh at a time; other requests wait for it
-  boardPromise ??= buildBoard(env)
-    .then((b) => { board = b; boardAt = Date.now(); return b; })
-    .catch((e) => { if (board) return { ...board, stale: true, error: e.message }; throw e; })
-    .finally(() => { boardPromise = null; });
-  return boardPromise;
+  // another request is rebuilding it: the last board meanwhile. (Its promise can't be shared: Workers drop a
+  // promise when the request that made it ends, and every other request waiting on it then fails.)
+  if (board && Date.now() - boardBuildingAt < 20_000) return board;
+  boardBuildingAt = Date.now();
+  try {
+    const b = await buildBoard(env);
+    board = b; boardAt = Date.now();
+    return b;
+  } catch (e) {
+    if (board) return { ...board, stale: true, error: e.message };
+    throw e;
+  } finally { boardBuildingAt = 0; }
 }
 
 function b64Bytes(b64) {
@@ -2950,7 +2956,7 @@ function commandCard(m) {
 /** New messages from the Discord channel into the room. */
 async function chatPull(env) {
   if (!env.DISCORD_CHAT_CHANNEL_ID || !env.DISCORD_BOT_TOKEN) return;
-  if (Date.now() - chatPulledAt < CHAT_PULL_MS) return chatPulling;
+  if (Date.now() - chatPulledAt < CHAT_PULL_MS) return; // pulled moments ago (by this or another request: its promise can't be shared)
   chatPulledAt = Date.now();
   chatPulling = (async () => {
     const box = await r2json(env, CHAT_KEY, chatEmpty());
@@ -3525,7 +3531,8 @@ const SHOP = [
      ["rate-abuser", "Rate Abuser"], ["sight-reader", "Sight Reader"], ["chart-crafter", "Chart Crafter"], ["workshop-regular", "Workshop Regular"],
      ["daily-devotee", "Daily Devotee"], ["streak-keeper", "Streak Keeper"], ["early-bird", "Early Bird"], ["one-more-try", "One More Try"],
      ["accuracy-addict", "Accuracy Addict"], ["miss-magnet", "Miss Magnet"], ["note-chaser", "Note Chaser"], ["beat-breaker", "Beat Breaker"],
-     ["vsrg-veteran", "VSRG Veteran"], ["4k-specialist", "4K Specialist"], ["7k-enjoyer", "7K Enjoyer"], ["osu-refugee", "osu! Refugee"]]
+     ["vsrg-veteran", "VSRG Veteran"], ["4k-specialist", "4K Specialist"], ["7k-enjoyer", "7K Enjoyer"], ["osu-refugee", "osu! Refugee"],
+     ["dan-addict", "Dan Addict"]]
     .map(([id, name]) => ({ id: "title-" + id, kind: "title", name, price: 300 })),
   ...[["legend", "Legend"], ["unstoppable", "Unstoppable"], ["rhythm-royalty", "Rhythm Royalty"], ["the-one", "The One"], ["beyond-human", "Beyond Human"], ["octive-elite", "OCTIVE Elite"]]
     .map(([id, name]) => ({ id: "title-" + id, kind: "title", name, price: 1500 })),
@@ -3621,7 +3628,13 @@ function versionAtLeast(have, want) {
   return true;
 }
 /** Items a game of that version can show and use (?v= from 1.6.2; older games send none). The website sees everything (all=1). */
-const shopFor = (url) => url.searchParams.get("all") === "1" ? SHOP.filter((x) => shopActive(x)) : SHOP.filter((x) => shopActive(x) && (!x.minVersion || versionAtLeast(url.searchParams.get("v"), x.minVersion)));
+/** Titles A to Z (everything else stays where it is in the list). */
+function titlesAtoZ(list) {
+  const titles = list.filter((x) => x.kind === "title").sort((a, b) => a.name.localeCompare(b.name, "en", { sensitivity: "base" }));
+  let i = 0;
+  return list.map((x) => (x.kind === "title" ? titles[i++] : x));
+}
+const shopFor = (url) => titlesAtoZ(url.searchParams.get("all") === "1" ? SHOP.filter((x) => shopActive(x)) : SHOP.filter((x) => shopActive(x) && (!x.minVersion || versionAtLeast(url.searchParams.get("v"), x.minVersion))));
 
 const newWallet = () => ({ balance: 0, earned: 0, streak: 0, bestStreak: 0, lastDay: null, freezes: 0, owned: [], equipped: {}, showcase: [], dans: {}, attempts: {}, history: [] });
 async function walletOf(env, id) { return { ...newWallet(), ...(await r2json(env, `points/${id}.json`, null) || {}) }; }
