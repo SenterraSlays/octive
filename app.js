@@ -1844,6 +1844,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const thanks = q.get("thanks") === "1";
 
     const perks = [
+      ["3× daily points", "Every daily chart pays three times the points: up to 150 on Easy, 300 on Normal and 600 on Hard. (The day's scoreboard still shows everyone's normal points.)"],
+      ["10% off in the points shop", "Every title, frame, icon, colour and extra costs 10% less, gifts for friends included."],
       ["Supporter badge", "A supporter badge on your profile and next to your name on leaderboards, with anniversary art as your support adds up."],
       ["Account banner", "A banner picture across the top of your profile, in the game and on the website."],
       ["Coloured name", "Colour and style your name with the same codes as bios: rainbow, bold, any colour."],
@@ -2008,7 +2010,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function supporterPanel() {
     const s = me.supporter || {};
     if (!s.active) {
-      return section("Supporter", s.days > 0 ? `You supported OCTIVE for ${monthsText(s.days)}. Thank you! Your badges stay; support again to get the perks back.` : "Coloured name, banner, profile effects, animated picture and more.",
+      return section("Supporter", s.days > 0 ? `You supported OCTIVE for ${monthsText(s.days)}. Thank you! Your badges stay; support again to get the perks back.` : "3× daily points, 10% off in the points shop, a coloured name, banner, profile effects, animated picture and more.",
         h("div.panel-actions", {}, h("a.btn.primary", { href: "#/supporter" }, "Become a supporter")));
     }
     const looks = me.looks || {};
