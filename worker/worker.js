@@ -3514,11 +3514,9 @@ const SHOP = [
     .map(([id, name]) => ({ id: "title-" + id, kind: "title", name, price: 1500 })),
   ...[["gold", "Gold", "#FFC94D", 500], ["silver", "Silver", "#CFD8E3", 500], ["neon", "Neon", "#39FFB0", 800], ["sakura", "Sakura", "#FF9EC7", 800],
      ["ocean", "Ocean", "#3FA9FF", 800], ["ember", "Ember", "#FF6A3D", 1000], ["void", "Void", "#8A5CFF", 1000], ["diamond", "Diamond", "#B9F2FF", 1500],
-     ["bronze", "Bronze", "#CD7F32", 500], ["rose", "Rose", "#FF5C8A", 600], ["mint", "Mint", "#7FFFD4", 600], ["lemon", "Lemon", "#FFF06B", 600],
-     ["lavender", "Lavender", "#C3A6FF", 600], ["sky", "Sky", "#8FD3FF", 600], ["peach", "Peach", "#FFB38A", 600], ["lime", "Lime", "#A6FF3D", 700],
-     ["crimson", "Crimson", "#E0193A", 800], ["cobalt", "Cobalt", "#2F5BFF", 800], ["emerald", "Emerald", "#1FCB76", 800], ["amethyst", "Amethyst", "#9B4DFF", 800],
-     ["obsidian", "Obsidian", "#2A2A33", 900], ["ivory", "Ivory", "#FFF8E7", 900], ["ruby", "Ruby", "#FF2E63", 1200], ["sapphire", "Sapphire", "#2E7BFF", 1200],
-     ["topaz", "Topaz", "#FFB800", 1200], ["onyx", "Onyx", "#0E0E12", 1200], ["pearl", "Pearl", "#F2F0FF", 1500], ["platinum", "Platinum", "#E5E4E2", 2000]]
+     ["bronze", "Bronze", "#CD7F32", 500], ["rose", "Rose", "#FF5C8A", 600], ["lemon", "Lemon", "#FFF06B", 600], ["lavender", "Lavender", "#C3A6FF", 600],
+     ["peach", "Peach", "#FFB38A", 600], ["lime", "Lime", "#A6FF3D", 700], ["crimson", "Crimson", "#E0193A", 800], ["cobalt", "Cobalt", "#2F5BFF", 800],
+     ["emerald", "Emerald", "#1FCB76", 800], ["obsidian", "Obsidian", "#2A2A33", 900], ["ivory", "Ivory", "#FFF8E7", 900]]
     .map(([id, name, color, price]) => ({ id: "frame-" + id, kind: "frame", name: name + " frame", color, price })),
   ...[["rainbow", "Rainbow", "rainbow", "#FF4FA3"], ["pulse", "Pulse", "pulse", "#FF4FA3"], ["aurora", "Aurora", "aurora", "#3FE0C5"],
      ["pulse-gold", "Golden pulse", "pulse", "#FFC94D"], ["pulse-ice", "Ice pulse", "pulse", "#8FE8FF"], ["pulse-toxic", "Toxic pulse", "pulse", "#7CFF3D"], ["pulse-blood", "Blood pulse", "pulse", "#E0193A"]]
@@ -3526,7 +3524,7 @@ const SHOP = [
   // two colours that flow into each other (OCTIVE 1.6.2; older versions pulse the first colour)
   ...[["sunset", "Sunset", "#FF6A3D", "#FF4FA3"], ["ocean-deep", "Deep ocean", "#2E7BFF", "#3FE0C5"], ["galaxy", "Galaxy", "#8A5CFF", "#FF4FA3"],
      ["fire", "Fire", "#FF2E00", "#FFC94D"], ["frost", "Frost", "#8FE8FF", "#FFFFFF"], ["forest", "Forest", "#1FCB76", "#A6FF3D"],
-     ["candy", "Candy", "#FF8AD8", "#8FD3FF"], ["midnight", "Midnight", "#1B1F5E", "#8A5CFF"], ["lava", "Lava", "#E0193A", "#FF8A00"], ["neon-nights", "Neon nights", "#39FFB0", "#FF4FA3"]]
+     ["candy", "Candy", "#FF8AD8", "#8FD3FF"], ["midnight", "Midnight", "#1B1F5E", "#8A5CFF"], ["neon-nights", "Neon nights", "#39FFB0", "#FF4FA3"]]
     .map(([id, name, color, color2]) => ({ id: "frame-" + id, kind: "frame", name: name + " frame (animated)", color, color2, anim: "duo", price: 4000, minVersion: "1.6.2" })),
   ...[["star", "Gold star", "star", "#FFC94D"], ["heart", "Pink heart", "heart", "#FF6FB5"], ["note", "Music note", "note", "#3FD8FF"],
      ["shield", "Silver shield", "shield", "#CFD8E3"], ["purple-star", "Purple star", "star", "#A77BFF"],
@@ -3544,6 +3542,35 @@ const SHOP = [
   { id: "spotlight", kind: "spotlight", name: "Workshop spotlight", price: 2000, note: "One of your uploads at the top of the Workshop for 24 hours", noGift: true },
   { id: "supporter-month", kind: "supporter", name: "1 month of OCTIVE Supporter", price: 15000 },
 ];
+// ---- supporters: 3x the points from the daily charts, and 10% off in the shop (gifts too)
+const SUPPORTER_DAILY_MULT = 3, SUPPORTER_DISCOUNT = 10;
+async function isSupporterNow(env, id) {
+  if (LIFETIME_SUPPORTERS.includes(id)) return true;
+  try {
+    const [rec, boost] = await Promise.all([r2json(env, `supporters/${id}.json`, null), r2json(env, `boosters/${id}.json`, null)]);
+    return !!supportStatus(rec, id, boost).active;
+  } catch { return false; }
+}
+/** What an item costs this player (supporters: 10% off, rounded). */
+const shopPriceFor = (item, supporter) => supporter ? Math.round(item.price * (100 - SUPPORTER_DISCOUNT) / 100) : item.price;
+
+/** Items taken out of the shop, with what they cost: owners get the points back (retireItems). */
+const RETIRED = { "frame-amethyst": 800, "frame-sapphire": 1200, "frame-ruby": 1200, "frame-topaz": 1200, "frame-onyx": 1200, "frame-pearl": 1500,
+  "frame-platinum": 2000, "frame-sky": 600, "frame-mint": 600, "frame-lava": 4000 };
+async function retireItems(env, id) {
+  const cur = await walletOf(env, id);
+  if (!(cur.owned || []).some((x) => x in RETIRED)) return cur;
+  const free = infinitePoints(id);
+  const w = await walletUpdate(env, id, (w) => {
+    const gone = w.owned.filter((x) => x in RETIRED);
+    if (!gone.length) return false;
+    w.owned = w.owned.filter((x) => !(x in RETIRED));
+    for (const slot of Object.keys(w.equipped || {})) if (w.equipped[slot] in RETIRED) delete w.equipped[slot];
+    for (const x of gone) { if (!free) w.balance = (w.balance || 0) + RETIRED[x]; remember(w, { kind: "refund", item: x, price: RETIRED[x] }); }
+  });
+  if (w) await writeCosmetics(env, id, w);
+  return w || cur;
+}
 const shopActive = (x, now = Date.now()) => (!x.from || Date.parse(x.from) <= now) && (!x.to || Date.parse(x.to) > now);
 const shopItem = (id) => SHOP.find((x) => x.id === id && shopActive(x));
 /** "1.6.10" > "1.6.2" (missing parts are 0; anything unreadable is 0.0.0). */
@@ -3753,7 +3780,8 @@ async function playRoutes(request, env, url) {
       const me = at >= 0 ? { ...all[at], rank: at + 1 } : null;
       return { ...c, scores: undefined, top: all.slice(0, 10), players: all.length, me, mine: w ? w.attempts[attemptKey(d, date, t.tier)] || null : null, preview: c.itemId ? `${WORKER_BASE}/api/preview/${c.itemId}` : null };
     });
-    return reply({ date, tiers, wallet: w ? walletPublic(w, who.playerId) : null, nextAt: new Date(Date.parse(date + "T00:00:00Z") + 86_400_000).toISOString() });
+    const supporterMultiplier = who && (await isSupporterNow(env, who.playerId)) ? SUPPORTER_DAILY_MULT : 1;
+    return reply({ date, tiers, wallet: w ? walletPublic(w, who.playerId) : null, supporterMultiplier, nextAt: new Date(Date.parse(date + "T00:00:00Z") + 86_400_000).toISOString() });
   }
   if (path === "/play/daily/start" && request.method === "POST") {
     const who = await signedIn(request, env);
@@ -3797,6 +3825,8 @@ async function playRoutes(request, env, url) {
     const acc = countsAccuracy(b.counts, c.notes);
     if (acc === null) fail(400, "That play doesn't match the daily chart.");
     const points = dailyPoints(acc, t);
+    const mult = (await isSupporterNow(env, who.playerId)) ? SUPPORTER_DAILY_MULT : 1;
+    const earned = points * mult;
     const key = attemptKey(d, date, t.tier);
     let why = null;
     const w = await walletUpdate(env, who.playerId, (w) => {
@@ -3806,9 +3836,9 @@ async function playRoutes(request, env, url) {
       // the play can't be shorter than the song
       const took = Date.now() - Date.parse(a.start);
       if (c.durationUs > 0 && took < c.durationUs / 1000 * 0.6) { why = "That play finished too quickly."; return false; }
-      a.done = true; a.acc = Math.round(acc * 100) / 100; a.points = points;
-      w.balance = (w.balance || 0) + points; w.earned = (w.earned || 0) + points;
-      remember(w, { kind: "daily", tier: t.tier, points, acc: a.acc, title: c.title });
+      a.done = true; a.acc = Math.round(acc * 100) / 100; a.points = points; if (mult > 1) a.earned = earned;
+      w.balance = (w.balance || 0) + earned; w.earned = (w.earned || 0) + earned;
+      remember(w, { kind: "daily", tier: t.tier, points: earned, base: mult > 1 ? points : undefined, mult: mult > 1 ? mult : undefined, acc: a.acc, title: c.title });
     });
     if (!w) fail(409, why || "That didn't count.");
     const name = await displayName(env, who.playerId);
@@ -3818,18 +3848,20 @@ async function playRoutes(request, env, url) {
       ch.scores = (ch.scores || []).filter((s) => s.id !== who.playerId);
       ch.scores.push({ id: who.playerId, name, acc: Math.round(acc * 100) / 100, points, at: new Date().toISOString() });
     });
-    return reply({ ok: true, tier: t.tier, points, accuracy: Math.round(acc * 100) / 100, balance: w.balance, streak: w.streak });
+    // "points": what went into the wallet (older games show this); the board keeps basePoints
+    return reply({ ok: true, tier: t.tier, points: earned, basePoints: points, multiplier: mult, accuracy: Math.round(acc * 100) / 100, balance: w.balance, streak: w.streak });
   }
 
   // ---- the shop
   if (path === "/play/shop" && request.method === "GET") {
     const who = await optionalWho();
-    const wallet = who ? walletPublic(await walletOf(env, who.playerId), who.playerId) : null;
-    return reply({ items: shopFor(url), wallet, danLevels: DAN_LEVELS, danClearAcc: DAN_CLEAR_ACC });
+    const wallet = who ? walletPublic(await retireItems(env, who.playerId), who.playerId) : null;
+    const discount = who && (await isSupporterNow(env, who.playerId)) ? SUPPORTER_DISCOUNT : 0;
+    return reply({ items: shopFor(url), wallet, discount, danLevels: DAN_LEVELS, danClearAcc: DAN_CLEAR_ACC });
   }
   if (path === "/play/wallet" && request.method === "GET") {
     const who = await signedIn(request, env);
-    const w = await walletOf(env, who.playerId);
+    const w = await retireItems(env, who.playerId);
     // showcases bought before others could see who owns one
     if (w.owned.includes("showcase")) {
       const idx = (await r2json(env, COSMETICS_KEY, { players: {} })).players || {};
@@ -3857,13 +3889,14 @@ async function playRoutes(request, env, url) {
       spot = (db.items || []).find((x) => x.id === String(b.target || "") && !x.removed);
       if (!spot || spot.creatorId !== who.playerId) fail(400, "Pick one of your own Workshop uploads.");
     }
-    // pay
+    // pay (supporters: 10% off)
     let short = false;
     const free = infinitePoints(who.playerId); // Senterra and Octive never run out
+    const price = shopPriceFor(item, await isSupporterNow(env, who.playerId));
     const paid = await walletUpdate(env, who.playerId, (w) => {
-      if (!free && (w.balance || 0) < item.price) { short = true; return false; }
-      if (!free) w.balance -= item.price;
-      remember(w, { kind: "buy", item: item.id, price: item.price, giftTo: giftTo || undefined });
+      if (!free && (w.balance || 0) < price) { short = true; return false; }
+      if (!free) w.balance -= price;
+      remember(w, { kind: "buy", item: item.id, price, giftTo: giftTo || undefined });
     });
     if (short || !paid) fail(400, "You don't have enough points.");
     // deliver
@@ -3888,7 +3921,7 @@ async function playRoutes(request, env, url) {
         if (got && item.kind === "showcase") await writeCosmetics(env, to, got);
       }
     } catch (e) {
-      if (!free) await walletUpdate(env, who.playerId, (w) => { w.balance += item.price; remember(w, { kind: "refund", item: item.id, price: item.price }); });
+      if (!free) await walletUpdate(env, who.playerId, (w) => { w.balance += price; remember(w, { kind: "refund", item: item.id, price }); });
       throw e;
     }
     return reply({ ok: true, wallet: walletPublic(await walletOf(env, who.playerId), who.playerId) });
