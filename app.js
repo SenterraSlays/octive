@@ -296,6 +296,80 @@
     document.title = "OCTIVE Rankings";
   }
 
+  // ---- the points shop's looks: titles and showcases (the same list the game uses)
+  let cosmeticsLoad = null;
+  function loadCosmetics() {
+    if (!cosmeticsLoad) cosmeticsLoad = Promise.all([
+      fetch(`${worker}/play/cosmetics`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null),
+      fetch(`${worker}/play/shop`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null),
+    ]).then(([c, shop]) => {
+      const titles = {};
+      for (const it of (shop && shop.items) || []) if (it.kind === "title") titles[it.id] = it.name;
+      return { players: (c && c.players) || {}, titles };
+    });
+    return cosmeticsLoad;
+  }
+  const JUDGEMENTS = [["Marvelous", "#9ef0ff"], ["Perfect", "#ffe08a"], ["Great", "#7ee39a"], ["Good", "#7fb6ff"], ["Bad", "#c79bff"], ["Miss", "#ff6b7a"]];
+  function showcaseLink(s) {
+    if (s.workshopId) return { href: `#/workshop/${encodeURIComponent(s.workshopId)}`, text: "View in the Workshop" };
+    if (s.osuSet) return { href: `https://osu.ppy.sh/beatmapsets/${encodeURIComponent(s.osuSet)}`, text: "View on osu!", target: "_blank", rel: "noopener" };
+    return null;
+  }
+  function coverStyle(el, url) { if (url) el.style.backgroundImage = `url("${String(url).replace(/["\\]/g, "")}")`; }
+  function showcaseCard(s) {
+    const pic = h("div.sc-pic");
+    coverStyle(pic, s.cover);
+    if (s.grade) pic.append(h("span.sc-grade", { text: s.grade }));
+    const stats = h("div.sc-stats");
+    if (s.score != null) stats.append(h("b", { text: fmt0.format(s.score) }));
+    if (s.acc != null) stats.append(h("span", { text: fmt2.format(s.acc) + "%" }));
+    if (s.pp != null) stats.append(h("span.sc-pr", { text: fmt0.format(s.pp) + " PR" }));
+    const link = showcaseLink(s);
+    const body = h("div.sc-body", {}, h("div.sc-title", { text: s.title || "Song" }), h("div.sc-diff", { text: s.difficulty || "" }), stats);
+    if (s.mods) body.append(h("div.sc-mods", { text: s.mods }));
+    if (link) { const a = h("a.sc-view", { href: link.href, target: link.target || null, rel: link.rel || null }, "View"); a.addEventListener("click", (e) => e.stopPropagation()); body.append(a); }
+    const card = h("div.sc-card", { tabindex: "0", role: "button", title: "Details" }, pic, body);
+    const open = () => showcaseDetails(s);
+    card.addEventListener("click", open);
+    card.addEventListener("keydown", (e) => { if (e.key === "Enter") open(); });
+    return card;
+  }
+  function showcaseDetails(s) {
+    const onKey = (e) => { if (e.key === "Escape") close(); };
+    const banner = h("div.scd-banner", {}, h("div.scd-shade"), h("div.scd-cap", {}, h("h2", { text: s.title || "Song" }),
+      h("p", { text: [s.artist, s.difficulty, s.keys ? s.keys + "K" : null, s.stars ? "\u2605 " + fmt2.format(s.stars) : null].filter(Boolean).join("  \u00b7  ") })));
+    if (s.grade) banner.append(h("span.scd-grade", { text: s.grade }));
+    coverStyle(banner, s.cover);
+    const tile = (label, value, cls) => h("div.scd-tile" + (cls || ""), {}, h("span", { text: label }), h("b", { text: value }));
+    const tiles = h("div.scd-tiles");
+    if (s.score != null) tiles.append(tile("Score", fmt0.format(s.score)));
+    if (s.acc != null) tiles.append(tile("Accuracy", fmt2.format(s.acc) + "%"));
+    if (s.pp != null) tiles.append(tile("Rating", fmt0.format(s.pp) + " PR", ".pr"));
+    if (s.maxCombo != null) tiles.append(tile("Max combo", fmt0.format(s.maxCombo) + "x" + (s.fullCombo ? "  FC" : ""), s.fullCombo ? ".fc" : ""));
+    const box = h("div.scd-modal", { role: "dialog", "aria-modal": "true", "aria-label": "Showcase play" }, banner, tiles);
+    if (Array.isArray(s.counts) && s.counts.length === 6) {
+      const judg = h("div.scd-judg");
+      JUDGEMENTS.forEach(([n, c], i) => { const b = h("div", {}, h("span", { text: n }), h("b", { text: fmt0.format(s.counts[i] || 0) })); b.style.setProperty("--j", c); judg.append(b); });
+      box.append(judg);
+    }
+    box.append(h("p.scd-mods", {}, h("span", { text: "Mods" }), s.mods ? s.mods : "None"));
+    if (s.date && !isNaN(Date.parse(s.date))) box.append(h("p.scd-when", { text: "Played " + new Date(s.date).toLocaleString(undefined, { dateStyle: "long", timeStyle: "short" }) }));
+    const link = showcaseLink(s);
+    const actions = h("div.scd-actions");
+    if (link) actions.append(h("a.btn", { href: link.href, target: link.target || null, rel: link.rel || null }, link.text));
+    const closeBtn = h("button.btn.ghost", { type: "button" }, "Close");
+    actions.append(closeBtn);
+    box.append(actions);
+    const layer = h("div.modal-layer", {}, box);
+    function close() { layer.remove(); document.removeEventListener("keydown", onKey); }
+    closeBtn.addEventListener("click", close);
+    layer.addEventListener("click", (e) => { if (e.target === layer) close(); });
+    // a link inside closes the popup too (the Workshop opens on this site)
+    box.querySelectorAll("a").forEach((a) => a.addEventListener("click", () => { if (!a.target) close(); }));
+    document.body.append(layer);
+    document.addEventListener("keydown", onKey);
+  }
+
   function player(id) {
     const p = findPlayer(id);
     if (!p) {
@@ -359,6 +433,19 @@
       view.querySelector(".bio").hidden = false;
       renderBio(view.querySelector(".bio-text"), p.bio);
     }
+    // the title bought in the points shop (under the name) and the showcase (under About)
+    const showcase = h("section.showcase", { hidden: true }, h("h2", { text: "Showcase" }), h("div.sc-row"));
+    view.querySelector(".bio").after(showcase);
+    loadCosmetics().then((cz) => {
+      const mine = cz.players[p.id] || {};
+      const title = mine.title && cz.titles[mine.title];
+      if (title) { const row = card.querySelector(".card-name-row"); if (row) row.after(h("div.shop-title", { text: title })); }
+      if (isOfficial(p)) return;
+      const songs = (mine.showcase || []).filter((x) => x && x.kind !== "ach").slice(0, 3);
+      const row = showcase.querySelector(".sc-row");
+      for (let i = 0; i < 3; i++) row.append(songs[i] ? showcaseCard(songs[i]) : h("div.sc-empty", { text: "Empty" }));
+      showcase.hidden = false;
+    });
     const sup = supporterSection(p);
     if (sup) view.querySelector(".tiles").after(sup);
     view.querySelector(".tiles").parentNode.append(achievementsSection(p));

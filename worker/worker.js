@@ -332,6 +332,13 @@ async function publicItems(cfg, playerId, keys) {
   return out;
 }
 
+/** The badge and role lists, read again when they're more than a minute old (charters' rights depend on them). */
+let moderationAt = 0;
+async function freshModeration(env) {
+  if (Date.now() - moderationAt < 60_000) return;
+  try { await loadModeration(config(env)); moderationAt = Date.now(); } catch { /* keep the last lists */ }
+}
+
 async function loadModeration(cfg) {
   const merged = { bans: {}, overrides: {}, roles: {}, badges: {} };
   await Promise.all(DEVELOPERS.map(async (dev) => {
@@ -1156,6 +1163,7 @@ async function account(request, env, route) {
       // verify (or un-verify) a song: its charts get a global leaderboard
       const b = await bodyOf(request);
       const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) await freshModeration(env);
       if (who.playerId !== OWNER && !isOfficial(who.playerId) && !badgesOf(who.playerId).includes("CHARTER")) fail(403, "Only Senterra, the official OCTIVE account and charters can verify songs.");
       const id = String(b.songId || "");
       if (!songIdOk(id) || officialSong(id)) fail(400, "That song can't be verified.");
@@ -3129,6 +3137,365 @@ async function wsInspect(kind, u8) {
   return { preview: null };
 }
 
+
+// ================================================================ the daily chart, points, the points shop, dans
+// R2: daily/<YYYY-MM-DD>.json   the day's chart (picked once, from verified Workshop songs) and its scores
+//     points/<playerId>.json   { balance, earned, streak, bestStreak, lastDay, freezes, owned, equipped, showcase, dans, attempts, history }
+//     cosmetics/index.json     { players: { <id>: { title, frame, icon, showcase, dan, dans } } }  (what others see)
+// Everything is decided here: the chart, the one attempt, the accuracy (from the judgement counts) and the points.
+const ACC_WEIGHTS = [100, 98, 70, 40, 10, 0];
+const DAN_CLEAR_ACC = 90; // a dan counts as cleared at this accuracy or more, with no mods
+const DAN_LEVELS = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th", "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta"];
+const COSMETICS_KEY = "cosmetics/index.json";
+const todayUtc = () => new Date().toISOString().slice(0, 10);
+const dayDiff = (a, b) => Math.round((Date.parse(b + "T00:00:00Z") - Date.parse(a + "T00:00:00Z")) / 86_400_000);
+const okPlayerId = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(id);
+
+// The shop: cosmetics only (nothing changes scores, PR or rankings). "from"/"to" make seasonal items.
+const SHOP = [
+  ...[["daily-grinder", "Daily Grinder"], ["jack-enjoyer", "Jack Enjoyer"], ["stream-machine", "Stream Machine"], ["ln-lover", "LN Lover"],
+     ["chordjack-menace", "Chordjack Menace"], ["sv-survivor", "SV Survivor"], ["night-owl", "Night Owl"], ["speed-demon", "Speed Demon"],
+     ["perfectionist", "Perfectionist"], ["rhythm-addict", "Rhythm Addict"], ["tech-wizard", "Tech Wizard"], ["stamina-beast", "Stamina Beast"]]
+    .map(([id, name]) => ({ id: "title-" + id, kind: "title", name, price: 300 })),
+  ...[["gold", "Gold", "#FFC94D", 500], ["silver", "Silver", "#CFD8E3", 500], ["neon", "Neon", "#39FFB0", 800], ["sakura", "Sakura", "#FF9EC7", 800],
+     ["ocean", "Ocean", "#3FA9FF", 800], ["ember", "Ember", "#FF6A3D", 1000], ["void", "Void", "#8A5CFF", 1000], ["diamond", "Diamond", "#B9F2FF", 1500]]
+    .map(([id, name, color, price]) => ({ id: "frame-" + id, kind: "frame", name: name + " frame", color, price })),
+  ...[["rainbow", "Rainbow", "rainbow", "#FF4FA3"], ["pulse", "Pulse", "pulse", "#FF4FA3"], ["aurora", "Aurora", "aurora", "#3FE0C5"]]
+    .map(([id, name, anim, color]) => ({ id: "frame-" + id, kind: "frame", name: name + " frame (animated)", color, anim, price: 3000 })),
+  ...[["star", "Gold star", "star", "#FFC94D"], ["heart", "Pink heart", "heart", "#FF6FB5"], ["note", "Music note", "note", "#3FD8FF"],
+     ["shield", "Silver shield", "shield", "#CFD8E3"], ["purple-star", "Purple star", "star", "#A77BFF"]]
+    .map(([id, name, shape, color]) => ({ id: "icon-" + id, kind: "icon", name, shape, color, price: 800 })),
+  { id: "streak-freeze", kind: "freeze", name: "Streak freeze", price: 400, note: "Covers one missed daily chart (hold up to 2)" },
+  { id: "showcase", kind: "showcase", name: "Profile showcase", price: 1000, note: "Pin up to 3 of your best plays or achievements to your profile" },
+  { id: "spotlight", kind: "spotlight", name: "Workshop spotlight", price: 2000, note: "One of your uploads at the top of the Workshop for 24 hours", noGift: true },
+  { id: "supporter-month", kind: "supporter", name: "1 month of OCTIVE Supporter", price: 15000 },
+];
+const shopActive = (x, now = Date.now()) => (!x.from || Date.parse(x.from) <= now) && (!x.to || Date.parse(x.to) > now);
+const shopItem = (id) => SHOP.find((x) => x.id === id && shopActive(x));
+
+const newWallet = () => ({ balance: 0, earned: 0, streak: 0, bestStreak: 0, lastDay: null, freezes: 0, owned: [], equipped: {}, showcase: [], dans: {}, attempts: {}, history: [] });
+async function walletOf(env, id) { return { ...newWallet(), ...(await r2json(env, `points/${id}.json`, null) || {}) }; }
+/** Changes a wallet safely (another change at the same time is retried); change returns false to cancel. */
+async function walletUpdate(env, id, change) {
+  let out = null;
+  await r2update(env, `points/${id}.json`, newWallet, (w) => { Object.assign(w, { ...newWallet(), ...w }); const r = change(w); if (r === false) return false; out = w; });
+  return out;
+}
+const remember = (w, entry) => { w.history = [{ ...entry, at: new Date().toISOString() }, ...(w.history || [])].slice(0, 60); };
+const infinitePoints = (id) => id === OWNER || isOfficial(id);
+function walletPublic(w, id) {
+  return { infinite: id ? infinitePoints(id) || undefined : undefined, balance: w.balance, earned: w.earned, streak: w.streak, bestStreak: w.bestStreak, lastDay: w.lastDay, freezes: w.freezes, owned: w.owned, equipped: w.equipped, showcase: w.showcase, dans: w.dans, history: (w.history || []).slice(0, 30) };
+}
+
+let cosmeticsCache = null, cosmeticsAt = 0;
+async function writeCosmetics(env, id, w) {
+  let best = -1;
+  for (const d of Object.values(w.dans || {})) { const i = DAN_LEVELS.indexOf(d.level); if (i > best) best = i; }
+  const e = { title: w.equipped.title || undefined, frame: w.equipped.frame || undefined, icon: w.equipped.icon || undefined,
+    showcase: (w.showcase || []).length ? w.showcase : undefined, dan: best >= 0 ? DAN_LEVELS[best] : undefined, dans: Object.keys(w.dans || {}).length || undefined };
+  const empty = Object.values(e).every((v) => v === undefined);
+  await r2update(env, COSMETICS_KEY, () => ({ players: {} }), (d) => { d.players ||= {}; if (empty) delete d.players[id]; else d.players[id] = e; });
+  cosmeticsCache = null;
+}
+
+/** The daily charts: Easy, Normal and Hard (4K only, by stars), with what each is worth. */
+const DAILY_TIERS = [
+  { tier: "easy", name: "Easy", min: 2, max: 4.8, factor: 0.5 },
+  { tier: "normal", name: "Normal", min: 4.81, max: 7.2, factor: 1 },
+  { tier: "hard", name: "Hard", min: 7.21, max: 10, factor: 2 },
+];
+const dailyTier = (t) => DAILY_TIERS.find((x) => x.tier === t);
+/** Points for a daily play: the accuracy rounded down (99.7% = 99), halved for Easy and doubled for Hard. */
+const dailyPoints = (acc, tier) => Math.max(0, Math.floor(Math.floor(acc + 1e-9) * tier.factor));
+
+/** The days's three charts: picked once from the verified Workshop songs (the same for everyone), then kept. */
+async function dailyOf(env, date) {
+  const key = `daily/${date}.json`;
+  const have = await r2json(env, key, null);
+  if (have && have.charts) return have;
+  const db = await r2json(env, WS_DB, { items: [] });
+  // every 4K chart of a verified song (not dans), in a fixed order
+  const all = [];
+  for (const it of (db.items || []).filter((x) => x.type === "charts" && x.verified && !x.removed && !x.dan && x.meta).sort((x, y) => String(x.id).localeCompare(String(y.id))))
+    for (const sg of it.meta.songs || []) for (const c of sg.charts || [])
+      if (c.keys === 4 && c.notes > 0 && sg.songId) all.push({ it, sg, c });
+  const charts = {};
+  for (const t of DAILY_TIERS) {
+    const pool = all.filter((x) => x.c.stars >= t.min && x.c.stars <= t.max);
+    if (!pool.length) continue;
+    let h = 2166136261; for (const ch of `octive-daily-${date}-${t.tier}`) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0; }
+    const { it, sg, c } = pool[h % pool.length];
+    charts[t.tier] = { tier: t.tier, name: t.name, maxPoints: Math.floor(100 * t.factor), itemId: it.id, songId: sg.songId, title: sg.title || it.title, artist: sg.artist || "",
+      difficulty: c.difficulty, keys: c.keys, stars: c.stars, notes: c.notes, durationUs: sg.durationUs || 0, creator: it.creator, scores: [] };
+  }
+  const pick = { date, charts };
+  // kept on the first look of the day (an older one-chart day is replaced)
+  await r2update(env, key, () => ({}), (d) => { if (d && d.charts) return false; for (const k of Object.keys(d)) delete d[k]; Object.assign(d, pick); }).catch(() => {});
+  const saved = await r2json(env, key, null);
+  return saved && saved.charts ? saved : pick;
+}
+
+/** Accuracy from judgement counts (Marvelous..Miss), worked out here. Null when they don't fit the chart. */
+function countsAccuracy(counts, notes) {
+  if (!Array.isArray(counts) || counts.length !== 6) return null;
+  const c = counts.map((n) => Math.round(Number(n)));
+  if (c.some((n) => !Number.isFinite(n) || n < 0 || n > 1_000_000)) return null;
+  const total = c.reduce((a, b) => a + b, 0);
+  // every note is judged once (long notes may be judged at both ends)
+  if (!(notes > 0) || total < notes || total > notes * 2 + 2) return null;
+  return c.reduce((a, n, i) => a + n * ACC_WEIGHTS[i], 0) / total;
+}
+
+async function displayName(env, id) {
+  try { const ov = moderation.overrides[id] || {}; return String(ov.name || (await publicItems(config(env), id, ["card"])).card?.name || "Player").slice(0, 40); } catch { return "Player"; }
+}
+
+async function playRoutes(request, env, url) {
+  const path = url.pathname;
+  const optionalWho = async () => (request.headers.get("Authorization") ? await signedIn(request, env).catch(() => null) : null);
+
+  // ---- the daily chart (and, signed in, your attempt and points)
+  if (path === "/play/daily" && request.method === "GET") {
+    const date = todayUtc();
+    const d = await dailyOf(env, date);
+    const who = await optionalWho();
+    const w = who ? await walletOf(env, who.playerId) : null;
+    const tiers = DAILY_TIERS.filter((t) => d.charts[t.tier]).map((t) => {
+      const c = d.charts[t.tier];
+      const top = (c.scores || []).slice().sort((a, b) => b.points - a.points || b.acc - a.acc || Date.parse(a.at) - Date.parse(b.at)).slice(0, 50);
+      return { ...c, scores: undefined, top, mine: w ? w.attempts[`${date}:${t.tier}`] || null : null, preview: c.itemId ? `${WORKER_BASE}/api/preview/${c.itemId}` : null };
+    });
+    return reply({ date, tiers, wallet: w ? walletPublic(w, who.playerId) : null, nextAt: new Date(Date.parse(date + "T00:00:00Z") + 86_400_000).toISOString() });
+  }
+  if (path === "/play/daily/start" && request.method === "POST") {
+    const who = await signedIn(request, env);
+    const b = await bodyOf(request, 1_000);
+    await loadModeration(config(env)).catch(() => {});
+    if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+    const t = dailyTier(String(b.tier || ""));
+    if (!t) fail(400, "Pick Easy, Normal or Hard.");
+    const date = todayUtc();
+    const d = await dailyOf(env, date);
+    if (!d.charts[t.tier]) fail(404, `There's no ${t.name} daily chart today.`);
+    const key = `${date}:${t.tier}`;
+    let used = false;
+    const w = await walletUpdate(env, who.playerId, (w) => {
+      if (w.attempts[key]) { used = true; return false; }
+      w.attempts[key] = { start: new Date().toISOString() };
+      // the streak: days in a row with a daily attempt (freezes cover missed days)
+      if (w.lastDay !== date) {
+        const gap = w.lastDay ? dayDiff(w.lastDay, date) : null;
+        if (gap === 1) w.streak = (w.streak || 0) + 1;
+        else if (gap > 1 && (w.freezes || 0) >= gap - 1) { w.freezes -= gap - 1; w.streak = (w.streak || 0) + 1; remember(w, { kind: "freeze-used", days: gap - 1 }); }
+        else w.streak = 1;
+        w.bestStreak = Math.max(w.bestStreak || 0, w.streak);
+        w.lastDay = date;
+      }
+      for (const k of Object.keys(w.attempts)) if (dayDiff(k.slice(0, 10), date) > 14) delete w.attempts[k];
+    });
+    if (used) fail(409, `You've had your attempt at today's ${t.name} daily chart. New ones come tomorrow.`);
+    return reply({ ok: true, streak: w.streak, freezes: w.freezes });
+  }
+  if (path === "/play/daily/submit" && request.method === "POST") {
+    const who = await signedIn(request, env);
+    const b = await bodyOf(request, 4_000);
+    const t = dailyTier(String(b.tier || ""));
+    if (!t) fail(400, "Pick Easy, Normal or Hard.");
+    const date = todayUtc();
+    const d = await dailyOf(env, date);
+    const c = d.charts[t.tier];
+    if (!c) fail(404, `There's no ${t.name} daily chart today.`);
+    if (String(b.mods || "").trim()) fail(400, "The daily charts are played without mods.");
+    const acc = countsAccuracy(b.counts, c.notes);
+    if (acc === null) fail(400, "That play doesn't match the daily chart.");
+    const points = dailyPoints(acc, t);
+    const key = `${date}:${t.tier}`;
+    let why = null;
+    const w = await walletUpdate(env, who.playerId, (w) => {
+      const a = w.attempts[key];
+      if (!a) { why = "Start the daily chart first."; return false; }
+      if (a.done) { why = `You've had your attempt at today's ${t.name} daily chart.`; return false; }
+      // the play can't be shorter than the song
+      const took = Date.now() - Date.parse(a.start);
+      if (c.durationUs > 0 && took < c.durationUs / 1000 * 0.6) { why = "That play finished too quickly."; return false; }
+      a.done = true; a.acc = Math.round(acc * 100) / 100; a.points = points;
+      w.balance = (w.balance || 0) + points; w.earned = (w.earned || 0) + points;
+      remember(w, { kind: "daily", tier: t.tier, points, acc: a.acc, title: c.title });
+    });
+    if (!w) fail(409, why || "That didn't count.");
+    const name = await displayName(env, who.playerId);
+    await r2update(env, `daily/${date}.json`, () => null, (x) => {
+      if (!x || !x.charts || !x.charts[t.tier]) return false;
+      const ch = x.charts[t.tier];
+      ch.scores = (ch.scores || []).filter((s) => s.id !== who.playerId);
+      ch.scores.push({ id: who.playerId, name, acc: Math.round(acc * 100) / 100, points, at: new Date().toISOString() });
+    });
+    return reply({ ok: true, tier: t.tier, points, accuracy: Math.round(acc * 100) / 100, balance: w.balance, streak: w.streak });
+  }
+
+  // ---- the shop
+  if (path === "/play/shop" && request.method === "GET") {
+    const who = await optionalWho();
+    const wallet = who ? walletPublic(await walletOf(env, who.playerId), who.playerId) : null;
+    return reply({ items: SHOP.filter((x) => shopActive(x)), wallet, danLevels: DAN_LEVELS, danClearAcc: DAN_CLEAR_ACC });
+  }
+  if (path === "/play/wallet" && request.method === "GET") {
+    const who = await signedIn(request, env);
+    return reply({ wallet: walletPublic(await walletOf(env, who.playerId), who.playerId) });
+  }
+  if (path === "/play/shop/buy" && request.method === "POST") {
+    const who = await signedIn(request, env);
+    const b = await bodyOf(request, 2_000);
+    const item = shopItem(String(b.id || ""));
+    if (!item) fail(404, "That isn't in the shop.");
+    const giftTo = b.giftTo ? String(b.giftTo) : null;
+    if (giftTo && (!okPlayerId(giftTo) || giftTo === who.playerId)) fail(400, "Pick someone else to gift it to.");
+    if (giftTo && item.noGift) fail(400, "That can't be gifted.");
+    const to = giftTo || who.playerId;
+    // can it go to them?
+    const target = await walletOf(env, to);
+    if (["title", "frame", "icon", "showcase"].includes(item.kind) && target.owned.includes(item.id)) fail(409, giftTo ? "They already have that." : "You already have that.");
+    if (item.kind === "freeze" && (target.freezes || 0) >= 2) fail(409, giftTo ? "They already hold 2 streak freezes." : "You already hold 2 streak freezes.");
+    let spot = null;
+    if (item.kind === "spotlight") {
+      const db = await r2json(env, WS_DB, { items: [] });
+      spot = (db.items || []).find((x) => x.id === String(b.target || "") && !x.removed);
+      if (!spot || spot.creatorId !== who.playerId) fail(400, "Pick one of your own Workshop uploads.");
+    }
+    // pay
+    let short = false;
+    const free = infinitePoints(who.playerId); // Senterra and Octive never run out
+    const paid = await walletUpdate(env, who.playerId, (w) => {
+      if (!free && (w.balance || 0) < item.price) { short = true; return false; }
+      if (!free) w.balance -= item.price;
+      remember(w, { kind: "buy", item: item.id, price: item.price, giftTo: giftTo || undefined });
+    });
+    if (short || !paid) fail(400, "You don't have enough points.");
+    // deliver
+    try {
+      if (item.kind === "supporter") {
+        await grantMonths(env, to, 1, { id: `points-${who.playerId}-${Date.now()}`, amount_total: 0, currency: "points", metadata: giftTo ? { gift: "1", buyer: who.playerId } : {} });
+        if (giftTo) await walletUpdate(env, to, (w) => remember(w, { kind: "gift", item: item.id, from: who.playerId }));
+      } else if (item.kind === "spotlight") {
+        await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+          const x = (d.items || []).find((y) => y.id === spot.id); if (!x) return false;
+          const from = Math.max(Date.now(), Date.parse(x.spotlightUntil || "") || 0);
+          x.spotlightUntil = new Date(from + 86_400_000).toISOString();
+        });
+      } else {
+        await walletUpdate(env, to, (w) => {
+          if (item.kind === "freeze") w.freezes = Math.min(2, (w.freezes || 0) + 1);
+          else if (!w.owned.includes(item.id)) w.owned.push(item.id);
+          if (giftTo) remember(w, { kind: "gift", item: item.id, from: who.playerId });
+        });
+      }
+    } catch (e) {
+      if (!free) await walletUpdate(env, who.playerId, (w) => { w.balance += item.price; remember(w, { kind: "refund", item: item.id, price: item.price }); });
+      throw e;
+    }
+    return reply({ ok: true, wallet: walletPublic(await walletOf(env, who.playerId), who.playerId) });
+  }
+  if (path === "/play/shop/equip" && request.method === "POST") {
+    const who = await signedIn(request, env);
+    const b = await bodyOf(request, 1_000);
+    const slot = String(b.slot || "");
+    if (!["title", "frame", "icon"].includes(slot)) fail(400, "Pick a title, frame or icon.");
+    const id = b.id ? String(b.id) : null;
+    let bad = false;
+    const w = await walletUpdate(env, who.playerId, (w) => {
+      if (id && (!w.owned.includes(id) || !SHOP.some((x) => x.id === id && x.kind === slot))) { bad = true; return false; }
+      if (id) w.equipped[slot] = id; else delete w.equipped[slot];
+    });
+    if (bad || !w) fail(400, "You don't own that.");
+    await writeCosmetics(env, who.playerId, w);
+    return reply({ ok: true, wallet: walletPublic(w, who.playerId) });
+  }
+  if (path === "/play/shop/showcase" && request.method === "POST") {
+    const who = await signedIn(request, env);
+    const b = await bodyOf(request, 4_000);
+    const cur = await walletOf(env, who.playerId);
+    if (!cur.owned.includes("showcase")) fail(403, "Get the profile showcase in the shop first.");
+    const picks = (Array.isArray(b.picks) ? b.picks : []).slice(0, 3);
+    const out = [];
+    let scores = null, card = null, db = null;
+    for (const p of picks) {
+      if (p && (p.kind === "play" || p.kind === "song")) {
+        if (!scores) scores = ((await privateItems(env, who.playerId, ["scores"]).catch(() => ({}))).scores || {}).charts || {};
+        const songId = String(p.songId || "").slice(0, 100), chartId = String(p.chartId || "").slice(0, 100);
+        const c = scores[`${songId}/${chartId}`];
+        if (!c) fail(400, "That song isn't in your synced scores yet. Wait a moment for the sync and try again.");
+        // the score they picked, from their own synced plays (its details are copied from there, not from the request)
+        const date = String(p.date || ""), want = Math.round(Number(p.score) || 0);
+        const play = (Array.isArray(c.top) ? c.top : []).find((x) => x && String(x.date) === date && Math.round(Number(x.score) || 0) === want);
+        if (!play) fail(400, "That score isn't in your synced scores yet. Wait a moment for the sync and try again.");
+        const num = (v, lo, hi) => { const n = Number(v); return Number.isFinite(n) && n >= lo && n <= hi ? n : 0; };
+        const r2 = (n) => Math.round(n * 100) / 100;
+        // where to see it: its Workshop upload, or its osu! beatmap set
+        if (!db) db = await r2json(env, WS_DB, { items: [] });
+        const ws = (db.items || []).find((x) => !x.removed && (x.songIds || []).includes(songId));
+        const wsSong = ws && ((ws.meta && ws.meta.songs) || []).find((x) => x.songId === songId);
+        const osuSet = (wsSong && wsSong.osuSet) || (Number.isInteger(Number(p.osuSet)) && Number(p.osuSet) > 0 && Number(p.osuSet) < 1e8 ? Number(p.osuSet) : 0);
+        out.push({
+          kind: "song", songId, chartId, title: String(c.title || p.title || "").slice(0, 80), artist: String(c.artist || p.artist || "").slice(0, 80), difficulty: String(c.difficulty || p.difficulty || "").slice(0, 60),
+          keys: num(c.keyCount || play.keyCount, 0, 20), score: Math.round(num(play.score, 0, SCORE_MAX)), acc: r2(num(play.accuracy, 0, 100)), grade: String(play.grade || "").replace(/[^A-Z+]/g, "").slice(0, 3),
+          maxCombo: Math.round(num(play.maxCombo, 0, V.maxCombo)), fullCombo: !!play.fullCombo,
+          counts: Array.isArray(play.counts) ? play.counts.slice(0, 6).map((n) => Math.round(num(n, 0, 1_000_000))) : [],
+          mods: String(play.mods || "").replace(/[^A-Za-z0-9. ]/g, "").slice(0, 40), pp: r2(num(play.pp, 0, playPRMax(V.maxStars))), stars: r2(num(play.stars || c.stars, 0, V.maxStars)), date: date.slice(0, 40),
+          workshopId: ws ? ws.id : undefined, osuSet: osuSet || undefined,
+          cover: ws && ws.preview ? `${WORKER_BASE}/api/preview/${ws.id}` : osuSet ? `https://assets.ppy.sh/beatmaps/${osuSet}/covers/card.jpg` : undefined,
+        });
+      } else if (p && p.kind === "ach") {
+        if (!card) card = (await publicItems(config(env), who.playerId, ["card"])).card || {};
+        const id = String(p.id || "");
+        if (!card.achievements || !(id in card.achievements)) fail(400, "That achievement isn't unlocked.");
+        out.push({ kind: "ach", id: id.slice(0, 60) });
+      }
+    }
+    const w = await walletUpdate(env, who.playerId, (w) => { w.showcase = out; });
+    await writeCosmetics(env, who.playerId, w);
+    return reply({ ok: true, wallet: walletPublic(w, who.playerId) });
+  }
+  // ---- what everyone has equipped (titles, frames, icons, showcases, dans)
+  if (path === "/play/cosmetics" && request.method === "GET") {
+    if (!cosmeticsCache || Date.now() - cosmeticsAt > 30_000) { cosmeticsCache = (await r2json(env, COSMETICS_KEY, { players: {} })).players || {}; cosmeticsAt = Date.now(); }
+    return reply({ players: cosmeticsCache });
+  }
+
+  // ---- dans: the Workshop songs marked as dans, and clearing one
+  if (path === "/play/dans" && request.method === "GET") {
+    const db = await r2json(env, WS_DB, { items: [] });
+    const dans = (db.items || []).filter((it) => it.dan && !it.removed).map((it) => ({ itemId: it.id, level: it.dan.level, title: it.title, songIds: it.songIds || [] }))
+      .sort((a, b) => DAN_LEVELS.indexOf(a.level) - DAN_LEVELS.indexOf(b.level));
+    return reply({ dans, levels: DAN_LEVELS, clearAcc: DAN_CLEAR_ACC });
+  }
+  if (path === "/play/dan/clear" && request.method === "POST") {
+    const who = await signedIn(request, env);
+    const b = await bodyOf(request, 4_000);
+    if (String(b.mods || "").trim()) fail(400, "Dans are played without mods.");
+    const db = await r2json(env, WS_DB, { items: [] });
+    const it = (db.items || []).find((x) => x.dan && !x.removed && (x.songIds || []).includes(String(b.songId || "")));
+    if (!it) fail(404, "That song isn't a dan.");
+    const song = ((it.meta && it.meta.songs) || []).find((s) => s.songId === String(b.songId));
+    const chart = song && (song.charts || []).find((c) => c.difficulty === String(b.difficulty || ""));
+    if (!chart) fail(404, "That difficulty isn't part of the dan.");
+    const acc = countsAccuracy(b.counts, chart.notes);
+    if (acc === null) fail(400, "That play doesn't match the dan.");
+    const cleared = acc >= DAN_CLEAR_ACC;
+    let w = null;
+    if (cleared) {
+      w = await walletUpdate(env, who.playerId, (w) => {
+        const old = w.dans[it.id];
+        if (old && old.acc >= acc) return false;
+        w.dans[it.id] = { level: it.dan.level, acc: Math.round(acc * 100) / 100, at: new Date().toISOString() };
+        remember(w, { kind: "dan", level: it.dan.level, acc: Math.round(acc * 100) / 100 });
+      });
+      if (w) await writeCosmetics(env, who.playerId, w);
+    }
+    return reply({ ok: true, cleared, level: it.dan.level, accuracy: Math.round(acc * 100) / 100, needed: DAN_CLEAR_ACC });
+  }
+  fail(404, "Not found");
+}
+
 const wsPublic = (it) => ({
   id: it.id, type: it.type, title: it.title, description: it.description, creator: it.creator, creatorId: it.creatorId,
   fileName: it.fileName, fileNames: it.fileNames || [it.fileName], size: it.size, at: it.at, downloads: it.downloads || 0, updated: it.updatedAt || null, version: it.version || 1,
@@ -3137,6 +3504,8 @@ const wsPublic = (it) => ({
   songIds: it.songIds || [], songs: it.meta && it.meta.songs ? it.meta.songs : undefined,
   tags: Array.isArray(it.tags) ? it.tags : [],
   verifyRequested: it.verifyRequest && !it.verified ? it.verifyRequest.at : undefined,
+  dan: it.dan ? it.dan.level : undefined,
+  spotlight: it.spotlightUntil && Date.parse(it.spotlightUntil) > Date.now() ? it.spotlightUntil : undefined,
   preview: it.preview ? `${WORKER_BASE}/api/preview/${it.id}` : null,
   discord: it.channelId && it.messageId && it.guildId ? `https://discord.com/channels/${it.guildId}/${it.channelId}/${it.messageId}` : null,
 });
@@ -3225,6 +3594,7 @@ async function workshopRoutes(request, env, url, ctx) {
     if (wantTags.length) items = items.filter((it) => wantTags.every((t) => (it.tags || []).includes(t)));
     // ?requested=1: songs waiting for a verification check (Senterra and Octive)
     if (sp.get("requested") === "1") items = items.filter((it) => it.verifyRequest && !it.verified);
+    if (sp.get("dan") === "1") items = items.filter((it) => !!it.dan);
     const topStars = (it) => Math.max(0, ...((it.meta && it.meta.songs) || []).flatMap((sg) => (sg.charts || []).map((c) => c.stars || 0)));
     items.sort(
       sort === "popular" ? (a, b) => (b.downloads || 0) - (a.downloads || 0) || b.at - a.at
@@ -3237,6 +3607,11 @@ async function workshopRoutes(request, env, url, ctx) {
       : (a, b) => b.at - a.at);
     const counts = {};
     for (const it of db.items || []) if (!it.removed) counts[it.type] = (counts[it.type] || 0) + 1;
+    // a spotlight (bought in the points shop) puts an upload first for a day
+    if (sort === "new" || sort === "popular") {
+      const lit = (it) => it.spotlightUntil && Date.parse(it.spotlightUntil) > Date.now();
+      items = [...items.filter(lit), ...items.filter((it) => !lit(it))];
+    }
     return reply({ items: items.slice(0, 300).map((it) => ({ ...wsPublic(it), keys: [...new Set(((it.meta && it.meta.songs) || []).flatMap((sg) => (sg.charts || []).map((c) => c.keys)))].filter(Boolean).sort((a, b) => a - b), topStars: it.type === "charts" ? topStars(it) : undefined, topPR: it.type === "charts" ? wsTopPR(it) : undefined })), counts, pending, tagList: WS_TAGS, maxBytes: await wsMaxBytes(env).catch(() => null) });
   }
 
@@ -3285,9 +3660,28 @@ async function workshopRoutes(request, env, url, ctx) {
   }
 
   // ---- verify (Senterra and the official account): OCTIVE vouches for it
+  mi = path.match(/^\/api\/items\/([a-z0-9]{16,40})\/dan$/);
+  if (mi && request.method === "POST") {
+    const who = await signedIn(request, env);
+    if (who.playerId !== OWNER && !isOfficial(who.playerId)) await freshModeration(env);
+    if (who.playerId !== OWNER && !isOfficial(who.playerId) && !badgesOf(who.playerId).includes("CHARTER")) fail(403, "Only Senterra, the official OCTIVE account and charters can mark dans.");
+    const b = await bodyOf(request);
+    const level = b.level ? String(b.level) : null;
+    if (level && !DAN_LEVELS.includes(level)) fail(400, "Pick a dan level.");
+    let out = null;
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      const x = (d.items || []).find((y) => y.id === mi[1]); if (!x || x.type !== "charts") return false;
+      if (level) x.dan = { level, by: who.playerId, at: new Date().toISOString() }; else delete x.dan;
+      out = x;
+    });
+    if (!out) fail(404, "That song isn't in the Workshop any more.");
+    return reply({ ok: true, item: wsPublic(out) });
+  }
+
   mi = path.match(/^\/api\/items\/([a-z0-9]{16,40})\/verify$/);
   if (mi && request.method === "POST") {
     const who = await signedIn(request, env);
+    if (who.playerId !== OWNER && !isOfficial(who.playerId)) await freshModeration(env);
     if (who.playerId !== OWNER && !isOfficial(who.playerId) && !badgesOf(who.playerId).includes("CHARTER")) fail(403, "Only Senterra, the official OCTIVE account and charters can verify Workshop items.");
     const b = await bodyOf(request);
     let out = null;
@@ -3390,7 +3784,12 @@ async function workshopRoutes(request, env, url, ctx) {
     if (parts.length > 1 && type !== "charts") fail(400, "Only songs can be shared several at a time.");
     if (parts.length > 9) fail(400, "Share at most 9 songs in one post.");
     const fileName = parts[0].fileName, bytes = parts[0].bytes;
-    const preview = (parts.find((x) => x.preview) || {}).preview || null;
+    let preview = (parts.find((x) => x.preview) || {}).preview || null;
+    // a picture the game drew (themes: their main menu), when the file has none
+    if (!preview) {
+      const pf = form.get("preview");
+      if (pf && typeof pf !== "string" && pf.size > 0 && pf.size <= 3 * 1048576) { const pb = new Uint8Array(await pf.arrayBuffer()); if (imageType(pb)) preview = pb; }
+    }
     const hashes = parts.map((x) => x.hash);
     const songIds = parts.map((x) => x.meta && x.meta.songId).filter(Boolean);
     const meta = type === "charts" ? { songs: parts.map((x) => x.meta).filter(Boolean) } : (parts[0].meta || null);
@@ -3400,7 +3799,8 @@ async function workshopRoutes(request, env, url, ctx) {
 
     // the same file, or the same song, is only in the Workshop once
     const dbNow = await r2json(env, WS_DB, { items: [] });
-    const dup = wsDuplicate(dbNow.items || [], hashes, songIds, null);
+    // OCTIVE's own items from the import key: a new copy replaces the old one (below), so no duplicate check
+    const dup = importer && form.get("builtin") === "1" ? null : wsDuplicate(dbNow.items || [], hashes, songIds, null);
     if (dup) {
       // your own: the game asks whether this is an update of it
       const mine = dup.creatorId === who.playerId;
@@ -3589,6 +3989,10 @@ async function workshopRoutes(request, env, url, ctx) {
       upParts.push({ fileName: fn, bytes: b8, preview: pv, hash: h, meta: mt });
     }
     let bytes = upParts.length ? upParts[0].bytes : null, fileName = upParts.length ? upParts[0].fileName : it.fileName, preview = (upParts.find((x) => x.preview) || {}).preview || null;
+    if (!preview && upParts.length) {
+      const pf = form.get("preview");
+      if (pf && typeof pf !== "string" && pf.size > 0 && pf.size <= 3 * 1048576) { const pb = new Uint8Array(await pf.arrayBuffer()); if (imageType(pb)) preview = pb; }
+    }
     let newHash = null, newMeta = null;
     if (upParts.length) {
       newHash = upParts[0].hash;
@@ -3967,6 +4371,10 @@ export default {
     }
     if (/^\/(support\/|stripe\/webhook$|looks\/|social\/|follow$)/.test(url.pathname)) {
       try { const r = await supportRoutes(request, env, url, ctx); if (r) return r; }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+    }
+    if (url.pathname.startsWith("/play/")) {
+      try { return await playRoutes(request, env, url); }
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/api/")) {
