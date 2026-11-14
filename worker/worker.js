@@ -337,6 +337,16 @@ async function publicItems(cfg, playerId, keys) {
 
 /** The badge and role lists, read again when they're more than a minute old (charters' rights depend on them). */
 let moderationAt = 0;
+/** Moderator actions: Senterra, the official account, and players with the MOD badge (who can't act on developers,
+ *  the official account or other moderators). */
+async function modGate(env, who, target) {
+  if (who.playerId === OWNER || isOfficial(who.playerId)) return;
+  await freshModeration(env);
+  if (!badgesOf(who.playerId).includes("MOD")) fail(403, "Only Senterra, the official OCTIVE account and moderators can do that.");
+  if (target && (target === OWNER || isOfficial(target) || DEVELOPERS.includes(target) || badgesOf(target).includes("MOD") || badgesOf(target).includes("DEV")))
+    fail(403, "Moderators can't moderate developers, the official OCTIVE account or other moderators.");
+}
+
 async function freshModeration(env) {
   if (Date.now() - moderationAt < 60_000) return;
   try { await loadModeration(config(env)); moderationAt = Date.now(); } catch { /* keep the last lists */ }
@@ -346,7 +356,14 @@ async function loadModeration(cfg) {
   const merged = { bans: {}, overrides: {}, roles: {}, badges: {} };
   await Promise.all(DEVELOPERS.map(async (dev) => {
     try {
-      const m = (await publicItems(cfg, dev, ["moderation"])).moderation;
+      const items = await publicItems(cfg, dev, ["moderation", "moderation-mods"]);
+      const mm = items["moderation-mods"];
+      if (mm && typeof mm === "object") {
+        Object.assign(merged.bans, mm.bans || {});
+        for (const [id, o] of Object.entries(mm.overrides || {}))
+          if (!merged.overrides[id] || new Date(o.at) > new Date(merged.overrides[id].at)) merged.overrides[id] = o;
+      }
+      const m = items.moderation;
       if (!m) return;
       Object.assign(merged.bans, m.bans || {});
       for (const [id, o] of Object.entries(m.overrides || {}))
@@ -627,6 +644,83 @@ async function admin(env, method, url, body) {
 }
 
 const identity = (env) => `https://services.api.unity.com/player-identity/v1/projects/${env.UGS_PROJECT_ID}`;
+
+// ---- the official OCTIVE account is everyone's friend: the server makes the friendship (Unity Friends, with the
+// service account: no request to accept), once per player, the first time they're online in the game; everyone who
+// had an account before gets it from the backfill (/api/admin/official-friends). Removing it later sticks.
+// R2: official-friends/<playerId>  (when it was done)
+const SOCIAL_API = "https://social.services.api.unity.com/v1";
+let socialAuthWay = null; // how Unity Friends took the service account (found on the first call)
+let statelessTok = null, statelessUntil = 0;
+async function statelessToken(env) {
+  if (statelessTok && Date.now() < statelessUntil) return statelessTok;
+  const res = await fetch(`https://services.api.unity.com/auth/v1/token-exchange?projectId=${env.UGS_PROJECT_ID}&environmentId=${env.UGS_ENVIRONMENT_ID}`, { method: "POST", headers: { Authorization: config(env).auth } });
+  if (!res.ok) throw new Error(`Unity token exchange ${res.status}`);
+  const j = await res.json();
+  statelessTok = j.accessToken; statelessUntil = Date.now() + 45 * 60_000;
+  return statelessTok;
+}
+async function socialAdmin(env, method, path, body, asPlayer) {
+  const ways = socialAuthWay ? [socialAuthWay] : ["bearer", "basic"];
+  const tried = [];
+  for (const way of ways) {
+    const headers = { "Content-Type": "application/json", ProjectId: env.UGS_PROJECT_ID };
+    // a service caller acts as one player (Unity: "a service caller must supply a player to impersonate")
+    if (asPlayer) headers["impersonated-user-id"] = asPlayer;
+    if (way === "bearer") headers.Authorization = "Bearer " + (await statelessToken(env));
+    else { headers.Authorization = config(env).auth; headers.UnityEnvironment = env.UGS_ENVIRONMENT_NAME || "production"; }
+    const res = await fetch(SOCIAL_API + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+    const text = await res.text();
+    if (res.status === 401 || res.status === 403) { tried.push(`${way} ${res.status}: ${text.slice(0, 160)}`); continue; }
+    socialAuthWay = way;
+    return { status: res.status, text, way };
+  }
+  throw new Error("Unity Friends refused the server: " + tried.join(" | "));
+}
+const officialFriendsDone = new Set();
+/**
+ * The friend lists profiles show are a copy each game uploads (/dm/friends): the official account's copy only changes
+ * when someone plays as it, so the server adds both sides itself (a player who already removed OCTIVE is left out).
+ */
+async function mirrorOfficialFriend(env, playerId) {
+  const name = dmName(await displayName(env, playerId).catch(() => "Player")) || "Player";
+  await r2update(env, dmInboxKey(playerId), dmEmptyInbox, (box) => {
+    box.friends ||= [];
+    const had = (box.unfriend || []).includes(OFFICIAL_ID);
+    if (had) box.unfriend = box.unfriend.filter((x) => x !== OFFICIAL_ID);
+    if (box.friends.some((f) => f.id === OFFICIAL_ID)) return had ? undefined : false;
+    box.friends.push({ id: OFFICIAL_ID, name: "OCTIVE" });
+  });
+  await r2update(env, dmInboxKey(OFFICIAL_ID), dmEmptyInbox, (box) => {
+    box.friends ||= [];
+    const x = box.friends.find((f) => f.id === playerId);
+    if (x) { if (x.name === name) return false; x.name = name; return; }
+    box.friends.push({ id: playerId, name });
+  });
+}
+/** Puts back a friendship with OCTIVE that an older game removed (OCTIVE can't be removed). */
+async function refriendOfficial(env, playerId) {
+  const r = await socialAdmin(env, "POST", "/relationships?withPresence=false&withProfile=false", { type: "FRIEND", members: [{ id: OFFICIAL_ID }, { id: playerId }] }, playerId);
+  if (!((r.status >= 200 && r.status < 300) || r.status === 409)) throw new Error(`Unity Friends ${r.status}: ${r.text.slice(0, 200)}`);
+  await mirrorOfficialFriend(env, playerId);
+}
+
+/** Makes the player friends with the official OCTIVE account (once). Returns what happened. */
+async function befriendOfficial(env, playerId) {
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(playerId || "") || isOfficial(playerId)) return "skipped";
+  if (officialFriendsDone.has(playerId)) return "already";
+  const key = `official-friends/${playerId}`;
+  if (await env.RELEASES.head(key).catch(() => null)) { officialFriendsDone.add(playerId); return "already"; }
+  const r = await socialAdmin(env, "POST", "/relationships?withPresence=false&withProfile=false", { type: "FRIEND", members: [{ id: OFFICIAL_ID }, { id: playerId }] }, playerId);
+  // 409: they're friends already (or one blocked the other): either way, don't try again
+  if ((r.status >= 200 && r.status < 300) || r.status === 409) {
+    await env.RELEASES.put(key, JSON.stringify({ at: new Date().toISOString(), status: r.status }), { httpMetadata: { contentType: "application/json" } });
+    officialFriendsDone.add(playerId);
+    await mirrorOfficialFriend(env, playerId).catch((e) => console.log("official friend list", e && e.message));
+    return r.status === 409 ? "already friends" : "friended";
+  }
+  throw new Error(`Unity Friends ${r.status}: ${r.text.slice(0, 200)}`);
+}
 
 async function privateItems(env, playerId, keys) {
   const q = keys.map((k) => "keys=" + encodeURIComponent(k)).join("&");
@@ -947,10 +1041,38 @@ async function account(request, env, route) {
       return reply({ code, exp });
     }
     // ---- the developer's and the official account's moderator view of a player (the game's player pop-up)
+    // ---- a moderator's ban, unban, name or picture (kept in their own list next to Senterra's; never badges or roles)
+    case "mod/act": {
+      const b = await bodyOf(request, 4_000);
+      const who = await signedIn(request, env);
+      const id = String(b.playerId || "");
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
+      await modGate(env, who, id);
+      const action = String(b.action || ""), text = cleanText(b.text, 200);
+      const cfg = config(env);
+      const byName = await displayName(env, who.playerId);
+      const cur = (await publicItems(cfg, OWNER, ["moderation-mods"]).catch(() => ({})))["moderation-mods"] || {};
+      const list = { bans: cur.bans || {}, overrides: cur.overrides || {}, updated: new Date().toISOString() };
+      const now = new Date().toISOString();
+      if (action === "ban") list.bans[id] = { name: await displayName(env, id), reason: text || null, by: byName, byId: who.playerId, at: now };
+      else if (action === "unban") {
+        if (!list.bans[id]) { await loadModeration(cfg); fail(400, moderation.bans[id] ? "Senterra banned them: only Senterra can unban them." : "They aren't banned."); }
+        delete list.bans[id];
+      } else if (action === "name") {
+        if (!/^[A-Za-z0-9_.\-]{3,20}$/.test(text)) fail(400, "Names are 3–20 letters, numbers and _ . -");
+        list.overrides[id] = { ...(list.overrides[id] || {}), name: text, at: now, by: byName };
+      } else if (action === "picture") list.overrides[id] = { ...(list.overrides[id] || {}), avatar: "default", at: now, by: byName };
+      else if (action === "clear") delete list.overrides[id];
+      else fail(400, "Unknown action.");
+      await serverWrite(() => saveItem(env, OWNER, "moderation-mods", JSON.stringify(list), true));
+      await loadModeration(cfg); moderationAt = Date.now();
+      cards.delete(id);
+      return reply({ ok: true });
+    }
     case "mod/inspect": {
       const b = await bodyOf(request);
       const who = await signedIn(request, env);
-      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can see this.");
+      await modGate(env, who, String(b.playerId || ""));
       const id = String(b.playerId || "");
       if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
       const cfg = config(env);
@@ -1073,6 +1195,7 @@ async function account(request, env, route) {
         await saveItem(env, who.playerId, "seen", b.hidden === true ? "" : new Date().toISOString(), true);
         await saveItem(env, who.playerId, "platform", platform, true);
       });
+      if (env.OFFICIAL_FRIENDS !== "off") await befriendOfficial(env, who.playerId).catch((e) => console.log("official friend", e && e.message));
       return reply({ ok: true });
     }
     case "mod/moderation": {
@@ -1095,7 +1218,7 @@ async function account(request, env, route) {
       // a player's stats back to a new account's: ranking, plays, levels, achievements, chart leaderboards
       const b = await bodyOf(request);
       const who = await signedIn(request, env);
-      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      await modGate(env, who, String(b.playerId || ""));
       const id = String(b.playerId || "");
       if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
       const cfg = config(env);
@@ -1130,7 +1253,7 @@ async function account(request, env, route) {
     case "mod/reset-link": {
       const b = await bodyOf(request);
       const who = await signedIn(request, env);
-      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      await modGate(env, who, String(b.playerId || ""));
       const id = String(b.playerId || "");
       if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
       const token = [...crypto.getRandomValues(new Uint8Array(20))].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -1158,7 +1281,7 @@ async function account(request, env, route) {
       // lets a held PR / level jump through (for a day)
       const b = await bodyOf(request);
       const who = await signedIn(request, env);
-      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      await modGate(env, who, String(b.playerId || ""));
       const id = String(b.playerId || "");
       const key = `rank/players/${id}.json`;
       const rec = await r2json(env, key, null);
@@ -1205,7 +1328,7 @@ async function account(request, env, route) {
     case "mod/unlink-discord": {
       const b = await bodyOf(request);
       const who = await signedIn(request, env);
-      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      await modGate(env, who, String(b.playerId || ""));
       const id = String(b.playerId || "");
       if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
       const rec = await record(env, id);
@@ -1218,7 +1341,7 @@ async function account(request, env, route) {
     case "mod/remove-uploads": {
       const b = await bodyOf(request);
       const who = await signedIn(request, env);
-      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      await modGate(env, who, String(b.playerId || ""));
       const id = String(b.playerId || "");
       const db = await r2json(env, WS_DB, { items: [] });
       const mine = (db.items || []).filter((x) => x.creatorId === id && !x.removed);
@@ -1236,7 +1359,7 @@ async function account(request, env, route) {
       const who = await signedIn(request, env);
       const rec = await record(env, who.playerId);
       const p = rec.discordPrefs || {};
-      return reply({ linked: rec.discord?.id ? { name: rec.discord.name || "", at: rec.discord.at } : null, prefs: { dmAlerts: !!p.dmAlerts, updates: !!p.updates, show: !!p.show } });
+      return reply({ linked: rec.discord?.id ? { name: rec.discord.name || "", at: rec.discord.at } : null, prefs: { dmAlerts: !!p.dmAlerts, updates: !!p.updates, show: !!p.show, streak: p.streak !== false } });
     }
     case "discord/prefs": {
       // the Discord options (linked accounts only): DMs from the bot, the updates role, Discord on the profile
@@ -1247,6 +1370,7 @@ async function account(request, env, route) {
       const p = rec.discordPrefs || {};
       if ("dmAlerts" in b) p.dmAlerts = !!b.dmAlerts;
       if ("show" in b) p.show = !!b.show;
+      if ("streak" in b) p.streak = !!b.streak;
       let note = null;
       if ("updates" in b && env.DISCORD_GUILD_ID && env.DISCORD_BOT_TOKEN) {
         // the @Octive Updates role: pinged when a new version is announced
@@ -1261,7 +1385,7 @@ async function account(request, env, route) {
       }
       rec.discordPrefs = p;
       await saveRecord(env, who.playerId, rec);
-      return reply({ ok: true, prefs: { dmAlerts: !!p.dmAlerts, updates: !!p.updates, show: !!p.show }, note });
+      return reply({ ok: true, prefs: { dmAlerts: !!p.dmAlerts, updates: !!p.updates, show: !!p.show, streak: p.streak !== false }, note });
     }
     case "discord/unlink": {
       await bodyOf(request);
@@ -3378,16 +3502,43 @@ const okPlayerId = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{8,64}$/.tes
 const SHOP = [
   ...[["daily-grinder", "Daily Grinder"], ["jack-enjoyer", "Jack Enjoyer"], ["stream-machine", "Stream Machine"], ["ln-lover", "LN Lover"],
      ["chordjack-menace", "Chordjack Menace"], ["sv-survivor", "SV Survivor"], ["night-owl", "Night Owl"], ["speed-demon", "Speed Demon"],
-     ["perfectionist", "Perfectionist"], ["rhythm-addict", "Rhythm Addict"], ["tech-wizard", "Tech Wizard"], ["stamina-beast", "Stamina Beast"]]
+     ["perfectionist", "Perfectionist"], ["rhythm-addict", "Rhythm Addict"], ["tech-wizard", "Tech Wizard"], ["stamina-beast", "Stamina Beast"],
+     ["full-combo-hunter", "Full Combo Hunter"], ["marvelous-maniac", "Marvelous Maniac"], ["key-smasher", "Key Smasher"], ["hold-the-line", "Hold the Line"],
+     ["jumpstream-junkie", "Jumpstream Junkie"], ["handstream-hero", "Handstream Hero"], ["trill-master", "Trill Master"], ["vibro-victim", "Vibro Victim"],
+     ["rate-abuser", "Rate Abuser"], ["sight-reader", "Sight Reader"], ["chart-crafter", "Chart Crafter"], ["workshop-regular", "Workshop Regular"],
+     ["daily-devotee", "Daily Devotee"], ["streak-keeper", "Streak Keeper"], ["early-bird", "Early Bird"], ["one-more-try", "One More Try"],
+     ["accuracy-addict", "Accuracy Addict"], ["miss-magnet", "Miss Magnet"], ["note-chaser", "Note Chaser"], ["beat-breaker", "Beat Breaker"],
+     ["vsrg-veteran", "VSRG Veteran"], ["4k-specialist", "4K Specialist"], ["7k-enjoyer", "7K Enjoyer"], ["osu-refugee", "osu! Refugee"]]
     .map(([id, name]) => ({ id: "title-" + id, kind: "title", name, price: 300 })),
+  ...[["legend", "Legend"], ["unstoppable", "Unstoppable"], ["rhythm-royalty", "Rhythm Royalty"], ["the-one", "The One"], ["beyond-human", "Beyond Human"], ["octive-elite", "OCTIVE Elite"]]
+    .map(([id, name]) => ({ id: "title-" + id, kind: "title", name, price: 1500 })),
   ...[["gold", "Gold", "#FFC94D", 500], ["silver", "Silver", "#CFD8E3", 500], ["neon", "Neon", "#39FFB0", 800], ["sakura", "Sakura", "#FF9EC7", 800],
-     ["ocean", "Ocean", "#3FA9FF", 800], ["ember", "Ember", "#FF6A3D", 1000], ["void", "Void", "#8A5CFF", 1000], ["diamond", "Diamond", "#B9F2FF", 1500]]
+     ["ocean", "Ocean", "#3FA9FF", 800], ["ember", "Ember", "#FF6A3D", 1000], ["void", "Void", "#8A5CFF", 1000], ["diamond", "Diamond", "#B9F2FF", 1500],
+     ["bronze", "Bronze", "#CD7F32", 500], ["rose", "Rose", "#FF5C8A", 600], ["mint", "Mint", "#7FFFD4", 600], ["lemon", "Lemon", "#FFF06B", 600],
+     ["lavender", "Lavender", "#C3A6FF", 600], ["sky", "Sky", "#8FD3FF", 600], ["peach", "Peach", "#FFB38A", 600], ["lime", "Lime", "#A6FF3D", 700],
+     ["crimson", "Crimson", "#E0193A", 800], ["cobalt", "Cobalt", "#2F5BFF", 800], ["emerald", "Emerald", "#1FCB76", 800], ["amethyst", "Amethyst", "#9B4DFF", 800],
+     ["obsidian", "Obsidian", "#2A2A33", 900], ["ivory", "Ivory", "#FFF8E7", 900], ["ruby", "Ruby", "#FF2E63", 1200], ["sapphire", "Sapphire", "#2E7BFF", 1200],
+     ["topaz", "Topaz", "#FFB800", 1200], ["onyx", "Onyx", "#0E0E12", 1200], ["pearl", "Pearl", "#F2F0FF", 1500], ["platinum", "Platinum", "#E5E4E2", 2000]]
     .map(([id, name, color, price]) => ({ id: "frame-" + id, kind: "frame", name: name + " frame", color, price })),
-  ...[["rainbow", "Rainbow", "rainbow", "#FF4FA3"], ["pulse", "Pulse", "pulse", "#FF4FA3"], ["aurora", "Aurora", "aurora", "#3FE0C5"]]
+  ...[["rainbow", "Rainbow", "rainbow", "#FF4FA3"], ["pulse", "Pulse", "pulse", "#FF4FA3"], ["aurora", "Aurora", "aurora", "#3FE0C5"],
+     ["pulse-gold", "Golden pulse", "pulse", "#FFC94D"], ["pulse-ice", "Ice pulse", "pulse", "#8FE8FF"], ["pulse-toxic", "Toxic pulse", "pulse", "#7CFF3D"], ["pulse-blood", "Blood pulse", "pulse", "#E0193A"]]
     .map(([id, name, anim, color]) => ({ id: "frame-" + id, kind: "frame", name: name + " frame (animated)", color, anim, price: 3000 })),
+  // two colours that flow into each other (OCTIVE 1.6.2; older versions pulse the first colour)
+  ...[["sunset", "Sunset", "#FF6A3D", "#FF4FA3"], ["ocean-deep", "Deep ocean", "#2E7BFF", "#3FE0C5"], ["galaxy", "Galaxy", "#8A5CFF", "#FF4FA3"],
+     ["fire", "Fire", "#FF2E00", "#FFC94D"], ["frost", "Frost", "#8FE8FF", "#FFFFFF"], ["forest", "Forest", "#1FCB76", "#A6FF3D"],
+     ["candy", "Candy", "#FF8AD8", "#8FD3FF"], ["midnight", "Midnight", "#1B1F5E", "#8A5CFF"], ["lava", "Lava", "#E0193A", "#FF8A00"], ["neon-nights", "Neon nights", "#39FFB0", "#FF4FA3"]]
+    .map(([id, name, color, color2]) => ({ id: "frame-" + id, kind: "frame", name: name + " frame (animated)", color, color2, anim: "duo", price: 4000, minVersion: "1.6.2" })),
   ...[["star", "Gold star", "star", "#FFC94D"], ["heart", "Pink heart", "heart", "#FF6FB5"], ["note", "Music note", "note", "#3FD8FF"],
-     ["shield", "Silver shield", "shield", "#CFD8E3"], ["purple-star", "Purple star", "star", "#A77BFF"]]
+     ["shield", "Silver shield", "shield", "#CFD8E3"], ["purple-star", "Purple star", "star", "#A77BFF"],
+     ["red-heart", "Red heart", "heart", "#FF4D6D"], ["mint-note", "Mint note", "note", "#39FFB0"], ["gold-shield", "Gold shield", "shield", "#FFC94D"],
+     ["cyan-star", "Cyan star", "star", "#3FD8FF"], ["ember-star", "Ember star", "star", "#FF6A3D"]]
     .map(([id, name, shape, color]) => ({ id: "icon-" + id, kind: "icon", name, shape, color, price: 800 })),
+  // new shapes (OCTIVE 1.6.2 draws them; older versions show a star)
+  ...[["tapnote", "Tap note", "tapnote", "#FF4FA3"], ["holdnote", "Hold note", "holdnote", "#3FA9FF"], ["keyboard", "Keyboard", "keyboard", "#CFD8E3"],
+     ["mic", "Microphone", "mic", "#FFB84F"], ["palette", "Palette", "palette", "#A77BFF"], ["globe", "Globe", "globe", "#3FE0C5"]]
+    .map(([id, name, shape, color]) => ({ id: "icon-" + id, kind: "icon", name, shape, color, price: 1200, minVersion: "1.6.2" })),
+  { id: "title-color", kind: "titlecolor", name: "Title colour customizer", price: 600, note: "Pick any colour for your profile title (from Your items on your profile)", minVersion: "1.6.2" },
+  { id: "title-rainbow", kind: "titlerainbow", name: "Rainbow title", price: 2500, note: "Your profile title cycles through every colour", minVersion: "1.6.2" },
   { id: "streak-freeze", kind: "freeze", name: "Streak freeze", price: 400, note: "Covers one missed daily chart (hold up to 2)" },
   { id: "showcase", kind: "showcase", name: "Profile showcase", price: 1000, note: "Pin up to 3 of your best plays or achievements to your profile" },
   { id: "spotlight", kind: "spotlight", name: "Workshop spotlight", price: 2000, note: "One of your uploads at the top of the Workshop for 24 hours", noGift: true },
@@ -3395,6 +3546,14 @@ const SHOP = [
 ];
 const shopActive = (x, now = Date.now()) => (!x.from || Date.parse(x.from) <= now) && (!x.to || Date.parse(x.to) > now);
 const shopItem = (id) => SHOP.find((x) => x.id === id && shopActive(x));
+/** "1.6.10" > "1.6.2" (missing parts are 0; anything unreadable is 0.0.0). */
+function versionAtLeast(have, want) {
+  const a = String(have || "").split(/[.-]/).map((x) => parseInt(x, 10) || 0), b = String(want || "").split(".").map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < 3; i++) { if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0); }
+  return true;
+}
+/** Items a game of that version can show and use (?v= from 1.6.2; older games send none). The website sees everything (all=1). */
+const shopFor = (url) => url.searchParams.get("all") === "1" ? SHOP.filter((x) => shopActive(x)) : SHOP.filter((x) => shopActive(x) && (!x.minVersion || versionAtLeast(url.searchParams.get("v"), x.minVersion)));
 
 const newWallet = () => ({ balance: 0, earned: 0, streak: 0, bestStreak: 0, lastDay: null, freezes: 0, owned: [], equipped: {}, showcase: [], dans: {}, attempts: {}, history: [] });
 async function walletOf(env, id) { return { ...newWallet(), ...(await r2json(env, `points/${id}.json`, null) || {}) }; }
@@ -3414,7 +3573,7 @@ let cosmeticsCache = null, cosmeticsAt = 0;
 async function writeCosmetics(env, id, w) {
   let best = -1;
   for (const d of Object.values(w.dans || {})) { const i = DAN_LEVELS.indexOf(d.level); if (i > best) best = i; }
-  const e = { title: w.equipped.title || undefined, frame: w.equipped.frame || undefined, icon: w.equipped.icon || undefined, hasShowcase: (w.owned || []).includes("showcase") || undefined,
+  const e = { title: w.equipped.title || undefined, frame: w.equipped.frame || undefined, icon: w.equipped.icon || undefined, titleColor: w.equipped.titleColor || undefined, hasShowcase: (w.owned || []).includes("showcase") || undefined,
     showcase: (w.showcase || []).length ? w.showcase : undefined, dan: best >= 0 ? DAN_LEVELS[best] : undefined, dans: Object.keys(w.dans || {}).length || undefined };
   const empty = Object.values(e).every((v) => v === undefined);
   await r2update(env, COSMETICS_KEY, () => ({ players: {} }), (d) => { d.players ||= {}; if (empty) delete d.players[id]; else d.players[id] = e; });
@@ -3495,11 +3654,80 @@ async function playRoutes(request, env, url) {
   const path = url.pathname;
   const optionalWho = async () => (request.headers.get("Authorization") ? await signedIn(request, env).catch(() => null) : null);
 
+  // ---- thanks for a gift: the giver gets a notice (once per gift, only for a gift that really came from them)
+  //   { to, kind: "shop", at }  a points-shop gift (its time in your wallet's history)
+  //   { to, kind: "supporter", id }  a supporter gift (waiting, or already accepted)
+  if (path === "/play/thank" && request.method === "POST") {
+    const who = await signedIn(request, env);
+    const b = await bodyOf(request, 2_000);
+    const to = String(b.to || ""), kind = String(b.kind || "");
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(to) || to === who.playerId) fail(400, "That gift can't be found.");
+    let what = null, giftKey = null;
+    if (kind === "shop") {
+      const at = String(b.at || "");
+      const w = await walletOf(env, who.playerId);
+      const h = (w.history || []).find((x) => x.kind === "gift" && x.from === to && x.at === at);
+      if (h) { const item = SHOP.find((x) => x.id === h.item); what = item ? item.name : "a gift from the shop"; giftKey = `shop:${at}`; }
+    } else if (kind === "supporter") {
+      const id = String(b.id || "");
+      const pend = (await r2json(env, `gifts/${who.playerId}.json`, { pending: [] })).pending || [];
+      const rec = await r2json(env, `supporters/${who.playerId}.json`, { purchases: [] });
+      const g = pend.find((x) => x.id === id && x.from === to) || (rec.purchases || []).find((x) => x.session === id && x.gift === to);
+      if (g) { what = `${g.months} month${g.months === 1 ? "" : "s"} of OCTIVE Supporter`; giftKey = `supporter:${id}`; }
+    }
+    if (!what) fail(404, "That gift can't be found.");
+    let again = false;
+    await r2update(env, `thanks/${who.playerId}.json`, () => ({ keys: [] }), (d) => {
+      d.keys ||= [];
+      if (d.keys.includes(giftKey)) { again = true; return false; }
+      d.keys = [giftKey, ...d.keys].slice(0, 300);
+    });
+    if (again) return reply({ ok: true, already: true });
+    await addNotice(env, to, { kind: "thanks", fromId: who.playerId, fromName: await displayName(env, who.playerId), what });
+    return reply({ ok: true });
+  }
+
   // ---- your notices (a #1 taken, your upload picked as a daily chart): the game turns them into notifications
   if (path === "/play/notices" && request.method === "GET") {
     const who = await signedIn(request, env);
     const d = await r2json(env, `notices/${who.playerId}.json`, { items: [] });
-    return reply({ items: (d.items || []).slice(0, NOTICES_MAX) });
+    // and the announcements to everyone (the last 30 days)
+    const all = await r2json(env, "notices/everyone.json", { items: [] });
+    const since = Date.now() - 30 * 86_400_000;
+    const items = [...(d.items || []), ...(all.items || []).filter((x) => Date.parse(x.at) > since)].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+    return reply({ items: items.slice(0, NOTICES_MAX) });
+  }
+
+  // ---- a notification from Senterra or the official OCTIVE account: to everyone, or to players by id or name
+  if (path === "/play/notices/send" && request.method === "POST") {
+    const who = await signedIn(request, env);
+    if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can send notifications.");
+    const b = await bodyOf(request, 8_000);
+    const title = cleanText(b.title, 80), message = cleanText(b.message, 600);
+    if (message.length < 2) fail(400, "Write a message.");
+    const n = { kind: "custom", title: title || undefined, message, fromId: who.playerId, fromName: isOfficial(who.playerId) ? "OCTIVE" : await displayName(env, who.playerId) };
+    if (b.to === "everyone") {
+      const item = { id: crypto.randomUUID().replace(/-/g, "").slice(0, 16), at: new Date().toISOString(), ...n };
+      await r2update(env, "notices/everyone.json", () => ({ items: [] }), (d) => { d.items = [item, ...(d.items || [])].slice(0, 50); });
+      return reply({ ok: true, to: "everyone" });
+    }
+    // players: ids, or names as they show on the ranking
+    let ids = (Array.isArray(b.to) ? b.to : [b.to]).map((x) => String(x || "").trim()).filter(Boolean).slice(0, 50);
+    const names = ids.filter((x) => !/^[A-Za-z0-9_-]{20,64}$/.test(x));
+    if (names.length) {
+      const players = (await leaderboard(env)).players || [];
+      const found = [], missing = [];
+      for (const name of names) {
+        const p = players.find((x) => String(x.name || "").toLowerCase() === name.toLowerCase().replace(/#\d+$/, ""));
+        if (p) found.push(p.id); else missing.push(name);
+      }
+      if (missing.length) fail(404, `No player found called ${missing.join(", ")}.`);
+      ids = [...ids.filter((x) => !names.includes(x)), ...found];
+    }
+    ids = [...new Set(ids)].filter((x) => /^[A-Za-z0-9_-]{8,64}$/.test(x));
+    if (!ids.length) fail(400, "Say who it's for.");
+    for (const id of ids) await addNotice(env, id, n);
+    return reply({ ok: true, sent: ids.length });
   }
 
   // ---- the daily chart (and, signed in, your attempt and points)
@@ -3597,7 +3825,7 @@ async function playRoutes(request, env, url) {
   if (path === "/play/shop" && request.method === "GET") {
     const who = await optionalWho();
     const wallet = who ? walletPublic(await walletOf(env, who.playerId), who.playerId) : null;
-    return reply({ items: SHOP.filter((x) => shopActive(x)), wallet, danLevels: DAN_LEVELS, danClearAcc: DAN_CLEAR_ACC });
+    return reply({ items: shopFor(url), wallet, danLevels: DAN_LEVELS, danClearAcc: DAN_CLEAR_ACC });
   }
   if (path === "/play/wallet" && request.method === "GET") {
     const who = await signedIn(request, env);
@@ -3614,13 +3842,14 @@ async function playRoutes(request, env, url) {
     const b = await bodyOf(request, 2_000);
     const item = shopItem(String(b.id || ""));
     if (!item) fail(404, "That isn't in the shop.");
+    if (item.minVersion && !versionAtLeast(b.v, item.minVersion)) fail(400, `That needs OCTIVE ${item.minVersion} or newer: update the game first.`);
     const giftTo = b.giftTo ? String(b.giftTo) : null;
     if (giftTo && (!okPlayerId(giftTo) || giftTo === who.playerId)) fail(400, "Pick someone else to gift it to.");
     if (giftTo && item.noGift) fail(400, "That can't be gifted.");
     const to = giftTo || who.playerId;
     // can it go to them?
     const target = await walletOf(env, to);
-    if (["title", "frame", "icon", "showcase"].includes(item.kind) && target.owned.includes(item.id)) fail(409, giftTo ? "They already have that." : "You already have that.");
+    if (["title", "frame", "icon", "showcase", "titlecolor", "titlerainbow"].includes(item.kind) && target.owned.includes(item.id)) fail(409, giftTo ? "They already have that." : "You already have that.");
     if (item.kind === "freeze" && (target.freezes || 0) >= 2) fail(409, giftTo ? "They already hold 2 streak freezes." : "You already hold 2 streak freezes.");
     let spot = null;
     if (item.kind === "spotlight") {
@@ -3678,6 +3907,32 @@ async function playRoutes(request, env, url) {
     if (bad || !w) fail(400, "You don't own that.");
     await writeCosmetics(env, who.playerId, w);
     return reply({ ok: true, wallet: walletPublic(w, who.playerId) });
+  }
+  if (path === "/play/shop/title-color" && request.method === "POST") {
+    const who = await signedIn(request, env);
+    const b = await bodyOf(request, 500);
+    const color = String(b.color || "").trim();
+    let why = null;
+    const w = await walletUpdate(env, who.playerId, (w) => {
+      if (color === "") { delete w.equipped.titleColor; return; }
+      if (color === "rainbow") { if (!w.owned.includes("title-rainbow")) { why = "Get the Rainbow title in the shop first."; return false; } }
+      else if (!/^#[0-9A-Fa-f]{6}$/.test(color)) { why = "That isn't a colour (#RRGGBB)."; return false; }
+      else if (!w.owned.includes("title-color")) { why = "Get the title colour customizer in the shop first."; return false; }
+      w.equipped.titleColor = color === "rainbow" ? "rainbow" : color.toUpperCase();
+    });
+    if (why) fail(403, why);
+    if (!w) fail(400, "Couldn't change it.");
+    await writeCosmetics(env, who.playerId, w);
+    return reply({ ok: true, wallet: walletPublic(w, who.playerId) });
+  }
+  // ---- a player's cleared dans (their profile's View Dans)
+  if (path === "/play/dans/of" && request.method === "GET") {
+    const id = String(url.searchParams.get("player") || "");
+    if (!okPlayerId(id)) fail(400, "That player can't be found.");
+    const w = await walletOf(env, id);
+    const list = Object.entries(w.dans || {}).map(([key, d]) => ({ key, level: d.level, title: d.title, difficulty: d.difficulty, acc: d.acc, at: d.at, itemId: d.itemId, songId: d.songId }))
+      .sort((a, c) => DAN_LEVELS.indexOf(c.level) - DAN_LEVELS.indexOf(a.level) || (c.acc || 0) - (a.acc || 0));
+    return reply({ dans: list, levels: DAN_LEVELS, clearAcc: DAN_CLEAR_ACC });
   }
   if (path === "/play/shop/showcase" && request.method === "POST") {
     const who = await signedIn(request, env);
@@ -3923,13 +4178,7 @@ async function workshopRoutes(request, env, url, ctx) {
       out.headers.set("X-Octive-Cache", "MISS");
       return cors(out);
     }
-    const msg = await discordApi(env, "GET", `/channels/${it.channelId}/messages/${it.messageId}`);
-    const names = it.fileNames && it.fileNames.length ? it.fileNames : [it.fileName];
-    const n = Math.max(0, Math.min(names.length - 1, Number(url.searchParams.get("n")) || 0));
-    const att = (msg.attachments || []).find((a) => a.filename === names[n]);
-    if (!att) fail(404, "That item's file is missing on Discord.");
-    const res = await fetch(att.url);
-    return cors(new Response(res.body, { status: res.status, headers: { "Content-Type": "application/octet-stream", "Cache-Control": "private, max-age=600" } }));
+    fail(404, "That item's file is missing.");
   }
 
   // ---- one item with its details: songs and difficulties, or the skin's lock (older items get them now, once)
@@ -4055,26 +4304,7 @@ async function workshopRoutes(request, env, url, ctx) {
       if (url.searchParams.get("redirect") === "1") return cors(Response.redirect(files[0].url, 302));
       return reply({ url: files[0].url, files, fileName: it.fileName, size: it.size, type: it.type, title: it.title });
     }
-    let c = wsUrls.get(it.id);
-    if (!c || c.until < Date.now()) {
-      let msg;
-      try { msg = await discordApi(env, "GET", `/channels/${it.channelId}/messages/${it.messageId}`); }
-      catch (e) { if (e.status === 404) fail(404, "That item was removed from Discord."); throw e; }
-      const names = it.fileNames && it.fileNames.length ? it.fileNames : [it.fileName];
-      const atts = msg.attachments || [];
-      const found = names.map((n) => atts.find((a) => a.filename === n)).filter(Boolean);
-      if (!found.length) { const any = atts.find((a) => !/^preview\./i.test(a.filename)); if (any) found.push(any); }
-      if (!found.length) fail(404, "That item's file is missing on Discord.");
-      // Discord's links say when they run out (ex=hex seconds); never keep one past that
-      let until = Date.now() + WS_URL_TTL;
-      for (const att of found) { const ex = (att.url.match(/[?&]ex=([0-9a-f]+)/) || [])[1]; if (ex) until = Math.min(until, parseInt(ex, 16) * 1000 - 300_000); }
-      c = { url: found[0].url, files: found.map((a) => ({ name: a.filename, url: a.url, size: a.size })), until };
-      wsUrls.set(it.id, c);
-      if (wsUrls.size > 2000) wsUrls.delete(wsUrls.keys().next().value);
-    }
-    ctx.waitUntil(r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === it.id); if (!x) return false; x.downloads = (x.downloads || 0) + 1; }).catch(() => {}));
-    if (url.searchParams.get("redirect") === "1") return cors(Response.redirect(c.url, 302));
-    return reply({ url: c.url, files: c.files || [{ name: it.fileName, url: c.url, size: it.size }], fileName: it.fileName, size: it.size, type: it.type, title: it.title });
+    fail(404, "That item's file is missing.");
   }
 
   // ---- the move to Backblaze (the developer's tools, a few uploads per call): each upload's files are copied from
@@ -4103,6 +4333,60 @@ async function workshopRoutes(request, env, url, ctx) {
     }
     return reply({ ok: true, done, errors, left: todo.length - done.length, retryAfter });
   }
+  // ---- everyone who already has an account: friends with the official OCTIVE account (a few per call)
+  if (path === "/api/admin/official-friends" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 20_000).catch(() => ({}));
+    // the friend lists profiles show, for everyone already done (done before the server kept them itself)
+    if (b.relist) {
+      const done = [];
+      let cursor;
+      do {
+        const list = await env.RELEASES.list({ prefix: "official-friends/", cursor });
+        for (const o of list.objects) done.push(o.key.slice("official-friends/".length));
+        cursor = list.truncated ? list.cursor : undefined;
+      } while (cursor);
+      let n = 0, failed = 0;
+      for (const id of done) { try { await mirrorOfficialFriend(env, id); n++; } catch (e) { failed++; console.log("relist", e && e.message); } }
+      const box = await r2json(env, dmInboxKey(OFFICIAL_ID), dmEmptyInbox());
+      return reply({ ok: failed === 0, relisted: n, failed, officialFriends: (box.friends || []).length });
+    }
+    let ids;
+    if (Array.isArray(b.only)) ids = b.only.map(String);
+    else {
+      const set = new Set();
+      for (const prefix of ["rank/players/", "points/"]) {
+        let cursor;
+        do {
+          const list = await env.RELEASES.list({ prefix, cursor });
+          for (const o of list.objects) set.add(o.key.slice(prefix.length).replace(/\.json$/, ""));
+          cursor = list.truncated ? list.cursor : undefined;
+        } while (cursor);
+      }
+      try { for (const p of (await leaderboard(env)).players || []) set.add(p.id); } catch { /* the ranking is optional here */ }
+      ids = [...set].filter((x) => /^[A-Za-z0-9_-]{8,64}$/.test(x) && !isOfficial(x)).sort();
+    }
+    // who has it already (one listing, not a look per player)
+    {
+      let cursor;
+      do {
+        const list = await env.RELEASES.list({ prefix: "official-friends/", cursor });
+        for (const o of list.objects) officialFriendsDone.add(o.key.slice("official-friends/".length));
+        cursor = list.truncated ? list.cursor : undefined;
+      } while (cursor);
+    }
+    const limit = Math.max(1, Math.min(25, Number(b.limit) || 10));
+    const done = [];
+    let errors = 0, left = 0, firstError = null;
+    for (const id of ids) {
+      if (done.length >= limit) { left++; continue; }
+      if (officialFriendsDone.has(id)) continue;
+      try { done.push({ id, result: await befriendOfficial(env, id) }); }
+      catch (e) { errors++; firstError ??= e.message; done.push({ id, error: e.message }); if (errors >= 3) break; }
+    }
+    return reply({ ok: errors === 0, done, left, total: ids.length, way: socialAuthWay, firstError });
+  }
+
   // a check that the Backblaze key works: one small file stored, read back and deleted
   if (path === "/api/admin/b2-test" && request.method === "POST") {
     if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
@@ -4495,6 +4779,52 @@ async function discordMessageAlert(env, to, from, fromName, preview) {
   });
 }
 
+/**
+ * Daily at 21:00 UTC (wrangler.toml cron): a Discord DM to every linked player whose daily streak ends at midnight
+ * because they haven't played today (unless a streak freeze covers it, said so). Once a day each; "streak" option off = none.
+ */
+async function streakReminders(env) {
+  if (!env.DISCORD_BOT_TOKEN) return;
+  const today = todayUtc();
+  const ids = [];
+  let cursor;
+  do {
+    const list = await env.RELEASES.list({ prefix: "points/", cursor });
+    for (const o of list.objects) ids.push(o.key.slice("points/".length).replace(/\.json$/, ""));
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+  let sent = 0;
+  for (const id of ids) {
+    try {
+      const w = await walletOf(env, id);
+      if (!(w.streak >= 1) || !w.lastDay || w.lastDay === today) continue;
+      const gap = dayDiff(w.lastDay, today);
+      if (gap < 1 || gap - 1 > (w.freezes || 0)) continue; // already broken: nothing to save
+      const rec = await record(env, id);
+      if (!rec.discord?.id || rec.discordPrefs?.streak === false) continue;
+      const key = `discord-streak/${id}.txt`;
+      const last = await env.RELEASES.get(key).then((o) => (o ? o.text() : null)).catch(() => null);
+      if (last === today) continue;
+      await env.RELEASES.put(key, today);
+      const covered = (w.freezes || 0) >= gap;
+      const ch = await discordApi(env, "POST", "/users/@me/channels", { recipient_id: rec.discord.id });
+      await discordApi(env, "POST", `/channels/${ch.id}/messages`, {
+        embeds: [{
+          color: 0xffb84f,
+          title: covered ? `🔥 Your ${w.streak}-day streak` : `🔥 Your ${w.streak}-day streak ends in 3 hours`,
+          description: covered
+            ? "Today's daily charts end at midnight UTC. A streak freeze will cover you if you miss them, but playing keeps the freeze."
+            : "Play one of today's daily charts in OCTIVE before midnight UTC to keep it going.",
+          footer: { text: "Turn these off in OCTIVE: Settings → Profile → Discord" },
+        }],
+        allowed_mentions: { parse: [] },
+      });
+      sent++;
+    } catch (e) { console.log("streak reminder", e && e.message); }
+  }
+  console.log("streak reminders sent:", sent);
+}
+
 async function dmRoutes(request, env, url) {
   const path = url.pathname;
   let m;
@@ -4511,11 +4841,14 @@ async function dmRoutes(request, env, url) {
     const blocked = (Array.isArray(b.blocked) ? b.blocked : []).map(String).filter((x) => DM_ID.test(x)).slice(0, 1000);
     const done = new Set((Array.isArray(b.doneUnfriend) ? b.doneUnfriend : []).map(String));
     await r2update(env, dmInboxKey(me), dmEmptyInbox, (box) => {
-      box.unfriend = (box.unfriend || []).filter((x) => !done.has(x));
+      box.unfriend = (box.unfriend || []).filter((x) => !done.has(x) && x !== OFFICIAL_ID);
       const pending = new Set(box.unfriend);
       box.friends = friends.filter((f) => !pending.has(f.id)); box.blocked = blocked; box.synced = Date.now();
       if (b.name) box.name = dmName(b.name);
     });
+    // OCTIVE is everyone's friend: an older game that removed it gets the friendship back
+    if (!isOfficial(me) && !friends.some((f) => f.id === OFFICIAL_ID) && (await env.RELEASES.head(`official-friends/${me}`).catch(() => null)))
+      await refriendOfficial(env, me).catch((e) => console.log("refriend", e && e.message));
     return reply({ ok: true });
   }
 
@@ -4639,6 +4972,7 @@ async function dmRoutes(request, env, url) {
     const b = await bodyOf(request, 2000);
     const other = String(b.playerId || "");
     if (!DM_ID.test(other)) fail(400, "That isn't a player.");
+    if (isOfficial(other) || isOfficial(me)) fail(400, "The official OCTIVE account is everyone's friend: it can't be removed.");
     await r2update(env, dmInboxKey(me), dmEmptyInbox, (box) => {
       box.friends = (box.friends || []).filter((f) => f.id !== other);
       box.unfriend = [...new Set([...(box.unfriend || []), other])];
@@ -4731,6 +5065,8 @@ async function testRelease(request, env, key) {
 export default {
   // every 6 hours: who still boosts the Discord server (wrangler.toml [triggers] crons)
   async scheduled(event, env, ctx) {
+    // 21:00 UTC: streak reminders (3 hours before the daily charts change)
+    if (event.cron === "0 21 * * *") { ctx.waitUntil(streakReminders(env).catch((e) => console.log("streak reminders", e && e.message))); return; }
     ctx.waitUntil(Promise.all([refreshBoosters(env).catch((e) => console.log("boosters", e && e.message)), cleanDmFiles(env).catch((e) => console.log("dm files", e && e.message)),
       r2json(env, WS_DB, { items: [] }).then((db) => wsBackfillSome(env, (db.items || []).filter((it) => !it.removed && !it.meta && it.type !== "themes").slice(0, 25))).catch((e) => console.log("workshop details", e && e.message))]));
   },

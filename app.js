@@ -303,7 +303,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function loadCosmetics() {
     if (!cosmeticsLoad) cosmeticsLoad = Promise.all([
       fetch(`${worker}/play/cosmetics`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null),
-      fetch(`${worker}/play/shop`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null),
+      fetch(`${worker}/play/shop?all=1`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null),
     ]).then(([c, shop]) => {
       const titles = {};
       for (const it of (shop && shop.items) || []) if (it.kind === "title") titles[it.id] = it.name;
@@ -1385,6 +1385,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           opts.replaceChildren(
             opt("show", "Show my Discord on my profile", "Players see your Discord name on your OCTIVE profile and can copy it to add you."),
             opt("dmAlerts", "Message me on Discord", "The OCTIVE bot DMs you when a friend sends you a message (at most once per friend every 10 minutes)."),
+            opt("streak", "Streak reminders", "The OCTIVE bot DMs you a few hours before your daily streak would end (once a day, only if you haven't played)."),
             opt("updates", "Ping me for updates", "Gives you the @Octive Updates role in the OCTIVE Discord, pinged when a new version is out."));
         }).catch((e) => opts.replaceChildren(h("p.field-hint", { text: "Couldn't load your Discord options: " + e.message })));
         return;
@@ -1820,7 +1821,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
             } }, "Unfollow"));
           if (mine && kind === "friends") {
             actions.append(h("a.btn", { href: "#/messages/" + encodeURIComponent(x.id) }, "Message"));
-            actions.append(h("button.btn", { type: "button", onclick: async (e) => {
+            // the official OCTIVE account is everyone's friend: it can't be removed
+            if (x.id !== OFFICIAL_ID) actions.append(h("button.btn", { type: "button", onclick: async (e) => {
               if (!confirm(`Remove ${x.name || "this player"} from your friends? Your game removes the friendship the next time it's open.`)) return;
               e.target.disabled = true;
               try { await callApi("/dm/unfriend", { playerId: x.id }, true); row.remove(); } catch (err) { e.target.disabled = false; alert(err.message); }

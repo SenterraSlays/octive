@@ -15,7 +15,7 @@ bucket_name = "octive-releases"
 
 # Discord server boosters: re-checked every 6 hours (needs DISCORD_GUILD_ID and the DISCORD_BOT_TOKEN secret)
 [triggers]
-crons = ["0 */6 * * *"]
+crons = ["0 */6 * * *", "0 21 * * *"]
 
 # the OCTIVE Discord server and its "OCTIVE Supporter" role (the bot token is the secret DISCORD_BOT_TOKEN)
 [vars]
