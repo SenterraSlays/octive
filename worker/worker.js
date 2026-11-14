@@ -3557,8 +3557,17 @@ const shopPriceFor = (item, supporter) => supporter ? Math.round(item.price * (1
 /** Items taken out of the shop, with what they cost: owners get the points back (retireItems). */
 const RETIRED = { "frame-amethyst": 800, "frame-sapphire": 1200, "frame-ruby": 1200, "frame-topaz": 1200, "frame-onyx": 1200, "frame-pearl": 1500,
   "frame-platinum": 2000, "frame-sky": 600, "frame-mint": 600, "frame-lava": 4000 };
+const OWNABLE = ["title", "frame", "icon", "showcase", "titlecolor", "titlerainbow"];
 async function retireItems(env, id) {
-  const cur = await walletOf(env, id);
+  let cur = await walletOf(env, id);
+  // Senterra and the official account: everything in the shop is theirs
+  if (infinitePoints(id)) {
+    const all = SHOP.filter((x) => OWNABLE.includes(x.kind) && shopActive(x)).map((x) => x.id);
+    if (all.some((x) => !(cur.owned || []).includes(x))) {
+      cur = (await walletUpdate(env, id, (w) => { for (const x of all) if (!w.owned.includes(x)) w.owned.push(x); })) || cur;
+      await writeCosmetics(env, id, cur);
+    }
+  }
   if (!(cur.owned || []).some((x) => x in RETIRED)) return cur;
   const free = infinitePoints(id);
   const w = await walletUpdate(env, id, (w) => {
@@ -3957,6 +3966,15 @@ async function playRoutes(request, env, url) {
     if (!w) fail(400, "Couldn't change it.");
     await writeCosmetics(env, who.playerId, w);
     return reply({ ok: true, wallet: walletPublic(w, who.playerId) });
+  }
+  // ---- a player's items (their profile's Items): what they own, and what they have on
+  if (path === "/play/items/of" && request.method === "GET") {
+    const id = String(url.searchParams.get("player") || "");
+    if (!okPlayerId(id)) fail(400, "That player can't be found.");
+    const w = await retireItems(env, id);
+    const owned = (w.owned || []).filter((x) => SHOP.some((y) => y.id === x && OWNABLE.includes(y.kind)));
+    const eq = w.equipped || {};
+    return reply({ owned, equipped: { title: eq.title || null, frame: eq.frame || null, icon: eq.icon || null, titleColor: eq.titleColor || null } });
   }
   // ---- a player's cleared dans (their profile's View Dans)
   if (path === "/play/dans/of" && request.method === "GET") {
