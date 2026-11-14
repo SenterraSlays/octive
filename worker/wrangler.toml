@@ -21,3 +21,6 @@ crons = ["0 */6 * * *"]
 [vars]
 DISCORD_GUILD_ID = "1167928565065601175"
 DISCORD_SUPPORTER_ROLE_ID = "1570329712826253445"
+# Workshop files (Backblaze B2, S3 API); the key is the B2_KEY_ID / B2_APP_KEY secrets
+B2_BUCKET = "octive-workshop"
+B2_ENDPOINT = "s3.us-east-005.backblazeb2.com"
