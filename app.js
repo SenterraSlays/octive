@@ -1397,9 +1397,40 @@
 
   function resetPage() {
     document.title = "Reset password · OCTIVE";
+    // a reset link from Senterra or Octive: just the new password
+    const link = ((location.hash.split("?")[1] || "").match(/(?:^|&)link=([a-f0-9]{40})/) || [])[1];
+    if (link) {
+      const out = msg();
+      const pass = h("input", { type: "password", autocomplete: "new-password", maxlength: 30 });
+      const again = h("input", { type: "password", autocomplete: "new-password", maxlength: 30 });
+      const go = h("button.btn.primary.wide", { type: "button", onclick: () => {
+        if (pass.value !== again.value) return setMsg(out, "The passwords don't match.");
+        busy(go, async () => {
+          try { const r = await callApi("reset/link", { token: link, newPassword: pass.value }); setMsg(out, r.message, true); setTimeout(() => { location.hash = "#/account"; }, 2200); }
+          catch (e) { setMsg(out, e.message); }
+        });
+      } }, "Set new password");
+      app.replaceChildren(h("div.auth-card", {}, emblemSvg(64), h("h1", { text: "Choose a new password" }),
+        h("p.sub", { text: "This link was made for your account by OCTIVE. It works once." }),
+        field("New password", pass, "8–30 characters with upper and lower case, a number and a symbol."), field("New password again", again), go, out));
+      return;
+    }
     const user = h("input", { type: "text", autocomplete: "username", maxlength: 20, spellcheck: "false" });
     const out = msg();
     const send = h("button.btn.primary.wide", { type: "submit" }, "Email me a code");
+    // a linked Discord: the code can come from the OCTIVE bot in Discord DMs
+    const viaDiscord = h("button.btn.wide", { type: "button", hidden: true }, "Send the code to my Discord DMs");
+    viaDiscord.addEventListener("click", () => busy(viaDiscord, async () => {
+      try { const r = await callApi("reset/start", { username: user.value.trim(), via: "discord" }); setMsg(out, r.message, true); step2.hidden = false; setTimeout(() => code.focus(), 30); }
+      catch (err) { setMsg(out, err.message); }
+    }));
+    let optT = null;
+    user.addEventListener("input", () => {
+      clearTimeout(optT);
+      optT = setTimeout(async () => {
+        try { const o = await callApi("reset/options", { username: user.value.trim() }); viaDiscord.hidden = !o.discord; } catch { viaDiscord.hidden = true; }
+      }, 400);
+    });
     const step2 = h("div", { hidden: true });
     const code = h("input", { type: "text", inputmode: "numeric", autocomplete: "one-time-code", maxlength: 6, placeholder: "123456" });
     const pass = h("input", { type: "password", autocomplete: "new-password", maxlength: 30 });
@@ -1414,7 +1445,7 @@
         } catch (e) { setMsg(out, e.message); }
       });
     } }, "Set new password");
-    step2.append(field("Code from the email", code), field("New password", pass, "8–30 characters with upper and lower case, a number and a symbol."), field("New password again", again), finish);
+    step2.append(field("Code (from the email or Discord)", code), field("New password", pass, "8–30 characters with upper and lower case, a number and a symbol."), field("New password again", again), finish);
     const form = h("form.auth-card", {
       onsubmit: (e) => {
         e.preventDefault();
@@ -1427,7 +1458,7 @@
       emblemSvg(64),
       h("h1", { text: "Reset your password" }),
       h("p.sub", { text: "We email a code to the address linked to your account. No email linked? Sign in and add one in Account first." }),
-      field("Username", user), send, step2, out,
+      field("Username", user), send, viaDiscord, step2, out,
       h("div.auth-links", {}, h("a", { href: "#/account" }, "← Back to sign in")));
     app.replaceChildren(h("div.auth-wrap", {}, form));
     setTimeout(() => user.focus(), 30);

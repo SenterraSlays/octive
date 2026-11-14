@@ -1111,6 +1111,33 @@ async function account(request, env, route) {
       board = null; cards.delete(id);
       return reply({ ok: true, at, boardsTouched });
     }
+    case "mod/reset-link": {
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      const id = String(b.playerId || "");
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
+      const token = [...crypto.getRandomValues(new Uint8Array(20))].map((x) => x.toString(16).padStart(2, "0")).join("");
+      await env.RELEASES.put(`reset-links/${token}.json`, JSON.stringify({ playerId: id, exp: Date.now() + 86_400_000, by: who.playerId }), { httpMetadata: { contentType: "application/json" } });
+      return reply({ ok: true, url: `${SITE}#/reset?link=${token}` });
+    }
+    case "reset/link": {
+      const b = await bodyOf(request);
+      const token = String(b.token || "");
+      if (!/^[a-f0-9]{40}$/.test(token)) fail(400, "That reset link isn't valid.");
+      const link = await r2json(env, `reset-links/${token}.json`, null);
+      if (!link || link.exp < Date.now()) fail(400, "That reset link ran out or was used. Ask for a new one.");
+      const problem = passwordProblem(b.newPassword);
+      if (problem) fail(400, problem);
+      try { await admin(env, "POST", `${identity(env)}/users/${encodeURIComponent(link.playerId)}/change-password`, { newPassword: b.newPassword }); }
+      catch (e) {
+        if (e.status === 401 || e.status === 403) fail(503, "Password resets aren't switched on yet (the server's Unity service account needs the Player Authentication admin role).");
+        if (e.status === 400) fail(400, "Unity didn't accept that password: " + e.message.replace(/^.*?: /, "").slice(0, 160));
+        throw e;
+      }
+      await env.RELEASES.delete(`reset-links/${token}.json`);
+      return reply({ ok: true, message: "Your password is changed. Sign in with the new one." });
+    }
     case "mod/rank-approve": {
       // lets a held PR / level jump through (for a day)
       const b = await bodyOf(request);
@@ -1129,7 +1156,7 @@ async function account(request, env, route) {
       // verify (or un-verify) a song: its charts get a global leaderboard
       const b = await bodyOf(request);
       const who = await signedIn(request, env);
-      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can verify songs.");
+      if (who.playerId !== OWNER && !isOfficial(who.playerId) && !badgesOf(who.playerId).includes("CHARTER")) fail(403, "Only Senterra, the official OCTIVE account and charters can verify songs.");
       const id = String(b.songId || "");
       if (!songIdOk(id) || officialSong(id)) fail(400, "That song can't be verified.");
       const clean = (v, n) => String(v || "").replace(/[\u0000-\u001F\u007F]/g, "").trim().slice(0, n);
@@ -1213,10 +1240,36 @@ async function account(request, env, route) {
       await saveRecord(env, who.playerId, rec);
       return reply(await me(env, who));
     }
+    case "reset/options": {
+      // which ways this account can get a reset code (email, Discord): the website shows only those
+      const b = await bodyOf(request);
+      const username = String(b.username || "").trim().toLowerCase();
+      if (!/^[a-z0-9._@-]{3,20}$/.test(username)) return reply({ email: true, discord: false });
+      const id = await findPlayer(env, username);
+      const rec = id ? await record(env, id) : {};
+      return reply({ email: true, discord: !!(rec.discord && rec.discord.id) });
+    }
     case "reset/start": {
       const b = await bodyOf(request);
       const username = String(b.username || "").trim().toLowerCase();
       if (!/^[a-z0-9._@-]{3,20}$/.test(username)) fail(400, "Type your OCTIVE username.");
+      if (b.via === "discord") {
+        // the code as a DM from the OCTIVE bot on the linked Discord
+        const sent = { ok: true, message: "If that account has a linked Discord, OCTIVE sent you a code in your Discord DMs." };
+        const did = await findPlayer(env, username);
+        if (!did) return reply(sent);
+        const drec = await record(env, did);
+        if (!drec.discord || !drec.discord.id || !env.DISCORD_BOT_TOKEN) return reply(sent);
+        allowSend(drec);
+        const dcode = newCode();
+        drec.reset = { hash: await codeHash(env, did, "reset", dcode), exp: Date.now() + CODE_TTL, tries: 0 };
+        try {
+          const ch = await discordApi(env, "POST", "/users/@me/channels", { recipient_id: drec.discord.id });
+          await discordApi(env, "POST", `/channels/${ch.id}/messages`, { embeds: [{ color: 0x8b7bff, title: "🔑 OCTIVE password reset", description: `Your code for the account **${username}**: \`${dcode}\`\nIt works for 15 minutes. If you didn't ask for it, ignore this: your password stays the same.` }], allowed_mentions: { parse: [] } });
+        } catch (e) { fail(502, "Discord didn't take the message (are your DMs open to the OCTIVE server?)."); }
+        await saveRecord(env, did, drec);
+        return reply(sent);
+      }
       const generic = { ok: true, message: "If that account has a confirmed email, a code is on its way. Check your inbox (and spam)." };
       const id = await findPlayer(env, username);
       if (!id) return reply(generic);
@@ -3235,7 +3288,7 @@ async function workshopRoutes(request, env, url, ctx) {
   mi = path.match(/^\/api\/items\/([a-z0-9]{16,40})\/verify$/);
   if (mi && request.method === "POST") {
     const who = await signedIn(request, env);
-    if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can verify Workshop items.");
+    if (who.playerId !== OWNER && !isOfficial(who.playerId) && !badgesOf(who.playerId).includes("CHARTER")) fail(403, "Only Senterra, the official OCTIVE account and charters can verify Workshop items.");
     const b = await bodyOf(request);
     let out = null;
     await r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === mi[1]); if (!x) return false; x.verified = b.verified !== false; if (x.verified) delete x.verifyRequest; out = x; });
@@ -3403,7 +3456,15 @@ async function workshopRoutes(request, env, url, ctx) {
       builtin: isOfficial(who.playerId) && form.get("builtin") === "1" ? true : undefined,
       originalId: isOfficial(who.playerId) && /^octive[.-][a-z0-9.-]{1,60}$/.test(String(form.get("originalId") || "")) ? String(form.get("originalId")) : undefined,
     };
-    await r2update(env, WS_DB, () => ({ items: [] }), (d) => { d.items = d.items || []; d.items.push(item); });
+    // OCTIVE's own items: one each (a newer export replaces the older copy)
+    const replaced = [];
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      d.items = d.items || [];
+      if (item.builtin && item.originalId)
+        for (const x of d.items) if (!x.removed && x.builtin && x.originalId === item.originalId) { x.removed = true; replaced.push(x); }
+      d.items.push(item);
+    });
+    for (const x of replaced) { try { await discordApi(env, "DELETE", `/channels/${x.channelId}/messages/${x.messageId}`); } catch { /* gone */ } wsUrls.delete(x.id); }
     rate.n += 1;
     await r2put(env, rateKey, rate);
     return reply({ ok: true, item: wsPublic(item) });
