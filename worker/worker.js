@@ -3499,6 +3499,23 @@ const dayDiff = (a, b) => Math.round((Date.parse(b + "T00:00:00Z") - Date.parse(
 const okPlayerId = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(id);
 
 // The shop: cosmetics only (nothing changes scores, PR or rankings). "from"/"to" make seasonal items.
+const ICON_COLORS = [["gold", "Gold", "#FFC94D"], ["pink", "Pink", "#FF6FB5"], ["hotpink", "Hot pink", "#FF4FA3"], ["red", "Red", "#FF4D6D"],
+  ["orange", "Orange", "#FF6A3D"], ["amber", "Amber", "#FFB84F"], ["lime", "Lime", "#A6FF3D"], ["mint", "Mint", "#39FFB0"], ["teal", "Teal", "#3FE0C5"],
+  ["cyan", "Cyan", "#3FD8FF"], ["sky", "Sky", "#3FA9FF"], ["purple", "Purple", "#A77BFF"], ["silver", "Silver", "#CFD8E3"]];
+/** Icons from before colours were separate: what each became (its shape and its colour). */
+const ICONS_V2 = { "icon-purple-star": ["icon-star", "iconcolor-purple"], "icon-red-heart": ["icon-heart", "iconcolor-red"], "icon-mint-note": ["icon-note", "iconcolor-mint"],
+  "icon-gold-shield": ["icon-shield", "iconcolor-gold"], "icon-cyan-star": ["icon-star", "iconcolor-cyan"], "icon-ember-star": ["icon-star", "iconcolor-orange"] };
+/** The colour each kept icon used to have (its owners get it free, so their icon looks the same). */
+const ICON_GIVEN_COLOR = { "icon-star": "iconcolor-gold", "icon-heart": "iconcolor-pink", "icon-note": "iconcolor-cyan", "icon-shield": "iconcolor-silver",
+  "icon-tapnote": "iconcolor-hotpink", "icon-holdnote": "iconcolor-sky", "icon-keyboard": "iconcolor-silver", "icon-mic": "iconcolor-amber", "icon-palette": "iconcolor-purple", "icon-globe": "iconcolor-teal" };
+/** A cosmetics entry from before the change, read as the new kind (players who haven't been back yet). */
+function iconsV2Entry(e) {
+  if (!e || !e.icon) return e;
+  if (ICONS_V2[e.icon]) return { ...e, icon: ICONS_V2[e.icon][0], iconColor: e.iconColor || ICONS_V2[e.icon][1] };
+  if (!e.iconColor && !e.iconsV2 && ICON_GIVEN_COLOR[e.icon]) return { ...e, iconColor: ICON_GIVEN_COLOR[e.icon] };
+  return e;
+}
+
 const SHOP = [
   ...[["daily-grinder", "Daily Grinder"], ["jack-enjoyer", "Jack Enjoyer"], ["stream-machine", "Stream Machine"], ["ln-lover", "LN Lover"],
      ["chordjack-menace", "Chordjack Menace"], ["sv-survivor", "SV Survivor"], ["night-owl", "Night Owl"], ["speed-demon", "Speed Demon"],
@@ -3526,15 +3543,16 @@ const SHOP = [
      ["fire", "Fire", "#FF2E00", "#FFC94D"], ["frost", "Frost", "#8FE8FF", "#FFFFFF"], ["forest", "Forest", "#1FCB76", "#A6FF3D"],
      ["candy", "Candy", "#FF8AD8", "#8FD3FF"], ["midnight", "Midnight", "#1B1F5E", "#8A5CFF"], ["neon-nights", "Neon nights", "#39FFB0", "#FF4FA3"]]
     .map(([id, name, color, color2]) => ({ id: "frame-" + id, kind: "frame", name: name + " frame (animated)", color, color2, anim: "duo", price: 4000, minVersion: "1.6.2" })),
-  ...[["star", "Gold star", "star", "#FFC94D"], ["heart", "Pink heart", "heart", "#FF6FB5"], ["note", "Music note", "note", "#3FD8FF"],
-     ["shield", "Silver shield", "shield", "#CFD8E3"], ["purple-star", "Purple star", "star", "#A77BFF"],
-     ["red-heart", "Red heart", "heart", "#FF4D6D"], ["mint-note", "Mint note", "note", "#39FFB0"], ["gold-shield", "Gold shield", "shield", "#FFC94D"],
-     ["cyan-star", "Cyan star", "star", "#3FD8FF"], ["ember-star", "Ember star", "star", "#FF6A3D"]]
-    .map(([id, name, shape, color]) => ({ id: "icon-" + id, kind: "icon", name, shape, color, price: 800 })),
-  // new shapes (OCTIVE 1.6.2 draws them; older versions show a star)
-  ...[["tapnote", "Tap note", "tapnote", "#FF4FA3"], ["holdnote", "Hold note", "holdnote", "#3FA9FF"], ["keyboard", "Keyboard", "keyboard", "#CFD8E3"],
-     ["mic", "Microphone", "mic", "#FFB84F"], ["palette", "Palette", "palette", "#A77BFF"], ["globe", "Globe", "globe", "#3FE0C5"]]
-    .map(([id, name, shape, color]) => ({ id: "icon-" + id, kind: "icon", name, shape, color, price: 1200, minVersion: "1.6.2" })),
+  // leaderboard icons: shapes, all the same price, white unless an icon colour is on
+  ...[["star", "Star", "star"], ["heart", "Heart", "heart"], ["note", "Music note", "note"], ["shield", "Shield", "shield"]]
+    .map(([id, name, shape]) => ({ id: "icon-" + id, kind: "icon", name, shape, color: "#FFFFFF", price: 800 })),
+  // newer shapes (OCTIVE 1.6.2 draws them; older versions show a star)
+  ...[["tapnote", "Tap note", "tapnote"], ["holdnote", "Hold note", "holdnote"], ["keyboard", "Keyboard", "keyboard"],
+     ["mic", "Microphone", "mic"], ["palette", "Palette", "palette"], ["globe", "Globe", "globe"]]
+    .map(([id, name, shape]) => ({ id: "icon-" + id, kind: "icon", name, shape, color: "#FFFFFF", price: 800, minVersion: "1.6.2" })),
+  // icon colours: one at a time, on whichever icon you have on
+  ...ICON_COLORS.map(([id, name, color]) => ({ id: "iconcolor-" + id, kind: "iconcolor", name: name + " icon colour", color, price: 200, minVersion: "1.6.2" })),
+  { id: "iconcolor-rainbow", kind: "iconcolor", name: "Rainbow icon colour", color: "#FF4FA3", anim: "rainbow", price: 600, note: "Your icon cycles through every colour", minVersion: "1.6.2" },
   { id: "title-color", kind: "titlecolor", name: "Title colour customizer", price: 600, note: "Pick any colour for your profile title (from Your items on your profile)", minVersion: "1.6.2" },
   { id: "title-rainbow", kind: "titlerainbow", name: "Rainbow title", price: 2500, note: "Your profile title cycles through every colour", minVersion: "1.6.2" },
   { id: "streak-freeze", kind: "freeze", name: "Streak freeze", price: 400, note: "Covers one missed daily chart (hold up to 2)" },
@@ -3557,7 +3575,7 @@ const shopPriceFor = (item, supporter) => supporter ? Math.round(item.price * (1
 /** Items taken out of the shop, with what they cost: owners get the points back (retireItems). */
 const RETIRED = { "frame-amethyst": 800, "frame-sapphire": 1200, "frame-ruby": 1200, "frame-topaz": 1200, "frame-onyx": 1200, "frame-pearl": 1500,
   "frame-platinum": 2000, "frame-sky": 600, "frame-mint": 600, "frame-lava": 4000 };
-const OWNABLE = ["title", "frame", "icon", "showcase", "titlecolor", "titlerainbow"];
+const OWNABLE = ["title", "frame", "icon", "iconcolor", "showcase", "titlecolor", "titlerainbow"];
 async function retireItems(env, id) {
   let cur = await walletOf(env, id);
   // Senterra and the official account: everything in the shop is theirs
@@ -3567,6 +3585,20 @@ async function retireItems(env, id) {
       cur = (await walletUpdate(env, id, (w) => { for (const x of all) if (!w.owned.includes(x)) w.owned.push(x); })) || cur;
       await writeCosmetics(env, id, cur);
     }
+  }
+  // icons became shapes + colours: what you had looks the same (the shape, its colour for free, still on)
+  if (!cur.iconsV2 && (cur.owned || []).some((x) => x.startsWith("icon-"))) {
+    cur = (await walletUpdate(env, id, (w) => {
+      if (w.iconsV2) return false;
+      const add = new Set();
+      w.owned = w.owned.filter((x) => { const m = ICONS_V2[x]; if (m) { add.add(m[0]); add.add(m[1]); return false; } if (ICON_GIVEN_COLOR[x]) add.add(ICON_GIVEN_COLOR[x]); return true; });
+      for (const x of add) if (!w.owned.includes(x)) w.owned.push(x);
+      const on = w.equipped.icon;
+      if (on && ICONS_V2[on]) { w.equipped.icon = ICONS_V2[on][0]; w.equipped.iconColor = ICONS_V2[on][1]; }
+      else if (on && ICON_GIVEN_COLOR[on] && !w.equipped.iconColor) w.equipped.iconColor = ICON_GIVEN_COLOR[on];
+      w.iconsV2 = true;
+    })) || cur;
+    await writeCosmetics(env, id, cur);
   }
   if (!(cur.owned || []).some((x) => x in RETIRED)) return cur;
   const free = infinitePoints(id);
@@ -3609,7 +3641,7 @@ let cosmeticsCache = null, cosmeticsAt = 0;
 async function writeCosmetics(env, id, w) {
   let best = -1;
   for (const d of Object.values(w.dans || {})) { const i = DAN_LEVELS.indexOf(d.level); if (i > best) best = i; }
-  const e = { title: w.equipped.title || undefined, frame: w.equipped.frame || undefined, icon: w.equipped.icon || undefined, titleColor: w.equipped.titleColor || undefined, hasShowcase: (w.owned || []).includes("showcase") || undefined,
+  const e = { title: w.equipped.title || undefined, frame: w.equipped.frame || undefined, icon: w.equipped.icon || undefined, titleColor: w.equipped.titleColor || undefined, iconColor: w.equipped.iconColor || undefined, iconsV2: w.iconsV2 || undefined, hasShowcase: (w.owned || []).includes("showcase") || undefined,
     showcase: (w.showcase || []).length ? w.showcase : undefined, dan: best >= 0 ? DAN_LEVELS[best] : undefined, dans: Object.keys(w.dans || {}).length || undefined };
   const empty = Object.values(e).every((v) => v === undefined);
   await r2update(env, COSMETICS_KEY, () => ({ players: {} }), (d) => { d.players ||= {}; if (empty) delete d.players[id]; else d.players[id] = e; });
@@ -3890,7 +3922,7 @@ async function playRoutes(request, env, url) {
     const to = giftTo || who.playerId;
     // can it go to them?
     const target = await walletOf(env, to);
-    if (["title", "frame", "icon", "showcase", "titlecolor", "titlerainbow"].includes(item.kind) && target.owned.includes(item.id)) fail(409, giftTo ? "They already have that." : "You already have that.");
+    if (["title", "frame", "icon", "iconcolor", "showcase", "titlecolor", "titlerainbow"].includes(item.kind) && target.owned.includes(item.id)) fail(409, giftTo ? "They already have that." : "You already have that.");
     if (item.kind === "freeze" && (target.freezes || 0) >= 2) fail(409, giftTo ? "They already hold 2 streak freezes." : "You already hold 2 streak freezes.");
     let spot = null;
     if (item.kind === "spotlight") {
@@ -3939,11 +3971,12 @@ async function playRoutes(request, env, url) {
     const who = await signedIn(request, env);
     const b = await bodyOf(request, 1_000);
     const slot = String(b.slot || "");
-    if (!["title", "frame", "icon"].includes(slot)) fail(400, "Pick a title, frame or icon.");
+    if (!["title", "frame", "icon", "iconColor"].includes(slot)) fail(400, "Pick a title, frame, icon or icon colour.");
+    const slotKind = slot === "iconColor" ? "iconcolor" : slot;
     const id = b.id ? String(b.id) : null;
     let bad = false;
     const w = await walletUpdate(env, who.playerId, (w) => {
-      if (id && (!w.owned.includes(id) || !SHOP.some((x) => x.id === id && x.kind === slot))) { bad = true; return false; }
+      if (id && (!w.owned.includes(id) || !SHOP.some((x) => x.id === id && x.kind === slotKind))) { bad = true; return false; }
       if (id) w.equipped[slot] = id; else delete w.equipped[slot];
     });
     if (bad || !w) fail(400, "You don't own that.");
@@ -3974,7 +4007,7 @@ async function playRoutes(request, env, url) {
     const w = await retireItems(env, id);
     const owned = (w.owned || []).filter((x) => SHOP.some((y) => y.id === x && OWNABLE.includes(y.kind)));
     const eq = w.equipped || {};
-    return reply({ owned, equipped: { title: eq.title || null, frame: eq.frame || null, icon: eq.icon || null, titleColor: eq.titleColor || null } });
+    return reply({ owned, equipped: { title: eq.title || null, frame: eq.frame || null, icon: eq.icon || null, iconColor: eq.iconColor || null, titleColor: eq.titleColor || null } });
   }
   // ---- a player's cleared dans (their profile's View Dans)
   if (path === "/play/dans/of" && request.method === "GET") {
@@ -4032,7 +4065,11 @@ async function playRoutes(request, env, url) {
   }
   // ---- what everyone has equipped (titles, frames, icons, showcases, dans)
   if (path === "/play/cosmetics" && request.method === "GET") {
-    if (!cosmeticsCache || Date.now() - cosmeticsAt > 30_000) { cosmeticsCache = (await r2json(env, COSMETICS_KEY, { players: {} })).players || {}; cosmeticsAt = Date.now(); }
+    if (!cosmeticsCache || Date.now() - cosmeticsAt > 30_000) {
+      const raw = (await r2json(env, COSMETICS_KEY, { players: {} })).players || {};
+      cosmeticsCache = Object.fromEntries(Object.entries(raw).map(([k, e]) => [k, iconsV2Entry(e)]));
+      cosmeticsAt = Date.now();
+    }
     return reply({ players: cosmeticsCache });
   }
 
