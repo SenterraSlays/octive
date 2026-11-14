@@ -1992,7 +1992,29 @@ async function readBoard(env, songId, chartId) {
   return data;
 }
 
+// R2: board-replays/<songId>/<chartId>/<playerId>.octreplay  the replay of a board score (its timing and Watch replay)
+const BOARD_REPLAY_MAX = 1_500_000;
+const boardReplayKey = (songId, chartId, playerId) => `board-replays/${songId}/${chartId}/${playerId}.octreplay`;
+/** A replay sent with a score: gzip bytes from base64 (null when missing or not a replay). */
+function replayBytes(b64) {
+  if (typeof b64 !== "string" || b64.length < 8 || b64.length > BOARD_REPLAY_MAX * 1.4) return null;
+  try {
+    const bin = atob(b64);
+    if (bin.length > BOARD_REPLAY_MAX || bin.charCodeAt(0) !== 0x1f || bin.charCodeAt(1) !== 0x8b) return null;
+    const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    return u;
+  } catch { return null; }
+}
+
 async function chartScores(request, env, url) {
+  // a board score's replay
+  const rp = url.pathname.match(/^\/scores\/replay\/([a-z0-9-]{1,90})\/([A-Za-z0-9_-]{1,80})\/([A-Za-z0-9_-]{8,64})$/);
+  if (rp && request.method === "GET") {
+    const o = await env.RELEASES.get(boardReplayKey(rp[1], rp[2], rp[3]));
+    if (!o) fail(404, "That score has no replay.");
+    return cors(new Response(o.body, { headers: { "Content-Type": "application/octet-stream", "Cache-Control": "public, max-age=300" } }));
+  }
   const m = url.pathname.match(/^\/scores\/([a-z0-9-]{1,90})\/([A-Za-z0-9_-]{1,80})$/);
   if (m && request.method === "GET") {
     if (!(await boardSong(env, m[1]))) return reply({ entries: [], official: false });
@@ -2004,7 +2026,7 @@ async function chartScores(request, env, url) {
     return reply({ official: true, entries, total: data.entries.length });
   }
   if (url.pathname === "/scores/submit") {
-    const b = await bodyOf(request);
+    const b = await bodyOf(request, 2_600_000); // a replay can come with it
     const who = await signedIn(request, env);
     const songId = String(b.songId || ""), chartId = String(b.chartId || "");
     if (!(await boardSong(env, songId)) || !chartIdOk(chartId)) fail(400, "Only OCTIVE Official and verified charts have online leaderboards.");
@@ -2034,12 +2056,23 @@ async function chartScores(request, env, url) {
     boards.delete(key);
     const data = await readBoard(env, songId, chartId);
     const i = data.entries.findIndex((e) => e.playerId === who.playerId);
+    const rep = replayBytes(b.replay);
     let improved = true;
     if (i >= 0) {
       if (data.entries[i].score >= score) improved = false;
       else data.entries.splice(i, 1);
     }
+    // the same score sent again with its replay (scores from before replays were kept): it's attached
+    if (!improved && rep && data.entries[i] && data.entries[i].score === score && !data.entries[i].replay) {
+      await env.RELEASES.put(boardReplayKey(songId, chartId, who.playerId), rep, { httpMetadata: { contentType: "application/octet-stream" } });
+      data.entries[i].replay = true;
+      await env.RELEASES.put(key, JSON.stringify(data), { httpMetadata: { contentType: "application/json" } });
+      boards.set(key, { data, at: Date.now() });
+    }
     if (improved) {
+      // the new best's replay (or none: the older one no longer matches)
+      if (rep) { await env.RELEASES.put(boardReplayKey(songId, chartId, who.playerId), rep, { httpMetadata: { contentType: "application/octet-stream" } }); entry.replay = true; }
+      else await env.RELEASES.delete(boardReplayKey(songId, chartId, who.playerId)).catch(() => {});
       data.entries.push(entry);
       data.entries.sort((a, c) => c.score - a.score || c.accuracy - a.accuracy || Date.parse(a.date) - Date.parse(c.date));
       data.entries = data.entries.slice(0, BOARD_SIZE);
@@ -2932,8 +2965,10 @@ function wsTopPR(it) {
   return Math.round(best);
 }
 /** Uploads a player can make a day: Senterra and Octive any number, supporters 10, everyone else 3. */
+// players with no daily Workshop upload limit besides staff (lego1027)
+const UNLIMITED_UPLOADS = ["u0bAhHr7LjswtFU4NB03XZcuUCOG"];
 async function wsDailyLimit(env, playerId) {
-  if (playerId === OWNER || isOfficial(playerId) || badgesOf(playerId).some((b) => b === "DEV" || b === "MOD")) return Infinity;
+  if (playerId === OWNER || isOfficial(playerId) || UNLIMITED_UPLOADS.includes(playerId) || badgesOf(playerId).some((b) => b === "DEV" || b === "MOD")) return Infinity;
   try { const sup = await supporters(env); if (sup[playerId]?.active) return 10; } catch { /* not known */ }
   return 3;
 }
@@ -3145,6 +3180,8 @@ async function wsInspect(kind, u8) {
 // Everything is decided here: the chart, the one attempt, the accuracy (from the judgement counts) and the points.
 const ACC_WEIGHTS = [100, 98, 70, 40, 10, 0];
 const DAN_CLEAR_ACC = 90; // a dan counts as cleared at this accuracy or more, with no mods
+// players who can mark dans besides Senterra, Octive and charters (lego1027)
+const DAN_MARKERS = ["u0bAhHr7LjswtFU4NB03XZcuUCOG"];
 const DAN_LEVELS = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th", "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta"];
 const COSMETICS_KEY = "cosmetics/index.json";
 const todayUtc = () => new Date().toISOString().slice(0, 10);
@@ -3677,8 +3714,9 @@ async function workshopRoutes(request, env, url, ctx) {
   if (mi && request.method === "POST") {
     // one difficulty of a song is a dan (a pack's 1st to 10th can each be one)
     const who = await signedIn(request, env);
-    if (who.playerId !== OWNER && !isOfficial(who.playerId)) await freshModeration(env);
-    if (who.playerId !== OWNER && !isOfficial(who.playerId) && !badgesOf(who.playerId).includes("CHARTER")) fail(403, "Only Senterra, the official OCTIVE account and charters can mark dans.");
+    const danMarker = who.playerId === OWNER || isOfficial(who.playerId) || DAN_MARKERS.includes(who.playerId);
+    if (!danMarker) await freshModeration(env);
+    if (!danMarker && !badgesOf(who.playerId).includes("CHARTER")) fail(403, "Only Senterra, the official OCTIVE account, charters and dan makers can mark dans.");
     const b = await bodyOf(request);
     const level = b.level ? String(b.level) : null;
     if (level && !DAN_LEVELS.includes(level)) fail(400, "Pick a dan level.");
