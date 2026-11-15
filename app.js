@@ -1887,7 +1887,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const thanks = q.get("thanks") === "1";
 
     const perks = [
-      ["3× daily points", "Every daily chart pays three times the points: up to 150 on Easy, 300 on Normal and 600 on Hard. (The day's scoreboard still shows everyone's normal points.)"],
+      ["3× daily points", "Every daily chart pays three times the points: up to 150 on Easy, 300 on Normal, 600 on Hard and 900 on Extreme. (The day's scoreboard still shows everyone's normal points.)"],
       ["10% off in the points shop", "Every title, frame, icon, colour and extra costs 10% less, gifts for friends included."],
       ["Supporter badge", "A supporter badge on your profile and next to your name on leaderboards, with anniversary art as your support adds up."],
       ["Account banner", "A banner picture across the top of your profile, in the game and on the website."],

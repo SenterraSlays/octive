@@ -1367,6 +1367,7 @@ async function account(request, env, route) {
         }
         if (!changed) return false;
       }).catch(() => {});
+      verIdx = null; danIdx = null; // the verified-copy check, dans and dailies read the uploads' verified flag
       return reply({ ok: true, verified: on, count: Object.keys(out?.songs || {}).length });
     }
     case "mod/unlink-discord": {
@@ -2164,6 +2165,13 @@ async function verifiedSongs(env) {
   verifiedCache.songs ||= {};
   verifiedAt = Date.now();
   return verifiedCache;
+}
+
+/** A Workshop upload of a song that's verified: one of its song ids, or an osu! map's set ("osu-<set>"), is in the list. */
+function wsOfVerifiedSong(it, songs) {
+  if (!it || it.type !== "charts" || !songs) return false;
+  if ((it.songIds || []).some((id) => songs[id])) return true;
+  return ((it.meta && it.meta.songs) || []).some((sg) => (sg.songId && songs[sg.songId]) || (Number(sg.osuSet) > 0 && songs["osu-" + sg.osuSet]));
 }
 // ---- notices: things to tell one player that happened while they weren't looking (their game's notifications)
 // R2: notices/<playerId>.json  { items: [{ id, kind, at, ... }] }  newest first, the last NOTICES_MAX
@@ -3841,40 +3849,68 @@ async function writeCosmetics(env, id, w) {
   cosmeticsCache = null;
 }
 
-/** The daily charts: Easy, Normal and Hard (4K only, by stars), with what each is worth. */
+/** The daily charts: Easy, Normal, Hard and Extreme (4K only, by stars), with what each is worth (× the accuracy). */
 const DAILY_TIERS = [
-  { tier: "easy", name: "Easy", min: 2, max: 4.8, factor: 0.5 },
-  { tier: "normal", name: "Normal", min: 4.81, max: 7.2, factor: 1 },
-  { tier: "hard", name: "Hard", min: 7.21, max: 10, factor: 2 },
+  { tier: "easy", name: "Easy", min: 2, max: 3.9, factor: 0.5 },
+  { tier: "normal", name: "Normal", min: 3.91, max: 5.5, factor: 1 },
+  { tier: "hard", name: "Hard", min: 5.51, max: 7.5, factor: 2 },
+  { tier: "extreme", name: "Extreme", min: 7.51, max: 10, factor: 3 }, // triple Normal (1.6.6)
 ];
 const dailyTier = (t) => DAILY_TIERS.find((x) => x.tier === t);
 /** The wallet key of an attempt at one of a day's charts (a re-picked day has its own). */
 const attemptKey = (d, date, tier) => d && d.rev ? `${date}:${tier}:${d.rev}` : `${date}:${tier}`;
-/** Points for a daily play: the accuracy rounded down (99.7% = 99), halved for Easy and doubled for Hard. */
+/** Points for a daily play: the accuracy rounded down (99.7% = 99), halved for Easy, doubled for Hard, tripled for Extreme. */
 const dailyPoints = (acc, tier) => Math.max(0, Math.floor(Math.floor(acc + 1e-9) * tier.factor));
 
-/** The days's three charts: picked once from the verified Workshop songs (the same for everyone), then kept. */
+/** Every 4K chart of a verified community song (not dans, never OCTIVE's own), in a fixed order: what dailies are picked from. */
+function dailyPool(db) {
+  const all = [];
+  for (const it of (db.items || []).filter((x) => x.type === "charts" && x.verified && !x.builtin && !x.removed && !x.dan && x.meta).sort((x, y) => String(x.id).localeCompare(String(y.id))))
+    for (const sg of it.meta.songs || []) for (const c of sg.charts || [])
+      if (c.keys === 4 && c.notes > 0 && sg.songId && !officialSong(sg.songId) && !(it.dans || []).some((d) => d.songId === sg.songId && d.difficulty === c.difficulty)) all.push({ it, sg, c });
+  return all;
+}
+
+/** A tier's chart for a day (the same for everyone: picked by the date), or null when no chart fits its stars. */
+function dailyPickFor(all, date, t) {
+  const pool = all.filter((x) => x.c.stars >= t.min && x.c.stars <= t.max);
+  if (!pool.length) return null;
+  let h = 2166136261; for (const ch of `octive-daily-${date}-${t.tier}`) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0; }
+  const { it, sg, c } = pool[h % pool.length];
+  return { tier: t.tier, name: t.name, maxPoints: Math.floor(100 * t.factor), itemId: it.id, songId: sg.songId, osuSet: sg.osuSet || undefined, title: sg.title || it.title, artist: sg.artist || "",
+    difficulty: c.difficulty, keys: c.keys, stars: c.stars, notes: c.notes, durationUs: sg.durationUs || 0, creator: it.creator, scores: [] };
+}
+
+/** The day's charts: picked once from the verified Workshop songs (the same for everyone), then kept. */
 async function dailyOf(env, date) {
   const key = `daily/${date}.json`;
   const have = await r2json(env, key, null);
   // a day picked before OCTIVE's own songs were left out is picked again (its old picks are kept in it)
   const stale = (d) => d && d.charts && Object.values(d.charts).some((c) => officialSong(c.songId));
-  if (have && have.charts && !stale(have)) return have;
+  if (have && have.charts && !stale(have)) {
+    // a tier added after the day was picked (Extreme, 1.6.6): picked once, the day's other charts stay as they are
+    const missing = DAILY_TIERS.filter((t) => !have.charts[t.tier] && !(have.added || []).includes(t.tier));
+    if (!missing.length) return have;
+    const all = dailyPool(await r2json(env, WS_DB, { items: [] }));
+    await r2update(env, key, () => ({}), (d) => {
+      if (!d || !d.charts) return false;
+      d.added = d.added || [];
+      for (const t of missing) {
+        if (d.charts[t.tier] || d.added.includes(t.tier)) continue;
+        const c = dailyPickFor(all, date, t);
+        if (c) d.charts[t.tier] = c;
+        d.added.push(t.tier); // tried once (a tier with no chart that fits isn't looked for again today)
+      }
+    }).catch((e) => console.log("daily tier", e && e.message));
+    const saved = await r2json(env, key, null);
+    return saved && saved.charts ? saved : have;
+  }
   const db = await r2json(env, WS_DB, { items: [] });
-  // every 4K chart of a verified song (not dans), in a fixed order
-  const all = [];
-  // verified community songs only: never OCTIVE's own (its official uploads, or songs with an OCTIVE id)
-  for (const it of (db.items || []).filter((x) => x.type === "charts" && x.verified && !x.builtin && !x.removed && !x.dan && x.meta).sort((x, y) => String(x.id).localeCompare(String(y.id))))
-    for (const sg of it.meta.songs || []) for (const c of sg.charts || [])
-      if (c.keys === 4 && c.notes > 0 && sg.songId && !officialSong(sg.songId) && !(it.dans || []).some((d) => d.songId === sg.songId && d.difficulty === c.difficulty)) all.push({ it, sg, c });
+  const all = dailyPool(db);
   const charts = {};
   for (const t of DAILY_TIERS) {
-    const pool = all.filter((x) => x.c.stars >= t.min && x.c.stars <= t.max);
-    if (!pool.length) continue;
-    let h = 2166136261; for (const ch of `octive-daily-${date}-${t.tier}`) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0; }
-    const { it, sg, c } = pool[h % pool.length];
-    charts[t.tier] = { tier: t.tier, name: t.name, maxPoints: Math.floor(100 * t.factor), itemId: it.id, songId: sg.songId, osuSet: sg.osuSet || undefined, title: sg.title || it.title, artist: sg.artist || "",
-      difficulty: c.difficulty, keys: c.keys, stars: c.stars, notes: c.notes, durationUs: sg.durationUs || 0, creator: it.creator, scores: [] };
+    const c = dailyPickFor(all, date, t);
+    if (c) charts[t.tier] = c;
   }
   // rev: this pick's own id, so attempts at an older pick of the same day don't count against it
   const pick = { date, charts, rev: Date.now() };
@@ -4760,6 +4796,24 @@ async function workshopRoutes(request, env, url, ctx) {
     }
     return reply({ ok: true, done, errors, left: todo.length - done.length, retryAfter });
   }
+  // ---- uploads of verified songs that aren't marked verified (uploaded after the song was verified, before 1.6.6)
+  if (path === "/api/admin/verify-sync" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 2000).catch(() => ({}));
+    const songs = (await verifiedSongs(env)).songs;
+    const fixed = [];
+    if (b.dry) {
+      for (const x of (await r2json(env, WS_DB, { items: [] })).items || []) if (!x.removed && !x.verified && wsOfVerifiedSong(x, songs)) fixed.push({ id: x.id, title: x.title, creator: x.creator });
+      return reply({ ok: true, dry: true, fixed });
+    }
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      fixed.length = 0;
+      for (const x of d.items || []) if (!x.removed && !x.verified && wsOfVerifiedSong(x, songs)) { x.verified = true; delete x.verifyRequest; fixed.push({ id: x.id, title: x.title, creator: x.creator }); }
+      if (!fixed.length) return false;
+    });
+    verIdx = null; danIdx = null;
+    return reply({ ok: true, fixed });
+  }
   // ---- each chart's id and osu! file fingerprint, read again from the manifests of uploads read before they were kept
   // (verified uploads and dans first). A few uploads per call: they're downloaded whole.
   if (path === "/api/admin/ws-chart-ids" && request.method === "POST") {
@@ -5108,12 +5162,14 @@ async function workshopRoutes(request, env, url, ctx) {
       id, type, title, description, creator, creatorId: who.playerId, fileName, fileNames: parts.map((x) => x.fileName), size: total,
       channelId, messageId: null, guildId: env.DISCORD_GUILD_ID, at: Date.now(), downloads: 0, preview: !!pType,
       hashes, songIds, meta, verified: isOfficial(who.playerId), // the official account's uploads are OCTIVE's own: verified
+      // (a song that's verified already: its new uploads are verified as well, below)
       tags: type === "charts" ? wsTags(form.get("tags")) : undefined,
       // OCTIVE's own songs, skins and themes (once built into the game): every player gets them
       builtin: isOfficial(who.playerId) && form.get("builtin") === "1" ? true : undefined,
       originalId: isOfficial(who.playerId) && /^octive[.-][a-z0-9.-]{1,60}$/.test(String(form.get("originalId") || "")) ? String(form.get("originalId")) : undefined,
       b2Files, post: 2,
     };
+    if (!item.verified && type === "charts") { try { if (wsOfVerifiedSong(item, (await verifiedSongs(env)).songs)) { item.verified = true; verIdx = null; danIdx = null; } } catch { /* stays unverified */ } }
     try { item.messageId = (await discordApi(env, "POST", `/channels/${channelId}/messages`, wsPostBody(item, creatorDiscord))).id; }
     catch (e) { console.log("workshop post", e && e.message); }
     // OCTIVE's own items: one each (a newer export replaces the older copy)
@@ -5287,6 +5343,7 @@ async function workshopRoutes(request, env, url, ctx) {
     if (pType) await env.RELEASES.put(`workshop/previews/${it.id}`, preview, { httpMetadata: { contentType: pType === "png" ? "image/png" : "image/jpeg" } });
     wsUrls.delete(it.id);
     let out = null;
+    const verifiedNow = it.type === "charts" ? ((await verifiedSongs(env).catch(() => null)) || {}).songs : null;
     await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
       const x = (d.items || []).find((y) => y.id === it.id);
       if (!x) return false;
@@ -5298,6 +5355,7 @@ async function workshopRoutes(request, env, url, ctx) {
         x.songIds = it.type === "charts" ? upParts.map((y) => y.meta && y.meta.songId).filter(Boolean) : [];
       }
       x.b2Files = newFiles || oldFiles;
+      if (!x.verified && verifiedNow && wsOfVerifiedSong(x, verifiedNow)) { x.verified = true; verIdx = null; danIdx = null; }
       if (form.get("tags") != null && it.type === "charts") x.tags = wsTags(form.get("tags"));
       if (pType) x.preview = true;
       out = x;
