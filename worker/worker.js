@@ -3601,6 +3601,46 @@ function wsDuplicate(items, hashes, songIds, exceptId) {
   return null;
 }
 
+/**
+ * What makes two charts the same map: the same chart file (its id), the same osu! difficulty file (MD5), or the
+ * same song (title and artist), difficulty name, note count and keys.
+ */
+const wsNorm = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+function wsChartKeys(song, c) {
+  const keys = [];
+  if (c.chartId) keys.push("id:" + c.chartId);
+  if (c.osuMd5) keys.push("md5:" + String(c.osuMd5).toLowerCase());
+  const t = wsNorm(song.title), d = wsNorm(c.difficulty);
+  if (t && d && Number(c.notes) > 0) keys.push(`n:${t}|${wsNorm(song.artist)}|${d}|${Number(c.notes)}|${Number(c.keys) || 0}`);
+  return keys;
+}
+
+/**
+ * An upload that already has every chart of one of these songs: a re-upload of a map that's in the Workshop (a fresh
+ * osu! import of it gets a new song id and file, so the file check doesn't catch it), or null. A song with any new
+ * difficulty isn't a re-upload.
+ */
+function wsSameCharts(items, songs, keep) {
+  const index = new Map();
+  for (const x of items) {
+    if (x.removed || x.type !== "charts" || (keep && !keep(x))) continue;
+    for (const sg of (x.meta && x.meta.songs) || []) for (const c of sg.charts || []) for (const k of wsChartKeys(sg, c)) if (!index.has(k)) index.set(k, x);
+  }
+  if (!index.size) return null;
+  for (const sg of songs || []) {
+    const charts = (sg && sg.charts) || [];
+    if (!charts.length) continue;
+    let hit = null, all = true;
+    for (const c of charts) {
+      const found = wsChartKeys(sg, c).map((k) => index.get(k)).find(Boolean);
+      if (!found) { all = false; break; }
+      hit = hit || found;
+    }
+    if (all && hit) return hit;
+  }
+  return null;
+}
+
 /** Checks a file and finds its preview; returns { preview } or throws a readable error. */
 async function wsInspect(kind, u8) {
   if (kind === "charts" || kind === "skins") {
@@ -5033,6 +5073,19 @@ async function workshopRoutes(request, env, url, ctx) {
       const mine = dup.creatorId === who.playerId;
       return reply({ error: `That's already in the Workshop: "${dup.title}" by ${dup.creator}.`, code: "duplicate", duplicateId: dup.id, mine, item: wsPublic(dup) }, 409);
     }
+    // the same map again (a fresh osu! import of it, or a changed copy of an upload): get the one that's there.
+    // Developers, moderators and the official account can still post their own copies.
+    if (type === "charts" && !(importer && form.get("builtin") === "1")) {
+      const staffUp = badgesOf(who.playerId).some((b) => b === "DEV" || b === "MOD") || who.playerId === OWNER || isOfficial(who.playerId);
+      const same = staffUp ? null : wsSameCharts(dbNow.items || [], meta && meta.songs, null);
+      if (same) {
+        const mine = same.creatorId === who.playerId;
+        return reply({
+          error: mine ? `You've shared this map already: "${same.title}". Update that upload instead.` : `This map is already in the Workshop: "${same.title}" by ${same.creator}. Get it there instead of uploading it again.`,
+          code: "duplicate", duplicateId: same.id, mine, item: wsPublic(same),
+        }, 409);
+      }
+    }
 
     const clean = (v, n) => String(v || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@\u200b$1").trim().slice(0, n);
     const card = (await publicItems(cfg, who.playerId, ["card"]).catch(() => ({}))).card || {};
@@ -5208,6 +5261,11 @@ async function workshopRoutes(request, env, url, ctx) {
       const sids = it.type === "charts" ? upParts.map((x) => x.meta && x.meta.songId).filter(Boolean) : [];
       const dup = wsDuplicate(db.items || [], upParts.map((x) => x.hash), sids, it.id);
       if (dup) fail(409, `That file is already in the Workshop: "${dup.title}" by ${dup.creator}.`);
+      // nor someone else's map again (their uploads only: a new version of your own map is fine)
+      if (it.type === "charts" && !staff) {
+        const same = wsSameCharts(db.items || [], upParts.map((x) => x.meta).filter(Boolean), (x) => x.id !== it.id && x.creatorId !== it.creatorId);
+        if (same) fail(409, `This map is already in the Workshop: "${same.title}" by ${same.creator}.`);
+      }
     }
     // a few updates a day per player (they count with uploads)
     const day = new Date().toISOString().slice(0, 10);
