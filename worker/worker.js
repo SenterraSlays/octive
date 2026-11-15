@@ -1872,10 +1872,10 @@ async function discordCommand(env, it) {
       const fields = [];
       for (const [label, test] of groups) {
         const list = all.filter((p) => test(p.status || ""));
-        if (list.length) fields.push({ name: `${label} — ${list.length}`, value: list.slice(0, 15).map((p) => `**${clean(p.name)}** · #${p.rank}${/-dev$/.test(p.status || "") ? " · 🧪" : ""}`).join("\n").slice(0, 1024), inline: true });
+        if (list.length) fields.push({ name: `${label} — ${list.length}`, value: list.slice(0, 20).map((p) => `**${clean(p.name)}** · #${p.rank}${/-dev$/.test(p.status || "") ? " · 🧪" : ""}`).join("\n").slice(0, 1024), inline: true });
       }
       const rest = all.filter((p) => !groups.some(([, t]) => t(p.status || "")));
-      if (rest.length) fields.push({ name: `🎮 In game — ${rest.length}`, value: rest.slice(0, 15).map((p) => `**${clean(p.name)}** · #${p.rank}`).join("\n").slice(0, 1024), inline: true });
+      if (rest.length) fields.push({ name: `🎮 In game — ${rest.length}`, value: rest.slice(0, 20).map((p) => `**${clean(p.name)}** · #${p.rank}`).join("\n").slice(0, 1024), inline: true });
       return {
         embeds: [{
           title: `🟢 ${all.length} player${all.length === 1 ? "" : "s"} online`, color: C_GREEN, url: `${SITE}#/rankings`,
@@ -3423,7 +3423,7 @@ function wsPostBody(it, creatorDiscord) {
   if (it.description) lines.push(wsMd(it.description, 700));
   if (songs.length) {
     if (lines.length) lines.push("");
-    for (const sg of songs.slice(0, 9)) {
+    for (const sg of songs.slice(0, 20)) {
       lines.push(`**${wsMd(sg.title || "Song", 80)}**${sg.artist ? ` · ${wsMd(sg.artist, 60)}` : ""}`);
       const cs = (sg.charts || []).slice().sort((a, b) => (a.stars || 0) - (b.stars || 0)).slice(0, 10);
       if (cs.length) lines.push(cs.map((c) => "`" + `${c.keys ? c.keys + "K " : ""}${String(c.difficulty || "?").replace(/`/g, "'").slice(0, 24)}${c.stars ? " " + Number(c.stars).toFixed(1) + "★" : ""}` + "`").join(" "));
@@ -4432,7 +4432,7 @@ async function wsBackfill(env, it) {
   try {
     const metas = [], hashes = [];
     if (it.b2Files && it.b2Files.length) {
-      for (const f of it.b2Files.slice(0, 9)) {
+      for (const f of it.b2Files.slice(0, 20)) {
         if (f.size > 60 * 1048576) continue;
         const r = await b2Get(env, f.key); if (!r.ok) continue;
         const u8 = new Uint8Array(await r.arrayBuffer());
@@ -4441,7 +4441,7 @@ async function wsBackfill(env, it) {
     } else {
     const msg = await discordApi(env, "GET", `/channels/${it.channelId}/messages/${it.messageId}`);
     const names = it.fileNames && it.fileNames.length ? it.fileNames : [it.fileName];
-    for (const a of (msg.attachments || []).filter((x) => names.includes(x.filename)).slice(0, 9)) {
+    for (const a of (msg.attachments || []).filter((x) => names.includes(x.filename)).slice(0, 20)) {
       if (a.size > 60 * 1048576) continue;
       const u8 = new Uint8Array(await (await fetch(a.url)).arrayBuffer());
       metas.push(await wsMeta(it.type, u8)); hashes.push(await bytesHash(u8));
@@ -4734,7 +4734,7 @@ async function workshopRoutes(request, env, url, ctx) {
     for (const it of todo.slice(0, limit)) {
       try {
         const found = [];
-        for (const f of it.b2Files.slice(0, 9)) {
+        for (const f of it.b2Files.slice(0, 20)) {
           if (f.size > 60 * 1048576) continue;
           const r = await b2Get(env, f.key);
           if (!r.ok) throw new Error(`B2 answered ${r.status}`);
@@ -4985,7 +4985,7 @@ async function workshopRoutes(request, env, url, ctx) {
     let form;
     try { form = await request.formData(); } catch { fail(400, "The upload wasn't readable (multipart/form-data expected)."); }
     if (importer && form.get("builtin") !== "1") fail(403, "The import key only publishes OCTIVE's own content.");
-    // one file, or (charts) the songs of one entry: a pack or speed copies, up to 9 songs in one item
+    // one file, or (charts) the songs of one entry: a pack or speed copies, up to 20 songs in one item
     const files = form.getAll("file").filter((f) => f && typeof f !== "string");
     if (!files.length) fail(400, "No file was attached.");
     const parts = [];
@@ -5009,7 +5009,7 @@ async function workshopRoutes(request, env, url, ctx) {
       parts.push({ fileName, bytes, preview, hash, meta: meta1 });
     }
     if (parts.length > 1 && type !== "charts") fail(400, "Only songs can be shared several at a time.");
-    if (parts.length > 9) fail(400, "Share at most 9 songs in one post.");
+    if (parts.length > 20) fail(400, "Share at most 20 songs in one post.");
     const fileName = parts[0].fileName, bytes = parts[0].bytes;
     let preview = (parts.find((x) => x.preview) || {}).preview || null;
     // a picture the game drew (themes: their main menu), when the file has none
@@ -5181,7 +5181,7 @@ async function workshopRoutes(request, env, url, ctx) {
     const upFiles = form.getAll("file").filter((f) => f && typeof f !== "string");
     const upParts = [];
     let upTotal = 0;
-    for (const file of upFiles.slice(0, 9)) {
+    for (const file of upFiles.slice(0, 20)) {
       const fn = String(file.name || it.fileName).replace(/[^A-Za-z0-9 ._()\[\]'&+,-]/g, "_").slice(0, 100);
       const ext = (fn.match(/\.[A-Za-z]+$/) || [""])[0].toLowerCase();
       if (WS_TYPES[ext] !== it.type) fail(400, `An update must be the same kind of file (${WS_LABEL[it.type].toLowerCase()}).`);
