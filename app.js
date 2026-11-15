@@ -265,6 +265,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         r.dataset.place = String(p.rank);
         r.querySelector(".rank").textContent = isOfficial(p) ? INF : "#" + fmt0.format(p.rank);
         nameInto(r.querySelector(".name"), p);
+        addLbIcon(r.querySelector(".name"), p.id);
         setAvatar(r.querySelector(".avatar"), p);
         setRole(r, r.querySelector(".badge"), p);
         if (isSupporter(p)) { r.classList.add("supporter"); const pill = supporterPill(p); pill.classList.add("rank"); r.querySelector(".player").append(pill); }
@@ -305,11 +306,52 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       fetch(`${worker}/play/cosmetics`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null),
       fetch(`${worker}/play/shop?all=1`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null),
     ]).then(([c, shop]) => {
-      const titles = {};
-      for (const it of (shop && shop.items) || []) if (it.kind === "title") titles[it.id] = it.name;
-      return { players: (c && c.players) || {}, titles };
+      const titles = {}, icons = {}, colors = {};
+      for (const it of (shop && shop.items) || []) {
+        if (it.kind === "title") titles[it.id] = it.name;
+        else if (it.kind === "icon") icons[it.id] = it;
+        else if (it.kind === "iconcolor") colors[it.id] = it;
+      }
+      return { players: (c && c.players) || {}, titles, icons, colors };
     });
     return cosmeticsLoad;
+  }
+
+  // ---- leaderboard icons from the points shop: a shape before the name, white or in the player's icon colour
+  // (the same shapes the game draws)
+  const LB_SHAPES = {
+    star: '<path fill="currentColor" d="M12 2.6l2.9 6 6.6.8-4.9 4.5 1.3 6.6L12 17.3l-5.9 3.2 1.3-6.6-4.9-4.5 6.6-.8z"/>',
+    heart: '<path fill="currentColor" d="M12 20.5s-7.6-4.6-9.4-9.3C1.4 8 3.4 4.5 6.8 4.5c2 0 3.4 1.1 5.2 3.1 1.8-2 3.2-3.1 5.2-3.1 3.4 0 5.4 3.5 4.2 6.7-1.8 4.7-9.4 9.3-9.4 9.3z"/>',
+    note: '<path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" d="M9 17.5V5.2l10.5-2v12"/><circle fill="currentColor" cx="6.3" cy="17.6" r="3"/><circle fill="currentColor" cx="16.8" cy="15.4" r="3"/>',
+    shield: '<path fill="currentColor" d="M12 2.2l8 3v6.1c0 5-3.4 9.1-8 10.6-4.6-1.5-8-5.6-8-10.6V5.2z"/>',
+    tapnote: '<rect fill="currentColor" x="2.5" y="8.5" width="19" height="7" rx="3.5"/>',
+    holdnote: '<rect fill="currentColor" opacity=".5" x="7.5" y="2.5" width="9" height="14" rx="1.5"/><rect fill="currentColor" x="2.5" y="14.5" width="19" height="7" rx="3.5"/>',
+    keyboard: '<rect fill="none" stroke="currentColor" stroke-width="2" x="2" y="5.5" width="20" height="13" rx="2.5"/><path fill="currentColor" d="M5.5 9h2v2h-2zM9 9h2v2H9zM12.5 9h2v2h-2zM16 9h2.5v2H16zM7 14.5h10v1.8H7z"/>',
+    mic: '<rect fill="currentColor" x="8.5" y="2" width="7" height="12" rx="3.5"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M5 11a7 7 0 0 0 14 0M12 18v3.5M8.5 21.5h7"/>',
+    palette: '<path fill="currentColor" fill-rule="evenodd" d="M12 3a9 9 0 1 0 0 18c1.5 0 2-1 2-2 0-1.5-1-2 0-3s3 0 5-1 2-4 2-4c0-4.5-4-8-9-8zM7.5 12.2a1.3 1.3 0 1 0 0-2.6 1.3 1.3 0 0 0 0 2.6zm3.5-4a1.3 1.3 0 1 0 0-2.6 1.3 1.3 0 0 0 0 2.6zm5 1.6a1.3 1.3 0 1 0 0-2.6 1.3 1.3 0 0 0 0 2.6z"/>',
+    globe: '<circle fill="none" stroke="currentColor" stroke-width="2" cx="12" cy="12" r="9"/><path fill="none" stroke="currentColor" stroke-width="1.8" d="M3 12h18M12 3c3.2 3.2 3.2 14.8 0 18M12 3c-3.2 3.2-3.2 14.8 0 18"/>',
+  };
+  function lbIconEl(id, cz) {
+    const e = cz && cz.players && cz.players[id];
+    const it = e && e.icon && cz.icons[e.icon];
+    if (!it) return null;
+    const col = e.iconColor ? cz.colors[e.iconColor] : null;
+    const s = document.createElement("span");
+    s.className = "lb-icon" + (col && col.anim === "rainbow" ? " rainbow" : "");
+    s.title = it.name || "Leaderboard icon";
+    s.setAttribute("aria-hidden", "true");
+    s.innerHTML = `<svg viewBox="0 0 24 24">${LB_SHAPES[it.shape] || LB_SHAPES.star}</svg>`;
+    if (col && col.anim !== "rainbow" && col.color) s.style.color = col.color;
+    return s;
+  }
+  /** Puts the player's leaderboard icon in front of their name (once the shop's list is in). */
+  function addLbIcon(nameEl, id) {
+    if (!nameEl || !id || !worker) return;
+    loadCosmetics().then((cz) => {
+      nameEl.querySelector(".lb-icon")?.remove();
+      const ic = lbIconEl(id, cz);
+      if (ic) nameEl.prepend(ic);
+    });
   }
   const JUDGEMENTS = [["Marvelous", "#9ef0ff"], ["Perfect", "#ffe08a"], ["Great", "#7ee39a"], ["Good", "#7fb6ff"], ["Bad", "#c79bff"], ["Miss", "#ff6b7a"]];
   function showcaseLink(s) {
@@ -767,6 +809,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           h("span.pod-sub", { text: `${fmt2.format(p.accuracy || 0)}% · Lv${p.level || 1}` }));
         setAvatar(a.querySelector(".avatar"), p);
         setRole(a, a.querySelector(".badge"), p);
+        addLbIcon(a.querySelector(".name"), p.id);
         return a;
       }), !players.length ? h("p.empty", { text: data ? "No ranked players yet. Be the first!" : "Loading the ranking…" }) : null));
     const end = h("section.h2-end", {},

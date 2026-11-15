@@ -1066,3 +1066,13 @@ main { max-width: 1160px; padding-left: 28px; padding-right: 28px; }
 .scd-mods span { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--dim); margin-right: 8px; }
 .scd-when { padding: 4px 18px 0; margin: 0; color: var(--dim); font-size: 12px; }
 .scd-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 18px 0; }
+
+/* leaderboard icons from the points shop: a shape before the name, white or in the player's icon colour */
+.lb-icon { display: inline-flex; width: 1em; height: 1em; margin-right: .38em; vertical-align: -0.14em; flex: none; color: #fff; }
+.lb-icon svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.lb-icon.rainbow { animation: lb-rainbow 5s linear infinite; }
+@keyframes lb-rainbow {
+  0%, 100% { color: #ff5c8a; } 17% { color: #ffb04d; } 33% { color: #ffe95c; }
+  50% { color: #5cff9d; } 67% { color: #5cc8ff; } 83% { color: #b47cff; }
+}
+@media (prefers-reduced-motion: reduce) { .lb-icon.rainbow { animation: none; color: #ff5c8a; } }
