@@ -16,6 +16,9 @@
 // Developers moderate from inside the game: their public "moderation" data (bans, forced names and
 // pictures, badges) is read here too, so banned players disappear from the site as well.
 
+// the game's judge, so plays are judged again from their replays (board scores, daily charts, dans): deploy judge.js with this file
+import { JUDGE_VERSION, JudgeDataError, loadChart, compileChart, packCompiled, unpackCompiled, readReplay, judgeReplay, parseMods, rateOf, signatureMatch, REPLAY_VERSION } from "./judge.js";
+
 const LEADERBOARD = "global-pp";
 const TOP = 100;                   // players shown
 const BOARD_TTL = 60_000;          // ranking refresh
@@ -212,6 +215,17 @@ async function serverWrite(fn) {
  * The ranking from a player's own plays, worked out and checked here. Returns what to publish and why
  * anything was left out.
  */
+let devFriends = null, devFriendsAt = 0;
+/** On the developer's friends list (their own game keeps it here): never taken from a player's own word. */
+async function isDevFriend(env, id) {
+  if (!devFriends || Date.now() - devFriendsAt > 300_000) {
+    const box = await r2json(env, dmInboxKey(OWNER), null).catch(() => null);
+    devFriends = new Set(((box && box.friends) || []).map((f) => String((f && f.id) || f)));
+    devFriendsAt = Date.now();
+  }
+  return devFriends.has(String(id));
+}
+
 async function rankFromPlays(env, cfg, playerId) {
   const [priv, resetRec] = await Promise.all([
     privateItems(env, playerId, ["scores"]).catch(() => ({})),
@@ -224,6 +238,7 @@ async function rankFromPlays(env, cfg, playerId) {
   let fullCombos = 0, bestCombo = 0, oldAfterReset = false;
   // verified songs (OCTIVE's own, or checked by Senterra / Octive) give their full PR, every other chart a third
   const verified = (await verifiedSongs(env).catch(() => ({ songs: {} }))).songs || {};
+  const vidx = await verifiedIndex(env).catch(() => null);
   const prFactor = (key, c) => {
     const ids = [typeof c.board === "string" ? c.board : null, String(key).split("/")[0]].filter(Boolean);
     return ids.some((id) => officialSong(id) || (songIdOk(id) && verified[id])) ? 1 : 1 / 3;
@@ -240,7 +255,12 @@ async function rankFromPlays(env, cfg, playerId) {
       c.bestScore !== undefined && !isInt(c.bestScore, 0, SCORE_MAX) ? `score ${c.bestScore}` :
       c.bestAccuracy !== undefined && !isNum(c.bestAccuracy, 0, 100) ? `accuracy ${c.bestAccuracy}` : null;
     if (why) { problems.push(`${String(key).slice(0, 60)}: ${why}`); continue; }
-    plays.push({ pp: round2(c.bestPP * prFactor(key, c)), acc: c.ppAccuracy });
+    let pp = c.bestPP;
+    // a verified chart: its stars are known here, so its PR is never more than they give at that accuracy (whatever was sent)
+    const known = vidx ? findVerified(vidx, String(key).split("/")[0], String(c.difficulty || ""), c.board) : null;
+    const ks = known ? Number(known.chart.stars) : 0;
+    if (ks > 0) pp = Math.min(pp, playPRMax(ks + 0.15, c.ppAccuracy) * 1.03 + 0.5);
+    plays.push({ pp: round2(pp * prFactor(key, c)), acc: c.ppAccuracy });
   }
   // totals: after a reset the device must have started over; numbers from before don't count
   const fresh = resetAt && oldAfterReset;
@@ -612,9 +632,14 @@ function reply(body, status = 200) {
 
 async function bodyOf(request, max = 400_000) {
   if (request.method !== "POST") fail(405, "Use POST.");
+  // a body that says it's too big is refused before it's read
+  if (Number(request.headers.get("Content-Length")) > max) fail(413, "That's too big.");
   const text = await request.text();
   if (text.length > max) fail(413, "That's too big.");
-  try { return text ? JSON.parse(text) : {}; } catch { fail(400, "The request wasn't valid JSON."); }
+  let v;
+  try { v = text ? JSON.parse(text) : {}; } catch { fail(400, "The request wasn't valid JSON."); }
+  // always an object: a body of null (or a number, a word or a list) read as fields made a server error
+  return v && typeof v === "object" && !Array.isArray(v) ? v : {};
 }
 
 /** Unity's player-facing Authentication API. Returns the JSON body; throws a readable error. */
@@ -1162,9 +1187,7 @@ async function account(request, env, route) {
       await loadModeration(cfg);
       if (moderation.bans[id]) fail(403, "This account is banned.");
       const r = await rankFromPlays(env, cfg, id);
-      // dan clears on copies the game didn't know were dans (never holds up the ranking)
-      let dansFound = 0;
-      try { dansFound = await danClearsFromPlays(env, id, r.charts, r.resetAt); } catch (err) { console.log("dans from plays", err && err.message); }
+      // (dan clears aren't taken from synced plays any more: only from /play/dan/clear, judged from the replay)
       // a jump bigger than a day of real playing waits for a moderator
       const { key, rec } = await paceCheck(env, cfg, id, now);
       rec.hist = (rec.hist || []).filter((h) => now - h.t < 86_400_000);
@@ -1206,7 +1229,7 @@ async function account(request, env, route) {
       const card = {
         name, pp: pub.pp, accuracy: pub.accuracy, level: pub.level, levelProgress: pub.levelProgress, avatar: avatarHash,
         totalScore: pub.totalScore, xp: pub.xp, playCount: pub.playCount, fullCombos: pub.fullCombos, maxCombo: pub.maxCombo,
-        playTimeMs: pub.playTimeMs, bio: cleanBio(b.bio), devFriend: b.devFriend === true, rank: 0,
+        playTimeMs: pub.playTimeMs, bio: cleanBio(b.bio), devFriend: await isDevFriend(env, id).catch(() => false), rank: 0,
         socials: badgesOf(id).includes("CREATOR") ? socialsOf({ socials: b.socials }) : {},
         version: typeof b.version === "string" && /^\d{1,3}\.\d{1,3}\.\d{1,4}$/.test(b.version) ? b.version : "",
         ppVersion: pub.ppVersion, achievements: cleanAchievements(b.achievements),
@@ -1228,7 +1251,7 @@ async function account(request, env, route) {
       rec.at = new Date(now).toISOString();
       await env.RELEASES.put(key, JSON.stringify(rec), { httpMetadata: { contentType: "application/json" } });
       cards.delete(id);
-      return reply({ ok: true, pp: pub.pp, level: pub.level, rank, held, leftOut: r.problems.length, counted: r.counted, dans: dansFound || undefined });
+      return reply({ ok: true, pp: pub.pp, level: pub.level, rank, held, leftOut: r.problems.length, counted: r.counted });
     }
     case "rank/seen": {
       // the online heartbeat (written by the server: nobody can make anyone else look online)
@@ -2240,15 +2263,23 @@ async function chartScores(request, env, url) {
     return reply({ official: true, entries, total: data.entries.length });
   }
   if (url.pathname === "/scores/submit") {
-    const b = await bodyOf(request, 2_600_000); // a replay can come with it
+    const b = await bodyOf(request, 2_600_000); // the play's replay comes with it
     const who = await signedIn(request, env);
     const songId = String(b.songId || ""), chartId = String(b.chartId || "");
     if (!(await boardSong(env, songId)) || !chartIdOk(chartId)) fail(400, "Only OCTIVE Official and verified charts have online leaderboards.");
-    const score = Math.round(Number(b.score)), acc = Number(b.accuracy);
-    if (!(score >= 0 && score <= SCORE_MAX) || !(acc >= 0 && acc <= 100)) fail(400, "That score isn't valid.");
     const cfg = config(env);
     await loadModeration(cfg);
     if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+    // the play is judged again from its replay, against the chart's Workshop upload: that's what goes on the board (the
+    // numbers the game sent are only compared with it, for the moderators)
+    const rep = replayBytes(b.replay);
+    if (!rep) fail(400, "A board score only counts with its replay. Update OCTIVE and play it again.");
+    const where = await boardChartOf(env, songId, chartId, cleanText(b.difficulty, 60));
+    const osuBoard = /^osu-[0-9]+$/.test(songId); // an osu! map's board: players' own imports have song ids of their own
+    const { replay, result } = await judgePlay(who, rep, where, { what: "A board score", ...(osuBoard ? {} : { songId, chartId }) });
+    await refuseCopies(env, `board|${songId}|${chartId}`, who, result);
+    await judgeFlags(env, who.playerId, `board ${songId}/${chartId}`, result, { score: b.score, accuracy: b.accuracy });
+    const score = result.score, acc = result.accuracy;
     const card = (await publicItems(cfg, who.playerId, ["card"])).card || {};
     const ov = moderation.overrides[who.playerId] || {};
     const entry = {
@@ -2256,16 +2287,23 @@ async function chartScores(request, env, url) {
       name: String(ov.name || card.name || who.username || "Player").slice(0, 40),
       avatarHash: ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : String(card.avatar || ""),
       score, accuracy: Math.round(acc * 100) / 100,
-      grade: String(b.grade || "").slice(0, 3),
-      maxCombo: Math.min(V.maxCombo, Math.max(0, Math.round(Number(b.maxCombo) || 0))),
-      fullCombo: !!b.fullCombo,
+      grade: result.grade,
+      maxCombo: result.maxCombo,
+      fullCombo: result.fullCombo,
       pp: Math.min(playPRMax(V.maxStars), Math.max(0, Math.round((Number(b.pp) || 0) * 100) / 100)),
-      counts: Array.isArray(b.counts) ? b.counts.slice(0, 6).map((n) => Math.min(1_000_000, Math.max(0, Math.round(Number(n) || 0)))) : [],
+      counts: result.counts,
       badges: badgesOf(who.playerId),
       date: new Date().toISOString(),
-      version: String(b.version || "").slice(0, 12),
-      mods: String(b.mods || "").replace(/[^A-Z ]/g, "").slice(0, 40),
+      version: String(replay.octiveVersion || b.version || "").slice(0, 12),
+      mods: String(replay.mods || "").replace(/[^A-Z ]/g, "").slice(0, 40),
+      judged: JUDGE_VERSION,
     };
+    // a verified chart's stars are known here: the PR on its board is never more than they give at that accuracy
+    try {
+      const kn = findVerified(await verifiedIndex(env), where.songId, where.difficulty, null);
+      const ks = kn ? Number(kn.chart.stars) : 0;
+      if (ks > 0) entry.pp = Math.min(entry.pp, round2(playPRMax(ks + 0.15, entry.accuracy) * 1.03 + 0.5));
+    } catch { /* as sent, within the limits above */ }
     const key = `scores/${songId}/${chartId}.json`;
     boards.delete(key);
     const data = await readBoard(env, songId, chartId);
@@ -2274,15 +2312,17 @@ async function chartScores(request, env, url) {
     // the song's name for notices (games from 1.6.1 send it)
     const title = cleanText(b.title, 120), difficulty = cleanText(b.difficulty, 60);
     const i = data.entries.findIndex((e) => e.playerId === who.playerId);
-    const rep = replayBytes(b.replay);
     let improved = true;
     if (i >= 0) {
       if (data.entries[i].score >= score) improved = false;
       else data.entries.splice(i, 1);
     }
-    // the same score sent again with its replay (scores from before replays were kept): it's attached
+    // the play that's on the board (its replay is public): its timing is kept, so a copy of it is refused
+    if (improved || (rep && data.entries[i] && data.entries[i].score === score)) await rememberReplay(env, `board|${songId}|${chartId}`, who.playerId, result.signature);
+    // the same score sent again with its replay (scores from before replays were kept): it's attached, as judged
     if (!improved && rep && data.entries[i] && data.entries[i].score === score && !data.entries[i].replay) {
       await env.RELEASES.put(boardReplayKey(songId, chartId, who.playerId), rep, { httpMetadata: { contentType: "application/octet-stream" } });
+      Object.assign(data.entries[i], { accuracy: entry.accuracy, grade: entry.grade, maxCombo: entry.maxCombo, fullCombo: entry.fullCombo, counts: entry.counts, judged: JUDGE_VERSION });
       data.entries[i].replay = true;
       await env.RELEASES.put(key, JSON.stringify(data), { httpMetadata: { contentType: "application/json" } });
       boards.set(key, { data, at: Date.now() });
@@ -2305,7 +2345,9 @@ async function chartScores(request, env, url) {
       }
     }
     const rank = data.entries.findIndex((e) => e.playerId === who.playerId) + 1;
-    return reply({ ok: true, improved, rank: rank || null, total: data.entries.length });
+    // what the server's judging gave (the game shows it if it differs from its own)
+    return reply({ ok: true, improved, rank: rank || null, total: data.entries.length,
+      judged: { score, accuracy: Math.round(acc * 100) / 100, maxCombo: result.maxCombo, counts: result.counts, fullCombo: result.fullCombo, grade: result.grade } });
   }
   fail(404, "Not found");
 }
@@ -3049,14 +3091,93 @@ function dmTrim(box) {
 // ---------------------------------------------------------------- global chat (game <-> Discord #octive-chat)
 // One public room. Messages from the game are stored in R2 (chat/global.json, the newest CHAT_KEEP) and posted
 // to the Discord channel through a webhook (the player's name and picture). Discord messages are pulled into
-// the room when someone reads it (at most every CHAT_PULL_MS) with the bot. Set up by Tools/discord_chat_setup.py
-// (secrets DISCORD_CHAT_CHANNEL_ID and DISCORD_CHAT_WEBHOOK); without them the chat is game-only.
+// the room when someone reads it (at most every CHAT_PULL_MS) with the bot, together with what changed on the
+// recent ones there: edits and deletions. Pictures are kept in R2 (chat/img/<message>-<n>) while their message is in
+// the room: sent from the game (POST /chat/image), or copied from Discord the first time someone looks. (Reactions were
+// tried in 1.6.6 and taken out: Discord only shows one bot reaction for every game player.)
+// Replies and @names reach the player they're for as a pop-up (chat/pings/<playerId>.json, read by /dm/inbox).
+// Set up by Tools/discord_chat_setup.py (secrets DISCORD_CHAT_CHANNEL_ID and DISCORD_CHAT_WEBHOOK); without
+// them the chat is game-only.
 const CHAT_KEY = "chat/global.json";
 const CHAT_KEEP = 200;
 const CHAT_MAX = 300;
 const CHAT_PULL_MS = 4000;
+const CHAT_IMG_MAX = 8 * 1024 * 1024;
+const CHAT_IMG_SIDE_MAX = 4096; // the game sends pictures at most 2048 across; older games anything up to this
+const CHAT_IMG_PIXELS_MAX = 4096 * 4096; // bigger pictures aren't sent to the game: opening one froze it for half a second
+const CHAT_IMG_TYPES = ["png", "jpeg", "gif", "webp"];
 let chatPulledAt = 0, chatPulling = null;
-const chatEmpty = () => ({ seq: 0, msgs: [], lastDiscord: null });
+const chatEmpty = () => ({ seq: 0, rev: 0, msgs: [], removed: [], lastDiscord: null });
+const discordBot = (env) => ({ Authorization: "Bot " + env.DISCORD_BOT_TOKEN, "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" });
+
+/** The Discord message a room message is (or was copied to), or null. */
+const chatDiscordId = (m) => m.discordId || ((m.src === "discord" || m.src === "command") && /^d\d+$/.test(String(m.id)) ? m.id.slice(1) : null);
+/** A message changed (an edit on Discord): readers who already have it fetch it again. */
+const chatBump = (b, m) => { b.rev = (b.rev || 0) + 1; m.rev = b.rev; };
+/** Messages taken out of the room (removed, or deleted on Discord): readers drop them too. */
+function chatGone(b, list) {
+  b.removed = b.removed || [];
+  for (const m of list) { b.rev = (b.rev || 0) + 1; b.removed.push({ id: m.id, rev: b.rev }); }
+  if (b.removed.length > 100) b.removed = b.removed.slice(-100);
+}
+/** The room keeps the newest CHAT_KEEP; returns the ones that fell out (their pictures are deleted). */
+function chatTrim(b) {
+  if (b.msgs.length <= CHAT_KEEP) return [];
+  const cut = b.msgs.length - CHAT_KEEP;
+  const out = b.msgs.slice(0, cut);
+  b.msgs = b.msgs.slice(cut);
+  return out;
+}
+async function chatDropImages(env, list) {
+  for (const m of list) for (let i = 0; i < (m.images || []).length; i++)
+    for (const k of ["", "-720", "-2048", "-w720", "-w2048"]) await env.RELEASES.delete(`chat/img/${m.id}-${i}${k}`).catch(() => {});
+}
+
+/** A Discord attachment's picture type (png, jpeg, gif or webp), or null when it isn't a picture. */
+function chatImageKind(a) {
+  const ct = String(a.content_type || "").toLowerCase().split(";")[0];
+  const ext = String(a.filename || "").toLowerCase().split(".").pop();
+  const t = ct.startsWith("image/") ? ct.slice(6) : ext === "jpg" ? "jpeg" : ext;
+  return CHAT_IMG_TYPES.includes(t) ? t : null;
+}
+
+/** The pictures of a Discord message: its attachments, and pictures and GIFs linked in it (4 at most). */
+function chatImagesOf(m) {
+  const out = [];
+  for (const a of m.attachments || []) {
+    const type = chatImageKind(a);
+    if (!type || out.length >= 4) continue;
+    out.push({ w: a.width || 0, h: a.height || 0, type, name: String(a.filename || "picture").slice(0, 80), att: a.id });
+  }
+  for (const e of m.embeds || []) {
+    if (out.length >= 4 || (e.type !== "image" && e.type !== "gifv")) continue;
+    const t = e.thumbnail || e.image;
+    if (!t || !t.url) continue;
+    out.push({ w: t.width || 0, h: t.height || 0, type: e.type === "gifv" ? "gifv" : "link", name: "", src: t.proxy_url || t.url, link: e.url || t.url });
+  }
+  return out;
+}
+
+/** The type and size of a PNG, JPEG or GIF picture from its first bytes (null for anything else). */
+function chatImageInfo(b) {
+  if (!b || b.length < 26) return null;
+  if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47)
+    return { type: "png", w: ((b[16] << 24) | (b[17] << 16) | (b[18] << 8) | b[19]) >>> 0, h: ((b[20] << 24) | (b[21] << 16) | (b[22] << 8) | b[23]) >>> 0 };
+  if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return { type: "gif", w: b[6] | (b[7] << 8), h: b[8] | (b[9] << 8) };
+  if (b[0] === 0xff && b[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xff) { i++; continue; }
+      const k = b[i + 1];
+      if (k === 0xff) { i++; continue; }
+      if (k === 0xd8 || k === 0x01 || (k >= 0xd0 && k <= 0xd7)) { i += 2; continue; }
+      if (k >= 0xc0 && k <= 0xcf && k !== 0xc4 && k !== 0xc8 && k !== 0xcc) return { type: "jpeg", h: (b[i + 5] << 8) | b[i + 6], w: (b[i + 7] << 8) | b[i + 8] };
+      i += 2 + ((b[i + 2] << 8) | b[i + 3]);
+    }
+    return { type: "jpeg", w: 0, h: 0 };
+  }
+  return null;
+}
 
 /** Discord text as plain text for the game: mentions, channels, roles and custom emoji become readable. */
 function discordToText(m) {
@@ -3064,7 +3185,9 @@ function discordToText(m) {
   for (const u of m.mentions || []) t = t.split(`<@${u.id}>`).join("@" + (u.global_name || u.username)).split(`<@!${u.id}>`).join("@" + (u.global_name || u.username));
   t = t.replace(/<@!?\d+>/g, "@someone").replace(/<@&\d+>/g, "@role").replace(/<#\d+>/g, "#channel")
     .replace(/<a?:(\w+):\d+>/g, ":$1:").replace(/<t:(\d+)(:\w)?>/g, (_, s) => new Date(Number(s) * 1000).toUTCString());
-  if (!t.trim() && (m.attachments || []).length) t = "[sent " + (m.attachments.length === 1 ? "a file" : m.attachments.length + " files") + "]";
+  // files that aren't pictures (pictures are shown)
+  const files = (m.attachments || []).filter((a) => !chatImageKind(a));
+  if (!t.trim() && files.length) t = "[sent " + (files.length === 1 ? "a file" : files.length + " files") + "]";
   if (!t.trim() && (m.sticker_items || []).length) t = "[sticker: " + m.sticker_items[0].name + "]";
   return t.slice(0, CHAT_MAX);
 }
@@ -3091,42 +3214,95 @@ function commandCard(m) {
   const title = e ? chatPlain(e.title || e.author?.name || "") : "";
   let lines = [];
   if (e) {
-    lines = chatPlain(e.description || "").split("\n").map((x) => x.trim()).filter((x) => x && x !== "\u3000");
+    lines = chatPlain(e.description || "").split("\n").map((x) => x.trim()).filter((x) => x && x !== "　");
     for (const f of e.fields || []) if (lines.length < 6) lines.push(`${chatPlain(f.name)}: ${chatPlain(f.value).split("\n")[0]}`);
   } else lines = chatPlain(m.content || "").split("\n").filter(Boolean);
   lines = lines.slice(0, 6).map((x) => x.slice(0, 120));
   return { name: String(name).split(" ")[0].slice(0, 32), title: title.slice(0, 100), lines, url: e?.url || null };
 }
 
-/** New messages from the Discord channel into the room. */
+/** Who a new message is for: the writer of the message it answers, and players it @names. Map playerId -> "reply" | "mention". */
+function chatTargets(box, msg, mentioned = []) {
+  const out = new Map();
+  const mine = msg.from?.id;
+  const isPlayer = (id) => id && !String(id).startsWith("discord:") && id !== mine;
+  if (isPlayer(msg.reply?.fromId)) out.set(msg.reply.fromId, "reply");
+  for (const id of mentioned) if (isPlayer(id) && !out.has(id)) out.set(id, "mention");
+  // @Name of a player who chatted lately
+  const names = new Map();
+  for (const x of (box.msgs || []).slice(-CHAT_KEEP)) if (isPlayer(x.from?.id) && x.from?.name) names.set(String(x.from.name).toLowerCase(), x.from.id);
+  for (const [, nm] of String(msg.text || "").matchAll(/@([^\s@]{2,40})/g)) {
+    const id = names.get(nm.toLowerCase().replace(/[.,!?:;]+$/, ""));
+    if (id && !out.has(id)) out.set(id, "mention");
+  }
+  return out;
+}
+
+/** Notes a reply or @name for the players it's for (a pop-up in the game, see /dm/inbox). */
+async function chatPing(env, msg, targets) {
+  if (!targets || !targets.size) return;
+  const text = String(msg.text || "").replace(/\s+/g, " ").trim().slice(0, 140) || ((msg.images || []).length ? "[a picture]" : "");
+  for (const [pid, kind] of targets) {
+    if (!DM_ID.test(pid)) continue;
+    try {
+      await r2update(env, `chat/pings/${pid}.json`, () => ({ items: [] }), (p) => {
+        p.items = (p.items || []).filter((x) => x.id !== msg.id)
+          .concat([{ id: msg.id, at: Date.now(), kind, by: msg.from?.name || "Someone", byId: msg.from?.id || null, text, src: msg.src }]).slice(-20);
+      });
+    } catch (e) { console.log("chat ping", e && e.message); }
+  }
+}
+
+/** New messages from the Discord channel into the room, and what changed there on the recent ones. */
 async function chatPull(env) {
   if (!env.DISCORD_CHAT_CHANNEL_ID || !env.DISCORD_BOT_TOKEN) return;
   if (Date.now() - chatPulledAt < CHAT_PULL_MS) return; // pulled moments ago (by this or another request: its promise can't be shared)
   chatPulledAt = Date.now();
   chatPulling = (async () => {
-    const box = await r2json(env, CHAT_KEY, chatEmpty());
-    const after = box.lastDiscord ? `&after=${box.lastDiscord}` : "";
-    const res = await fetch(`https://discord.com/api/v10/channels/${env.DISCORD_CHAT_CHANNEL_ID}/messages?limit=50${after}`, {
-      headers: { Authorization: "Bot " + env.DISCORD_BOT_TOKEN, "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" },
-    });
-    if (!res.ok) { console.log("chat pull", res.status); return; }
-    let list = (await res.json()).filter((m) => m && m.id).sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+    const base = `https://discord.com/api/v10/channels/${env.DISCORD_CHAT_CHANNEL_ID}/messages`;
+    const get = async (q) => {
+      const res = await fetch(base + q, { headers: discordBot(env) });
+      if (!res.ok) { console.log("chat pull", res.status); return null; }
+      const v = await res.json();
+      return Array.isArray(v) ? v.filter((m) => m && m.id) : null;
+    };
+    // the newest 50: the new ones, and edits and deletions on the rest
+    const latest = await get("?limit=50");
+    if (!latest) return;
+    const big = (id) => BigInt(id);
+    const oldest = latest.length ? latest.reduce((a, m) => (big(m.id) < a ? big(m.id) : a), big(latest[0].id)) : 0n;
+    const newest = latest.reduce((a, m) => (big(m.id) > a ? big(m.id) : a), 0n);
+    const box0 = await r2json(env, CHAT_KEY, chatEmpty());
+    let list = latest.slice();
+    if (box0.lastDiscord && latest.length >= 50 && big(box0.lastDiscord) < oldest) {
+      // more than 50 since the last pull: the ones in between too
+      const gap = await get(`?limit=50&after=${box0.lastDiscord}`);
+      for (const m of gap || []) if (!list.some((x) => x.id === m.id)) list.push(m);
+    }
+    list.sort((a, b) => (big(a.id) < big(b.id) ? -1 : 1));
+    let fresh = list.filter((m) => !box0.lastDiscord || big(m.id) > big(box0.lastDiscord));
     // a command still "thinking": wait for its answer (but never longer than a minute)
-    const thinking = list.findIndex((m) => m.type === 20 && (Number(m.flags || 0) & 128) && Date.now() - Date.parse(m.timestamp) < 60_000);
-    if (thinking >= 0) list = list.slice(0, thinking);
-    if (!list.length) return;
+    const thinking = fresh.findIndex((m) => m.type === 20 && (Number(m.flags || 0) & 128) && Date.now() - Date.parse(m.timestamp) < 60_000);
+    if (thinking >= 0) fresh = fresh.slice(0, thinking);
     const ours = webhookId(env);
     const isCommand = (m) => m.type === 20 && (m.application_id === DISCORD_APP_ID || m.author?.id === DISCORD_APP_ID);
-    // Discord people who linked their OCTIVE account appear as their OCTIVE player
+    // Discord people who linked their OCTIVE account appear as their OCTIVE player (writers and people @named)
     const who = new Map();
     const cfg = config(env);
-    try { await loadModeration(cfg); } catch { /* badges may be missing */ }
-    for (const m of list) {
-      const u = isCommand(m) ? (m.interaction_metadata?.user || m.interaction?.user) : m.author;
-      if (!u?.id || who.has(u.id) || (u.bot && !isCommand(m))) continue;
-      who.set(u.id, null);
-      const pid = await linkedPlayer(env, u.id);
-      if (pid) who.set(u.id, await chatIdentity(cfg, pid, u.global_name || u.username));
+    if (fresh.length) {
+      try { await loadModeration(cfg); } catch { /* badges may be missing */ }
+      const users = [];
+      for (const m of fresh) {
+        const u = isCommand(m) ? (m.interaction_metadata?.user || m.interaction?.user) : m.author;
+        if (u?.id && !(u.bot && !isCommand(m))) users.push(u);
+        for (const x of m.mentions || []) if (x?.id && !x.bot) users.push(x);
+      }
+      for (const u of users) {
+        if (who.has(u.id)) continue;
+        who.set(u.id, null);
+        const pid = await linkedPlayer(env, u.id).catch(() => null);
+        if (pid) who.set(u.id, await chatIdentity(cfg, pid, u.global_name || u.username));
+      }
     }
     const discordFrom = (u, member) => {
       const shown = String(member?.nick || u?.global_name || u?.username || "Discord user").slice(0, 40);
@@ -3134,10 +3310,25 @@ async function chatPull(env) {
       if (linked) return { ...linked, discord: shown, discordId: u.id };
       return { id: "discord:" + (u?.id || "0"), name: shown, discordId: u?.id || null, avatar: u?.avatar ? `https://cdn.discordapp.com/avatars/${u.id}/${u.avatar}.png?size=64` : null };
     };
+    const byId = new Map(latest.map((d) => [d.id, d]));
+    let dropped = [], pings = [], unreact = [];
     await r2update(env, CHAT_KEY, chatEmpty, (b) => {
+      dropped = []; pings = []; unreact = [];
       let changed = false;
-      for (const m of list) {
-        if (b.lastDiscord && BigInt(m.id) <= BigInt(b.lastDiscord)) continue;
+      // reactions were taken out (1.6.6): kept ones are dropped, and the bot's reactions that stood for game players
+      // come off Discord (once)
+      if (!b.reactionsGone) {
+        for (const m of b.msgs) {
+          if (!m.reactions) continue;
+          const did = chatDiscordId(m);
+          if (did) for (const [k, v] of Object.entries(m.reactions)) if ((v.by || []).length) unreact.push([did, k]);
+          delete m.reactions;
+        }
+        b.reactionsGone = true;
+        changed = true;
+      }
+      for (const m of fresh) {
+        if (b.lastDiscord && big(m.id) <= big(b.lastDiscord)) continue;
         b.lastDiscord = m.id; changed = true;
         if (m.webhook_id && m.webhook_id === ours) continue; // our own copy of a game message
         if (isCommand(m)) {
@@ -3148,24 +3339,143 @@ async function chatPull(env) {
           continue;
         }
         if (m.author?.bot || (m.type !== 0 && m.type !== 19)) continue; // bots and system messages
-        const text = discordToText(m);
-        if (!text.trim()) continue;
+        const images = chatImagesOf(m);
+        let text = discordToText(m);
+        // only a link to a picture or GIF: the picture is enough
+        if (images.some((x) => x.link && text.trim() === x.link)) text = "";
+        if (!text.trim() && !images.length) continue;
         const from = discordFrom(m.author || {}, m.member);
         // a Discord reply: to a Discord message ("d<id>"), or to a game message's Discord copy
         let reply;
         const ref = m.referenced_message;
         if (ref && ref.id) {
           const target = b.msgs.find((x) => x.id === "d" + ref.id || x.discordId === ref.id);
-          reply = target ? { id: target.id, name: target.from?.name || "", text: String(target.text || "").slice(0, 120), fromId: target.from?.id || null }
+          reply = target ? { id: target.id, name: target.from?.name || "", text: String(target.text || "").slice(0, 120) || ((target.images || []).length ? "[a picture]" : ""), fromId: target.from?.id || null }
             : { id: "d" + ref.id, name: String(ref.member?.nick || ref.author?.global_name || ref.author?.username || "").slice(0, 40), text: String(ref.content || "").slice(0, 120), fromId: null };
         }
-        b.msgs.push({ seq: ++b.seq, id: "d" + m.id, at: m.timestamp || new Date().toISOString(), src: "discord", text, from, linked: !from.id.startsWith("discord:"), reply });
+        const msg = { seq: ++b.seq, id: "d" + m.id, at: m.timestamp || new Date().toISOString(), src: "discord", text, from, linked: !from.id.startsWith("discord:"), reply };
+        if (images.length) msg.images = images;
+        if (m.edited_timestamp) msg.edited = m.edited_timestamp;
+        b.msgs.push(msg);
+        const mentioned = (m.mentions || []).map((x) => who.get(x.id)?.id).filter(Boolean);
+        const targets = chatTargets(b, msg, mentioned);
+        if (targets.size) pings.push([msg, targets]);
+      }
+      // the recent ones: edits and deletions on Discord
+      if (latest.length) {
+        const low = Math.max(0, b.msgs.length - 80);
+        for (let i = b.msgs.length - 1; i >= low; i--) {
+          const m = b.msgs[i];
+          const did = chatDiscordId(m);
+          if (!did) continue;
+          const id = big(did);
+          if (id < oldest || id > newest) continue;
+          const d = byId.get(did);
+          if (!d) { b.msgs.splice(i, 1); chatGone(b, [m]); dropped.push(m); changed = true; continue; }
+          let c = false;
+          if (m.src === "discord" && d.edited_timestamp && d.edited_timestamp !== m.edited) {
+            m.edited = d.edited_timestamp;
+            const im = chatImagesOf(d);
+            m.text = discordToText(d);
+            if (im.some((x) => x.link && m.text.trim() === x.link)) m.text = "";
+            if (im.length) m.images = im; else delete m.images;
+            c = true;
+          }
+          if (c) { chatBump(b, m); changed = true; }
+        }
       }
       if (!changed) return false;
-      if (b.msgs.length > CHAT_KEEP) b.msgs = b.msgs.slice(-CHAT_KEEP);
+      dropped.push(...chatTrim(b));
     });
+    if (dropped.length) await chatDropImages(env, dropped);
+    for (const [did, e] of unreact)
+      await fetch(`https://discord.com/api/v10/channels/${env.DISCORD_CHAT_CHANNEL_ID}/messages/${did}/reactions/${encodeURIComponent(e)}/@me`, { method: "DELETE", headers: discordBot(env) }).catch(() => {});
+    for (const [msg, targets] of pings) await chatPing(env, msg, targets);
   })().catch((e) => console.log("chat pull failed", e && e.message)).finally(() => { chatPulling = null; });
   return chatPulling;
+}
+
+/** Messages from before someone linked their Discord: shown as their OCTIVE player now (so they're clickable). */
+async function chatAsPlayers(env, lists) {
+  const all = lists.flat();
+  const unlinked = [...new Set(all.filter((m) => String(m.from?.id || "").startsWith("discord:")).map((m) => m.from.id.slice(8)))].slice(0, 30);
+  if (!unlinked.length) return lists;
+  const cfg = config(env);
+  const ids = new Map();
+  for (const d of unlinked) { const pid = await linkedPlayer(env, d).catch(() => null); if (pid) ids.set(d, await chatIdentity(cfg, pid, null)); }
+  if (!ids.size) return lists;
+  const fix = (m) => { const d = String(m.from?.id || "").startsWith("discord:") ? m.from.id.slice(8) : null; const p = d && ids.get(d); return p ? { ...m, from: { ...p, discord: m.from.name, discordId: d }, linked: true } : m; };
+  return lists.map((l) => l.map(fix));
+}
+
+/** A message's text from the game: no control characters, at most one empty line in a row. */
+const chatClean = (t) => String(t || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/\n{3,}/g, "\n\n").trim();
+
+/** A little slow-down: 1 message every 1.5 s and 12 a minute per player, and 6 pictures in 10 minutes. */
+async function chatRate(env, playerId, picture) {
+  const key = `chat/rate/${playerId}.json`;
+  const rl = await r2json(env, key, { at: [], img: [] });
+  const now = Date.now();
+  rl.at = (rl.at || []).filter((t) => now - t < 60_000);
+  rl.img = (rl.img || []).filter((t) => now - t < 600_000);
+  if (rl.at.length && now - rl.at[rl.at.length - 1] < 1500) fail(429, "Slow down a little.");
+  if (rl.at.length >= 12) fail(429, "You're sending a lot of messages. Wait a minute.");
+  if (picture && rl.img.length >= 6) fail(429, "That's a lot of pictures. Wait a few minutes.");
+  rl.at.push(now);
+  if (picture) rl.img.push(now);
+  await r2put(env, key, rl);
+}
+
+/** Adds a game message to the room (answering another when replyTo names one that's still there). */
+async function chatAdd(env, msg, replyTo) {
+  let target = null, dropped = [];
+  const box = await r2update(env, CHAT_KEY, chatEmpty, (bx) => {
+    target = null; dropped = [];
+    msg.seq = ++bx.seq;
+    const rid = String(replyTo || "");
+    const t = rid ? bx.msgs.find((x) => x.id === rid) : null;
+    if (t) {
+      msg.reply = { id: t.id, name: t.from?.name || "", text: String(t.text || "").slice(0, 120) || ((t.images || []).length ? "[a picture]" : ""), fromId: t.from?.id || null };
+      target = t;
+    } else delete msg.reply;
+    bx.msgs.push(msg);
+    dropped = chatTrim(bx);
+  });
+  return { box, target, dropped };
+}
+
+/** A game message into the Discord channel as the player (pinging only the @named and the reply's writer). */
+async function chatToDiscord(env, box, msg, target, file) {
+  if (!env.DISCORD_CHAT_WEBHOOK) return;
+  const badge = (msg.from.badges || []).includes("DEV") ? " 🛠️" : (msg.from.badges || []).includes("MOD") ? " 🛡️" : "";
+  const byName = new Map();
+  for (const x of (box.msgs || []).slice(-CHAT_KEEP)) if (x.from?.discordId && x.from?.name) byName.set(String(x.from.name).toLowerCase(), x.from.discordId);
+  const pings = new Set();
+  let content = String(msg.text || "").replace(/@([^\s@]{2,40})/g, (all, nm) => { const d = byName.get(String(nm).toLowerCase()); if (!d) return all; pings.add(d); return `<@${d}>`; });
+  if (target) {
+    const quote = String(target.text || "").replace(/\n/g, " ").slice(0, 80) || ((target.images || []).length ? "[picture]" : "");
+    const rd = target.from?.discordId;
+    if (rd) pings.add(rd);
+    content = `> ↪ ${rd ? `<@${rd}>` : `**${target.from?.name || "someone"}**`}: ${quote}\n${content}`;
+  }
+  const ua = "DiscordBot (https://senterraslays.github.io/octive, 1.0)";
+  const payload = { content: content.slice(0, 2000), username: `${msg.from.name}${badge} · OCTIVE`.slice(0, 80), avatar_url: msg.from.avatar || `${SITE}logo-512.png`, allowed_mentions: { parse: [], users: [...pings].slice(0, 10) } };
+  let init;
+  if (file) {
+    payload.attachments = [{ id: 0, filename: file.name }];
+    const fd = new FormData();
+    fd.append("payload_json", JSON.stringify(payload));
+    fd.append("files[0]", new Blob([file.bytes], { type: file.type }), file.name);
+    init = { method: "POST", body: fd, headers: { "User-Agent": ua } };
+  } else init = { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": ua }, body: JSON.stringify(payload) };
+  const r = await fetch(env.DISCORD_CHAT_WEBHOOK + "?wait=true", init);
+  if (!r.ok) { console.log("chat webhook", r.status, (await r.text()).slice(0, 200)); return; }
+  const posted = await r.json();
+  await r2update(env, CHAT_KEY, chatEmpty, (bx) => {
+    const m = bx.msgs.find((x) => x.id === msg.id);
+    if (!m) return false;
+    m.discordId = posted.id;
+  });
 }
 
 async function chatRoutes(request, env, url, ctx) {
@@ -3173,18 +3483,16 @@ async function chatRoutes(request, env, url, ctx) {
   if (path === "/chat/global" && request.method === "GET") {
     await chatPull(env);
     const after = Number(url.searchParams.get("after") || 0);
+    const since = url.searchParams.has("rev") ? Number(url.searchParams.get("rev") || 0) : null;
     const box = await r2json(env, CHAT_KEY, chatEmpty());
-    let msgs = (box.msgs || []).filter((m) => m.seq > after && !moderation.bans[m.from?.id]);
+    const shown = (m) => !moderation.bans[m.from?.id];
+    let msgs = (box.msgs || []).filter((m) => m.seq > after && shown(m));
     if (!after) msgs = msgs.slice(-80);
-    // messages from before someone linked their Discord: shown as their OCTIVE player now (so they're clickable)
-    const unlinked = [...new Set(msgs.filter((m) => String(m.from?.id || "").startsWith("discord:")).map((m) => m.from.id.slice(8)))].slice(0, 30);
-    if (unlinked.length) {
-      const cfg = config(env);
-      const ids = new Map();
-      for (const d of unlinked) { const pid = await linkedPlayer(env, d).catch(() => null); if (pid) ids.set(d, await chatIdentity(cfg, pid, null)); }
-      if (ids.size) msgs = msgs.map((m) => { const d = String(m.from?.id || "").startsWith("discord:") ? m.from.id.slice(8) : null; const p = d && ids.get(d); return p ? { ...m, from: { ...p, discord: m.from.name, discordId: d }, linked: true } : m; });
-    }
-    return reply({ seq: box.seq || 0, msgs, discord: !!env.DISCORD_CHAT_CHANNEL_ID, channel: env.DISCORD_CHAT_CHANNEL_ID || null, guild: env.DISCORD_GUILD_ID || null });
+    // what changed on messages the reader already has, and which were taken out
+    let upd = after && since !== null ? (box.msgs || []).filter((m) => m.seq <= after && (m.rev || 0) > since && shown(m)) : [];
+    const gone = after && since !== null ? (box.removed || []).filter((x) => x.rev > since).map((x) => x.id) : [];
+    [msgs, upd] = await chatAsPlayers(env, [msgs, upd]);
+    return reply({ seq: box.seq || 0, rev: box.rev || 0, msgs, upd, gone, discord: !!env.DISCORD_CHAT_CHANNEL_ID, channel: env.DISCORD_CHAT_CHANNEL_ID || null, guild: env.DISCORD_GUILD_ID || null });
   }
   if (path === "/chat/send" && request.method === "POST") {
     const b = await bodyOf(request);
@@ -3192,58 +3500,94 @@ async function chatRoutes(request, env, url, ctx) {
     const cfg = config(env);
     await loadModeration(cfg);
     if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
-    let text = String(b.text || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/\n{3,}/g, "\n\n").trim();
+    const text = chatClean(b.text);
     if (!text) fail(400, "Type a message first.");
     if (text.length > CHAT_MAX) fail(400, `Messages can be ${CHAT_MAX} characters at most.`);
-    // a little slow-down: 1 message every 1.5 s and 12 a minute per player
-    const rl = await r2json(env, `chat/rate/${who.playerId}.json`, { at: [] });
-    const now = Date.now();
-    rl.at = (rl.at || []).filter((t) => now - t < 60_000);
-    if (rl.at.length && now - rl.at[rl.at.length - 1] < 1500) fail(429, "Slow down a little.");
-    if (rl.at.length >= 12) fail(429, "You're sending a lot of messages. Wait a minute.");
-    rl.at.push(now);
-    await r2put(env, `chat/rate/${who.playerId}.json`, rl);
+    await chatRate(env, who.playerId, false);
     const from = await chatIdentity(cfg, who.playerId, who.username);
-    const name = from.name;
     const msg = { id: "g" + crypto.randomUUID().replace(/-/g, "").slice(0, 16), at: new Date().toISOString(), src: "game", text, from };
-    let replyTarget = null;
-    const box = await r2update(env, CHAT_KEY, chatEmpty, (bx) => {
-      msg.seq = ++bx.seq;
-      const rid = String(b.replyTo || "");
-      const t = rid ? bx.msgs.find((x) => x.id === rid) : null;
-      if (t) { msg.reply = { id: t.id, name: t.from?.name || "", text: String(t.text || "").slice(0, 120), fromId: t.from?.id || null }; replyTarget = t; }
-      bx.msgs.push(msg);
-      if (bx.msgs.length > CHAT_KEEP) bx.msgs = bx.msgs.slice(-CHAT_KEEP);
-    });
-    // and into the Discord channel, as the player (no pings)
-    if (env.DISCORD_CHAT_WEBHOOK) ctx.waitUntil((async () => {
-      const badge = (msg.from.badges || []).includes("DEV") ? " 🛠️" : (msg.from.badges || []).includes("MOD") ? " 🛡️" : "";
-      // @Name of someone with a linked Discord pings them there; a reply quotes what it answers (and pings its writer)
-      const recent = (box.msgs || []).slice(-200);
-      const byName = new Map();
-      for (const x of recent) if (x.from?.discordId && x.from?.name) byName.set(String(x.from.name).toLowerCase(), x.from.discordId);
-      const pings = new Set();
-      let content = text.replace(/@([^\s@]{2,40})/g, (all, nm) => { const d = byName.get(String(nm).toLowerCase()); if (!d) return all; pings.add(d); return `<@${d}>`; });
-      if (replyTarget) {
-        const quote = String(replyTarget.text || "").replace(/\n/g, " ").slice(0, 80);
-        const rd = replyTarget.from?.discordId;
-        if (rd) pings.add(rd);
-        content = `> ↪ ${rd ? `<@${rd}>` : `**${replyTarget.from?.name || "someone"}**`}: ${quote}\n${content}`;
-      }
-      const r = await fetch(env.DISCORD_CHAT_WEBHOOK + "?wait=true", {
-        method: "POST", headers: { "Content-Type": "application/json", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" },
-        body: JSON.stringify({ content: content.slice(0, 2000), username: `${name}${badge} · OCTIVE`.slice(0, 80), avatar_url: msg.from.avatar || `${SITE}logo-512.png`, allowed_mentions: { parse: [], users: [...pings].slice(0, 10) } }),
-      });
-      if (!r.ok) { console.log("chat webhook", r.status, (await r.text()).slice(0, 200)); return; }
-      const posted = await r.json();
-      await r2update(env, CHAT_KEY, chatEmpty, (bx) => {
-        const m = bx.msgs.find((x) => x.id === msg.id);
-        if (!m) return false;
-        m.discordId = posted.id;
-        if (!bx.lastDiscord || BigInt(posted.id) > BigInt(bx.lastDiscord)) { /* pulled later and skipped as our own */ }
-      });
-    })().catch((e) => console.log("chat webhook failed", e && e.message)));
+    const { box, target, dropped } = await chatAdd(env, msg, b.replyTo);
+    ctx.waitUntil((async () => {
+      if (dropped.length) await chatDropImages(env, dropped);
+      await chatPing(env, msg, chatTargets(box, msg));
+      await chatToDiscord(env, box, msg, target, null);
+    })().catch((e) => console.log("chat send", e && e.message)));
     return reply({ ok: true, msg, seq: box.seq });
+  }
+  if (path === "/chat/image" && request.method === "POST") {
+    // a picture from the game (PNG, JPEG or GIF), with words if there are some
+    const who = await signedIn(request, env);
+    const cfg = config(env);
+    await loadModeration(cfg);
+    if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+    let form = null;
+    try { form = await request.formData(); } catch { fail(400, "That picture couldn't be read."); }
+    const file = form.get("file");
+    if (!file || typeof file === "string") fail(400, "Choose a picture first.");
+    if (file.size > CHAT_IMG_MAX) fail(413, "Pictures can be 8 MB at most.");
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const info = chatImageInfo(bytes);
+    if (!info) fail(400, "Send a PNG, JPG or GIF picture.");
+    if (info.w > CHAT_IMG_SIDE_MAX || info.h > CHAT_IMG_SIDE_MAX) fail(400, `Pictures can be ${CHAT_IMG_SIDE_MAX} pixels across at most.`);
+    const text = chatClean(form.get("text"));
+    if (text.length > CHAT_MAX) fail(400, `Messages can be ${CHAT_MAX} characters at most.`);
+    await chatRate(env, who.playerId, true);
+    // checked before it's kept or sent anywhere: nudity, sexual content, gore and the like never reach the chat or Discord
+    const safe = await chatPictureSafe(env, bytes);
+    if (safe === false) {
+      await flagPlayer(env, who.playerId, "chat picture refused (not safe for the chat)").catch(() => {});
+      fail(400, "That picture can't be posted in the chat.");
+    }
+    if (safe !== true) fail(503, "The picture couldn't be checked right now, so it wasn't sent. Try again in a moment.");
+    const from = await chatIdentity(cfg, who.playerId, who.username);
+    const id = "g" + crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+    const ext = info.type === "jpeg" ? "jpg" : info.type;
+    const name = `${String(file.name || "picture").replace(/\.[^.]*$/, "").replace(/[^\w\- ]+/g, "").trim().slice(0, 60) || "picture"}.${ext}`;
+    const type = "image/" + info.type;
+    await env.RELEASES.put(`chat/img/${id}-0`, bytes, { httpMetadata: { contentType: type } });
+    const msg = { id, at: new Date().toISOString(), src: "game", text, from, images: [{ w: info.w, h: info.h, type: info.type, name }] };
+    const { box, target, dropped } = await chatAdd(env, msg, form.get("replyTo"));
+    ctx.waitUntil((async () => {
+      if (dropped.length) await chatDropImages(env, dropped);
+      await chatPing(env, msg, chatTargets(box, msg));
+      await chatToDiscord(env, box, msg, target, { bytes, name, type });
+    })().catch((e) => console.log("chat picture", e && e.message)));
+    return reply({ ok: true, msg, seq: box.seq });
+  }
+  let mi = path.match(/^\/chat\/img\/([A-Za-z0-9_-]{2,40})\/([0-3])$/);
+  if (mi && request.method === "GET") {
+    // a picture in the room: from R2, or copied from Discord the first time (its file links expire). One bigger than
+    // 16 megapixels isn't sent to the game (opening it froze the game for half a second); it's still there on Discord.
+    const key = `chat/img/${mi[1]}-${mi[2]}`;
+    const headers = (type) => ({ "Content-Type": type, "Cache-Control": "public, max-age=604800" });
+    const have = await env.RELEASES.get(key);
+    if (have && have.size <= 1_000_000) return cors(new Response(have.body, { headers: headers(have.httpMetadata?.contentType || "image/png") }));
+    const box = await r2json(env, CHAT_KEY, chatEmpty());
+    const m = (box.msgs || []).find((x) => x.id === mi[1]);
+    const im = m && (m.images || [])[Number(mi[2])];
+    if (im && (im.w || 0) * (im.h || 0) > CHAT_IMG_PIXELS_MAX) return cors(new Response("That picture is too big to show in the game.", { status: 413 }));
+    if (have) return cors(new Response(have.body, { headers: headers(have.httpMetadata?.contentType || "image/png") }));
+    if (!im) return cors(new Response("Not found", { status: 404 }));
+    let src = im.src || null;
+    if (!src) {
+      const did = chatDiscordId(m);
+      if (!did || !env.DISCORD_BOT_TOKEN || !env.DISCORD_CHAT_CHANNEL_ID) return cors(new Response("Not found", { status: 404 }));
+      const r = await fetch(`https://discord.com/api/v10/channels/${env.DISCORD_CHAT_CHANNEL_ID}/messages/${did}`, { headers: discordBot(env) });
+      if (!r.ok) return cors(new Response("Not found", { status: 404 }));
+      const d = await r.json();
+      const a = (d.attachments || []).find((x) => x.id === im.att);
+      if (!a) return cors(new Response("Not found", { status: 404 }));
+      // WebP isn't something the game can show: Discord's media server sends it as PNG
+      src = im.type === "webp" ? (a.proxy_url || a.url) + ((a.proxy_url || a.url).includes("?") ? "&" : "?") + "format=png" : a.url;
+    } else if (/\.webp(\?|$)/i.test(src)) src += (src.includes("?") ? "&" : "?") + "format=png";
+    const res = await fetch(src);
+    if (!res.ok) return cors(new Response("Not found", { status: 404 }));
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const info = chatImageInfo(buf);
+    if (info && (info.w || 0) * (info.h || 0) > CHAT_IMG_PIXELS_MAX) return cors(new Response("That picture is too big to show in the game.", { status: 413 }));
+    const ct = info ? "image/" + info.type : res.headers.get("Content-Type") || "application/octet-stream";
+    if (buf.length <= CHAT_IMG_MAX * 2) ctx.waitUntil(env.RELEASES.put(key, buf, { httpMetadata: { contentType: ct } }).catch(() => {}));
+    return cors(new Response(buf, { headers: headers(ct) }));
   }
   if (path === "/chat/delete" && request.method === "POST") {
     // developers and moderators: remove a message (and its Discord copy)
@@ -3254,17 +3598,76 @@ async function chatRoutes(request, env, url, ctx) {
     if (!(badges.includes("DEV") || badges.includes("MOD") || who.playerId === OWNER)) fail(403, "Only moderators can remove messages.");
     let removed = null;
     await r2update(env, CHAT_KEY, chatEmpty, (bx) => {
+      removed = null;
       const i = bx.msgs.findIndex((x) => x.id === String(b.id || ""));
       if (i < 0) return false;
       removed = bx.msgs.splice(i, 1)[0];
+      chatGone(bx, [removed]);
     });
     if (!removed) fail(404, "That message is already gone.");
+    ctx.waitUntil(chatDropImages(env, [removed]));
     if (removed.discordId && env.DISCORD_CHAT_WEBHOOK) ctx.waitUntil(fetch(`${env.DISCORD_CHAT_WEBHOOK}/messages/${removed.discordId}`, { method: "DELETE" }).catch(() => {}));
     else if ((removed.src === "discord" || removed.src === "command") && env.DISCORD_BOT_TOKEN && env.DISCORD_CHAT_CHANNEL_ID)
       ctx.waitUntil(fetch(`https://discord.com/api/v10/channels/${env.DISCORD_CHAT_CHANNEL_ID}/messages/${removed.id.slice(1)}`, { method: "DELETE", headers: { Authorization: "Bot " + env.DISCORD_BOT_TOKEN } }).catch(() => {}));
     return reply({ ok: true });
   }
   fail(404, "Not found.");
+}
+
+// ---------------------------------------------------------------- shared score pictures, read back
+// A shared score's picture is drawn by the game, so the server reads it back (Workers AI, a vision model: the AI
+// binding in wrangler.toml) and compares it with the play saved to the account: the score, and the player's name
+// or the accuracy.
+const SHARE_VISION = "@cf/meta/llama-3.2-11b-vision-instruct";
+let shareVisionAgreed = false;
+/** "ok": the picture shows this play; "fake": it isn't a results screen at all; "different" or "unread" otherwise. */
+async function sharePictureCheck(env, bytes, want) {
+  if (!env.AI) return "unread";
+  const prompt = 'This image should be the results screen of the rhythm game OCTIVE. Reply with JSON only, no other words: {"results": true or false (is it a rhythm game results screen?), "player": "the player name written at the top", "score": "the big score number", "accuracy": "the accuracy percentage", "title": "the song title"}';
+  const run = () => env.AI.run(SHARE_VISION, { prompt, image: Array.from(bytes), max_tokens: 160, temperature: 0 });
+  let out;
+  try { out = await run(); }
+  catch (e) {
+    // the model's license is accepted once for the account
+    if (shareVisionAgreed || !/agree|licen[cs]e/i.test(String(e && e.message))) { console.log("share vision", e && e.message); return "unread"; }
+    try { await env.AI.run(SHARE_VISION, { prompt: "agree" }); shareVisionAgreed = true; out = await run(); }
+    catch (e2) { console.log("share vision", e2 && e2.message); return "unread"; }
+  }
+  const m = String(out?.response ?? out?.description ?? "").match(/\{[\s\S]*\}/);
+  if (!m) return "unread";
+  let r;
+  try { r = JSON.parse(m[0]); } catch { return "unread"; }
+  if (r.results === false || r.results === "false") return "fake";
+  const digits = (v) => String(v ?? "").replace(/[^0-9]/g, "");
+  const scoreOk = digits(r.score) !== "" && digits(r.score) === String(Math.round(want.score));
+  const a = parseFloat(String(r.accuracy ?? "").replace(",", ".").replace(/[^0-9.]/g, ""));
+  const accOk = Number.isFinite(a) && Math.abs(a - want.acc) <= 0.06;
+  const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const nameOk = norm(r.player).length >= 2 && (norm(r.player).includes(norm(want.name)) || norm(want.name).includes(norm(r.player)));
+  // the score has to be right, with the name or the accuracy (small text can be misread)
+  if (scoreOk && (accOk || nameOk)) return "ok";
+  return digits(r.score) !== "" || norm(r.player) !== "" ? "different" : "unread";
+}
+
+/**
+ * A picture for the public chat, checked before anyone sees it (here or on Discord): true when it's fine, false when
+ * it shows nudity, sexual content, gore and the like, null when it couldn't be checked (then it isn't posted either).
+ */
+async function chatPictureSafe(env, bytes) {
+  if (!env.AI) return null;
+  const prompt = 'You moderate pictures for a game chat that teenagers use. Reply with JSON only, no other words: {"safe": true or false, "why": "a few words"}. ' +
+    "It is NOT safe if it shows nudity, sexual content or acts, genitals, sexualised minors, gore, graphic violence, self-harm, or hate symbols. Ordinary photos, screenshots, memes, drawings and game pictures are safe.";
+  const run = () => env.AI.run(SHARE_VISION, { prompt, image: Array.from(bytes), max_tokens: 80, temperature: 0 });
+  let out;
+  try { out = await run(); }
+  catch (e) {
+    if (shareVisionAgreed || !/agree|licen[cs]e/i.test(String(e && e.message))) { console.log("chat picture check", e && e.message); return null; }
+    try { await env.AI.run(SHARE_VISION, { prompt: "agree" }); shareVisionAgreed = true; out = await run(); }
+    catch (e2) { console.log("chat picture check", e2 && e2.message); return null; }
+  }
+  const m = String(out?.response ?? out?.description ?? "").match(/\{[\s\S]*\}/);
+  if (!m) return null; // a refusal or anything else: not posted
+  try { const r = JSON.parse(m[0]); return r.safe === true || r.safe === "true" ? true : r.safe === false || r.safe === "false" ? false : null; } catch { return null; }
 }
 
 // ---------------------------------------------------------------- workshop: charts, skins, themes and styles shared from the game
@@ -3523,6 +3926,250 @@ async function zipRead(u8, e, max = 8 * 1048576) {
   return buf.length > max ? null : buf;
 }
 
+// ---------------------------------------------------------------- plays judged again from their replays
+// Board scores, daily charts and dans only count with the play's replay: its inputs are judged again here against the
+// chart (judge.js: the game's judge, ported line for line and checked against it by Tools/judge_parity.mjs), and only
+// what that gives is kept. The counts, score, accuracy and combo a game sends are never used. The chart comes from its
+// Workshop upload in B2: just the zip's directory, its manifest and the one chart file are read (byte ranges), compiled
+// once and kept in R2 under judge/<judge version>/<file key>/ (manifest.json, chart-<n>.json).
+const BACKSLASH = String.fromCharCode(92);
+/** 503 with code "retry": the game sends the play again a little later (it isn't the play's fault). */
+const failRetry = (message) => { const e = new HttpError(503, message); e.code = "retry"; throw e; };
+const JUDGE_MEMO = new Map(); // in this Worker instance: R2 key -> manifest details or compiled chart
+const judgeMemo = (k, v) => { JUDGE_MEMO.set(k, v); if (JUDGE_MEMO.size > 60) JUDGE_MEMO.delete(JUDGE_MEMO.keys().next().value); return v; };
+
+/** A byte range of a file in B2 (signed like b2Fetch; the Range header isn't part of the signature). */
+async function b2Range(env, key, start, end) {
+  const host = String(env.B2_ENDPOINT).replace("https://", "").replace("http://", "").replace(/[/]+$/, "");
+  const region = (host.match(/^s3[.]([a-z0-9-]+)[.]backblazeb2[.]com$/) || [])[1] || "us-east-1";
+  const path = `/${env.B2_BUCKET}/` + key.split("/").map((x) => encodeURIComponent(x)).join("/");
+  const amzDate = new Date().toISOString().replace(/[-:]/g, "").replace(/[.][0-9]{3}/, "");
+  const payloadHash = await sha256Hex("");
+  const headers = { host, "x-amz-content-sha256": payloadHash, "x-amz-date": amzDate };
+  const auth = await s3Sign({ method: "GET", path, headers, payloadHash, keyId: env.B2_KEY_ID, secret: env.B2_APP_KEY, region, amzDate });
+  const send = { ...headers, authorization: auth, range: `bytes=${start}-${end}` };
+  delete send.host;
+  const r = await fetch(`https://${host}${path}`, { headers: send });
+  if (r.status !== 206 && r.status !== 200) throw new Error(`Backblaze answered ${r.status}`);
+  const u8 = new Uint8Array(await r.arrayBuffer());
+  return r.status === 200 ? u8.subarray(start, end + 1) : u8; // a whole file sent anyway: the part asked for
+}
+
+/** The directory of a zip in B2 (name -> where its data is), read from the end of the file. */
+async function judgeZipDir(env, f) {
+  const size = Number(f.size) || 0;
+  if (size < 22) throw new Error("the package is empty");
+  const tailStart = Math.max(0, size - 66_000);
+  const tail = await b2Range(env, f.key, tailStart, size - 1);
+  const dv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
+  let eocd = -1;
+  for (let i = tail.length - 22; i >= 0; i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) throw new Error("the package isn't a zip archive");
+  const count = dv.getUint16(eocd + 10, true), cdSize = dv.getUint32(eocd + 12, true), cdOff = dv.getUint32(eocd + 16, true);
+  if (count === 0xffff || cdOff === 0xffffffff) throw new Error("the package is too large to read here");
+  const cd = cdOff >= tailStart && cdOff + cdSize <= size ? tail.subarray(cdOff - tailStart, cdOff - tailStart + cdSize) : await b2Range(env, f.key, cdOff, cdOff + cdSize - 1);
+  const cv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
+  const dec = new TextDecoder();
+  const out = new Map();
+  for (let n = 0, p = 0; n < count && p + 46 <= cd.length; n++) {
+    if (cv.getUint32(p, true) !== 0x02014b50) break;
+    const nl = cv.getUint16(p + 28, true), xl = cv.getUint16(p + 30, true), cl = cv.getUint16(p + 32, true);
+    const name = dec.decode(cd.subarray(p + 46, p + 46 + nl)).split(BACKSLASH).join("/");
+    out.set(name, { method: cv.getUint16(p + 10, true), comp: cv.getUint32(p + 20, true), size: cv.getUint32(p + 24, true), local: cv.getUint32(p + 42, true) });
+    p += 46 + nl + xl + cl;
+  }
+  return out;
+}
+
+/** One file out of a zip in B2: its local header, then its bytes (deflate undone). */
+async function judgeZipFile(env, f, e, max = 32 * 1048576) {
+  if (e.size > max || e.comp > max) throw new Error("a file in the package is too large");
+  let part = await b2Range(env, f.key, e.local, e.local + 30 + 1024 + e.comp - 1);
+  let dv = new DataView(part.buffer, part.byteOffset, part.byteLength);
+  if (part.length < 30 || dv.getUint32(0, true) !== 0x04034b50) throw new Error("the package is damaged");
+  const start = 30 + dv.getUint16(26, true) + dv.getUint16(28, true);
+  if (start + e.comp > part.length) part = await b2Range(env, f.key, e.local, e.local + start + e.comp - 1);
+  const raw = part.subarray(start, start + e.comp);
+  if (e.method === 0) return raw;
+  if (e.method !== 8) throw new Error("the package uses a compression this server can't read");
+  const buf = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).arrayBuffer());
+  if (buf.length > max) throw new Error("a file in the package is too large");
+  return buf;
+}
+
+/** A package's manifest, as judging needs it: the song id and each chart (file, id, difficulty, osu! file MD5) and where it is. */
+async function judgeManifest(env, f) {
+  const rk = `judge/${JUDGE_VERSION}/${f.key}/manifest.json`;
+  if (JUDGE_MEMO.has(rk)) return JUDGE_MEMO.get(rk);
+  let m = await r2json(env, rk, null);
+  if (!m) {
+    const dir = await judgeZipDir(env, f);
+    const me = [...dir.entries()].find(([n]) => n.toLowerCase() === "manifest.json");
+    if (!me) throw new Error("the package has no manifest");
+    const man = JSON.parse(new TextDecoder().decode(await judgeZipFile(env, f, me[1], 4 * 1048576)));
+    const str = (v) => (typeof v === "string" ? v : null);
+    m = {
+      songId: str(man.songId),
+      charts: (Array.isArray(man.charts) ? man.charts : []).filter((c) => c && typeof c === "object").map((c) => {
+        const file = String(c.file || "").split(BACKSLASH).join("/");
+        return { file, chartId: str(c.chartId), difficulty: str(c.difficulty), osuMd5: str(c.osuMd5) ? c.osuMd5.toLowerCase() : null, entry: dir.get(file) || null };
+      }),
+    };
+    await r2put(env, rk, m);
+  }
+  return judgeMemo(rk, m);
+}
+
+/** One of a package's charts, compiled for judging: read from B2 the first time, then kept in R2. */
+async function judgeCompiled(env, f, m, i) {
+  const rk = `judge/${JUDGE_VERSION}/${f.key}/chart-${i}.json`;
+  if (JUDGE_MEMO.has(rk)) return JUDGE_MEMO.get(rk);
+  let packed = await r2json(env, rk, null);
+  if (!packed) {
+    const mc = m.charts[i];
+    if (!mc.entry) throw new Error("the package is missing a chart file");
+    let chart;
+    try { chart = loadChart(new TextDecoder().decode(await judgeZipFile(env, f, mc.entry))); }
+    catch (e) { if (e instanceof JudgeDataError) fail(409, `This chart can't be checked by the server (${e.message}), so plays of it don't count.`); throw e; }
+    packed = packCompiled(compileChart(chart));
+    await r2put(env, rk, packed);
+  }
+  const c = unpackCompiled(packed);
+  if (!c) throw new Error("a kept chart is out of date");
+  return judgeMemo(rk, c);
+}
+
+/**
+ * A chart of a Workshop upload, ready to judge: found in its song's package by chart id, else the osu! file's MD5, else
+ * the difficulty's name (only where the package doesn't name another osu! file). Null when the upload hasn't got it.
+ */
+async function judgeChartOf(env, it, songId, want) {
+  const files = (it && it.b2Files) || [];
+  if (!files.length || !b2Ready(env)) failRetry("The server can't read this chart right now, so the play can't be checked. Try again later.");
+  const songs = (it.meta && it.meta.songs) || [];
+  const order = files.map((_, i) => i);
+  const si = songs.findIndex((s) => s.songId === songId);
+  if (si >= 0 && songs.length === files.length) order.unshift(...order.splice(si, 1)); // its file first (the details were read in file order)
+  try {
+    for (const n of order) {
+      const f = files[n];
+      if (!f || !f.key || Number(f.size) > 200 * 1048576) continue;
+      const m = await judgeManifest(env, f);
+      if (songId && m.songId !== songId) continue;
+      let i = -1;
+      if (want.chartId) i = m.charts.findIndex((c) => c.chartId === want.chartId);
+      if (i < 0 && want.osuMd5) i = m.charts.findIndex((c) => c.osuMd5 === want.osuMd5);
+      if (i < 0 && want.difficulty) i = m.charts.findIndex((c) => c.difficulty === want.difficulty && !(want.osuMd5 && c.osuMd5));
+      if (i < 0) return null;
+      return { compiled: await judgeCompiled(env, f, m, i), itemId: it.id, songId: m.songId, chartId: m.charts[i].chartId, difficulty: m.charts[i].difficulty };
+    }
+  } catch (e) {
+    if (e.status) throw e;
+    console.log("judge chart", it && it.id, e && e.message);
+    failRetry("The server couldn't read this chart right now, so the play can't be checked. Try again in a moment.");
+  }
+  return null;
+}
+
+let judgeDbCache = null, judgeDbAt = 0;
+async function judgeDb(env) {
+  if (judgeDbCache && Date.now() - judgeDbAt < 60_000) return judgeDbCache;
+  judgeDbCache = await r2json(env, WS_DB, { items: [] });
+  judgeDbAt = Date.now();
+  return judgeDbCache;
+}
+
+/** The chart a board's play is judged with: OCTIVE's own or a verified song's upload, or a verified upload of an osu! set. */
+async function boardChartOf(env, songId, chartId, difficulty) {
+  const items = ((await judgeDb(env)).items || []).filter((x) => x.type === "charts" && !x.removed && x.meta && (x.b2Files || []).length);
+  const rank = (x) => (x.verified ? 0 : x.builtin ? 1 : 2);
+  const set = /^osu-([0-9]+)$/.exec(songId);
+  if (set) {
+    const md5 = /^[0-9a-f]{32}$/.test(chartId) ? chartId : null;
+    const ofSet = (s) => Number(s.osuSet) === Number(set[1]);
+    for (const it of items.filter((x) => (x.meta.songs || []).some(ofSet)).sort((a, b) => rank(a) - rank(b)).slice(0, 4))
+      for (const sg of it.meta.songs.filter(ofSet)) {
+        const r = await judgeChartOf(env, it, sg.songId, { chartId: md5 ? null : chartId, osuMd5: md5, difficulty: difficulty || null });
+        if (r) return r;
+      }
+    return null;
+  }
+  const it = items.filter((x) => (x.songIds || []).includes(songId) || (x.meta.songs || []).some((s) => s.songId === songId)).sort((a, b) => rank(a) - rank(b))[0];
+  return it ? judgeChartOf(env, it, songId, { chartId }) : null;
+}
+
+/**
+ * A play judged again from its replay (the gzip bytes the game sent, see replayBytes). It has to be the signed-in
+ * player's own recorded play (not autoplay), from a game that judges like this one, of a chart with that many keys.
+ * Gives { replay, result }: result has the game's numbers (counts, score, accuracy, maxCombo, fullCombo, grade), judged here.
+ */
+async function judgePlay(who, bytes, where, opts = {}) {
+  if (!bytes) fail(400, `${opts.what || "A play"} only counts with its replay. Update OCTIVE and play it again.`);
+  let replay;
+  try { replay = await readReplay(bytes); }
+  catch (e) { if (e instanceof JudgeDataError) fail(400, "The play's replay couldn't be read: " + e.message); throw e; }
+  if (replay.version < REPLAY_VERSION) fail(400, "That replay comes from an older OCTIVE. Update the game and play it again.");
+  if (replay.autoplay) fail(400, "Autoplay doesn't count.");
+  if (!replay.playerId || replay.playerId !== who.playerId) fail(403, "That replay isn't your own play.");
+  if (opts.noMods && (parseMods(replay.mods) !== 0 || rateOf(replay.mods) !== 1)) fail(400, opts.noModsText || "This is played without mods.");
+  if (!where) fail(409, "The server can't find this chart to check the play, so it doesn't count.");
+  if (opts.songId && (replay.songId !== opts.songId || replay.chartId !== opts.chartId)) fail(409, "That replay is of another chart.");
+  const c = where.compiled;
+  if (replay.keyCount && replay.keyCount !== c.keyCount) fail(409, `That replay was played with ${replay.keyCount} keys, but this chart has ${c.keyCount}.`);
+  const result = judgeReplay(c, replay);
+  if (!result.hits) fail(400, "Nothing was hit in that play.");
+  return { replay, result };
+}
+
+/** Accuracy from judgement counts (what a game says its play got), or null. */
+function claimedAccuracy(counts) {
+  if (!Array.isArray(counts) || counts.length !== 6) return null;
+  const c = counts.map((n) => Number(n));
+  const total = c.reduce((a, b) => a + (Number.isFinite(b) && b > 0 ? b : 0), 0);
+  return total > 0 ? c.reduce((a, n, i) => a + (Number.isFinite(n) && n > 0 ? n : 0) * ACC_WEIGHTS[i], 0) / total : null;
+}
+
+/** Writes down (for moderators; the play still counts as judged) a game that claimed more than its replay gives, or timing too exact for a person. */
+async function judgeFlags(env, playerId, what, result, claimed) {
+  const notes = [];
+  if (claimed) {
+    const s = Number(claimed.score), a = Number(claimed.accuracy);
+    if ((Number.isFinite(s) && s > result.score + 5000) || (Number.isFinite(a) && a > result.accuracy + 0.5))
+      notes.push(`${what}: the game sent ${Number.isFinite(s) ? Math.round(s) + " / " : ""}${Number.isFinite(a) ? a.toFixed(2) + "%" : "?"}, its replay gives ${result.score} / ${result.accuracy.toFixed(2)}%`);
+  }
+  if (result.hits >= 100 && result.stdMs < 3) notes.push(`${what}: hit timing spread ${result.stdMs.toFixed(2)} ms over ${result.hits} hits (too exact for a person?)`);
+  for (const n of notes) await flagPlayer(env, playerId, n);
+}
+
+// The same play sent by someone else (a replay passed on or downloaded from a board, its player id changed): the hit
+// timing of the plays that count is kept per chart (board scores, daily and dan plays), and a play whose timing
+// matches another player's is refused.
+const judgeSigKey = async (scope) => `judge/sigs/${(await sha256Hex(scope)).slice(0, 40)}.json`;
+/** Another player's play with the same timing on this chart (or, with sameOk false, any earlier one, yours too). */
+async function replayCopyOf(env, scope, playerId, sig, sameOk = true) {
+  if (!sig) return null;
+  const d = await r2json(env, await judgeSigKey(scope), { list: [] });
+  return (d.list || []).find((x) => (!sameOk || x.p !== playerId) && signatureMatch(x.s, sig) >= 0.9) || null;
+}
+/** Keeps a play's timing for a chart: each player's newest few (on a board: their score and the ones it replaced). */
+async function rememberReplay(env, scope, playerId, sig, perPlayer = 3) {
+  if (!sig) return;
+  await r2update(env, await judgeSigKey(scope), () => ({ list: [] }), (d) => {
+    d.list = d.list || [];
+    if (d.list.some((x) => x.p === playerId && x.s === sig)) return false;
+    const theirs = d.list.filter((x) => x.p === playerId);
+    if (theirs.length >= perPlayer) { const old = new Set(theirs.slice(0, theirs.length - perPlayer + 1)); d.list = d.list.filter((x) => !old.has(x)); }
+    d.list.push({ p: playerId, s: sig, at: new Date().toISOString() });
+    if (d.list.length > 600) d.list = d.list.slice(-600);
+  }).catch((e) => console.log("replay timing", e && e.message));
+}
+async function refuseCopies(env, scope, who, result, sameOk = true) {
+  const copy = await replayCopyOf(env, scope, who.playerId, result.signature, sameOk);
+  if (!copy) return;
+  if (copy.p !== who.playerId) await flagPlayer(env, who.playerId, `sent a replay with the same timing as ${copy.p}'s (${scope})`);
+  fail(409, copy.p === who.playerId ? "That replay was already used." : "That replay is a copy of another player's play, so it doesn't count.");
+}
+
 const isImageName = (n) => /\.(png|jpe?g)$/i.test(n);
 const imageType = (b) => b && b.length > 4 && b[0] === 0x89 && b[1] === 0x50 ? "png" : b && b.length > 3 && b[0] === 0xff && b[1] === 0xd8 ? "jpg" : null;
 
@@ -3683,7 +4330,8 @@ async function wsInspect(kind, u8) {
 //     cosmetics/index.json     { players: { <id>: { title, frame, icon, showcase, dan, dans } } }  (what others see)
 // Everything is decided here: the chart, the one attempt, the accuracy (from the judgement counts) and the points.
 const ACC_WEIGHTS = [100, 98, 70, 40, 10, 0];
-const DAN_CLEAR_ACC = 90; // a dan counts as cleared at this accuracy or more, with no mods
+const DAILY_REPLAY_GAME = "1.6.6"; // the first game that sends its daily and dan plays' replays (they're judged here)
+const DAN_CLEAR_ACC = 96; // a dan counts as cleared at this accuracy or more, with no mods (90 until 1.6.6: those clears stay)
 // players who can mark dans besides Senterra, Octive and charters (lego1027)
 const DAN_MARKERS = ["u0bAhHr7LjswtFU4NB03XZcuUCOG"];
 const DAN_LEVELS = ["1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th", "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta"];
@@ -3839,14 +4487,47 @@ function walletPublic(w, id) {
 }
 
 let cosmeticsCache = null, cosmeticsAt = 0;
+/** A player's highest dan, and the clear of it with the best accuracy: the song it was played on (null: none cleared). */
+function highestDanClear(w) {
+  let best = null, bi = -1;
+  for (const d of Object.values(w.dans || {})) {
+    const i = DAN_LEVELS.indexOf(d && d.level);
+    if (i < 0) continue;
+    if (i > bi || (i === bi && (Number(d.acc) || 0) > (Number(best.acc) || 0))) { best = d; bi = i; }
+  }
+  return best ? { level: DAN_LEVELS[bi], d: best } : null;
+}
+/** What others see of that clear: the song (its title and difficulty) and the accuracy. */
+function danClearPublic(d) {
+  const title = String((d && d.title) || "").slice(0, 80), difficulty = String((d && d.difficulty) || "").slice(0, 60);
+  if (!title && !difficulty) return undefined;
+  const acc = Number(d.acc);
+  return { title: title || undefined, difficulty: difficulty || undefined, acc: Number.isFinite(acc) ? Math.round(acc * 100) / 100 : undefined };
+}
 async function writeCosmetics(env, id, w) {
-  let best = -1;
-  for (const d of Object.values(w.dans || {})) { const i = DAN_LEVELS.indexOf(d.level); if (i > best) best = i; }
+  const hd = highestDanClear(w);
+  const best = hd ? DAN_LEVELS.indexOf(hd.level) : -1;
   const e = { title: w.equipped.title || undefined, frame: w.equipped.frame || undefined, icon: w.equipped.icon || undefined, titleColor: w.equipped.titleColor || undefined, iconColor: w.equipped.iconColor || undefined, iconsV2: w.iconsV2 || undefined, hasShowcase: (w.owned || []).includes("showcase") || undefined,
-    showcase: (w.showcase || []).length ? w.showcase : undefined, dan: best >= 0 ? DAN_LEVELS[best] : undefined, dans: Object.keys(w.dans || {}).length || undefined };
+    showcase: (w.showcase || []).length ? w.showcase : undefined, dan: best >= 0 ? DAN_LEVELS[best] : undefined, danClear: hd ? danClearPublic(hd.d) : undefined, dans: Object.keys(w.dans || {}).length || undefined };
   const empty = Object.values(e).every((v) => v === undefined);
   await r2update(env, COSMETICS_KEY, () => ({ players: {} }), (d) => { d.players ||= {}; if (empty) delete d.players[id]; else d.players[id] = e; });
   cosmeticsCache = null;
+}
+/** Once: the song each player's highest dan was cleared on, for everyone who cleared it before that was kept. */
+async function backfillDanClears(env, doc) {
+  const ids = Object.entries(doc.players || {}).filter(([, e]) => e && e.dan && !e.danClear).map(([id]) => id);
+  const found = {};
+  for (let i = 0; i < ids.length; i += 10)
+    await Promise.all(ids.slice(i, i + 10).map(async (id) => {
+      const hd = highestDanClear(await walletOf(env, id));
+      const pub = hd && danClearPublic(hd.d);
+      if (pub) found[id] = { level: hd.level, pub };
+    }));
+  return r2update(env, COSMETICS_KEY, () => ({ players: {} }), (d) => {
+    d.players ||= {};
+    for (const [id, f] of Object.entries(found)) { const e = d.players[id]; if (e && e.dan === f.level && !e.danClear) e.danClear = f.pub; }
+    d.danClears = 1;
+  });
 }
 
 /** The daily charts: Easy, Normal, Hard and Extreme (4K only, by stars), with what each is worth (× the accuracy). */
@@ -3858,7 +4539,10 @@ const DAILY_TIERS = [
 ];
 const dailyTier = (t) => DAILY_TIERS.find((x) => x.tier === t);
 /** The wallet key of an attempt at one of a day's charts (a re-picked day has its own). */
-const attemptKey = (d, date, tier) => d && d.rev ? `${date}:${tier}:${d.rev}` : `${date}:${tier}`;
+const attemptKey = (d, date, tier) => {
+  const r = (d && d.charts && d.charts[tier] && d.charts[tier].rev) || (d && d.rev);
+  return r ? `${date}:${tier}:${r}` : `${date}:${tier}`;
+};
 /** Points for a daily play: the accuracy rounded down (99.7% = 99), halved for Easy, doubled for Hard, tripled for Extreme. */
 const dailyPoints = (acc, tier) => Math.max(0, Math.floor(Math.floor(acc + 1e-9) * tier.factor));
 
@@ -3890,9 +4574,16 @@ async function dailyOf(env, date) {
   if (have && have.charts && !stale(have)) {
     // a tier added after the day was picked (Extreme, 1.6.6): picked once, the day's other charts stay as they are
     const missing = DAILY_TIERS.filter((t) => !have.charts[t.tier] && !(have.added || []).includes(t.tier));
-    if (!missing.length) return have;
-    const all = dailyPool(await r2json(env, WS_DB, { items: [] }));
+    // a chart picked with older star ranges that doesn't fit its tier any more: that tier is picked again (once), with
+    // its own attempts and board; the tiers that still fit keep theirs
+    const fits = (c, t) => c && Number(c.stars) >= t.min && Number(c.stars) <= t.max;
+    const misfit = DAILY_TIERS.filter((t) => have.charts[t.tier] && !fits(have.charts[t.tier], t) && !(have.refit || []).includes(t.tier));
+    if (!missing.length && !misfit.length) return have;
+    const db = await r2json(env, WS_DB, { items: [] });
+    const all = dailyPool(db);
+    let repicked = [];
     await r2update(env, key, () => ({}), (d) => {
+      repicked = [];
       if (!d || !d.charts) return false;
       d.added = d.added || [];
       for (const t of missing) {
@@ -3901,7 +4592,24 @@ async function dailyOf(env, date) {
         if (c) d.charts[t.tier] = c;
         d.added.push(t.tier); // tried once (a tier with no chart that fits isn't looked for again today)
       }
+      d.refit = d.refit || [];
+      for (const t of misfit) {
+        if (d.refit.includes(t.tier) || fits(d.charts[t.tier], t)) continue;
+        d.refit.push(t.tier);
+        const c = dailyPickFor(all, date, t);
+        if (!c) continue; // nothing fits: the old pick stays for today
+        c.rev = Date.now();
+        d.replacedTiers = d.replacedTiers || {};
+        d.replacedTiers[t.tier] = { ...d.charts[t.tier], scores: undefined };
+        d.charts[t.tier] = c;
+        repicked.push([t, c]);
+      }
     }).catch((e) => console.log("daily tier", e && e.message));
+    // the uploaders of the new picks are told
+    for (const [t, c] of repicked) {
+      const it = (db.items || []).find((x) => x.id === c.itemId);
+      if (it && it.creatorId) await addNotice(env, it.creatorId, { kind: "daily-pick", date, tier: t.tier, tierName: t.name, itemId: c.itemId, songId: c.songId, title: c.title, difficulty: c.difficulty }).catch(() => {});
+    }
     const saved = await r2json(env, key, null);
     return saved && saved.charts ? saved : have;
   }
@@ -3932,7 +4640,6 @@ async function dailyOf(env, date) {
   return saved && saved.charts ? saved : pick;
 }
 
-/** Accuracy from judgement counts (Marvelous..Miss), worked out here. Null when they don't fit the chart. */
 // ---- dans from any copy. A dan is marked on one upload's song, but players may have the same chart from another upload
 // or from their own osu! import. A song's id is its artist and title plus a random end ("...-staminamap-pack-5279c3"),
 // and an osu! import's board id names its beatmap set ("osu-611978"): so a dan is found by its exact song, by its song
@@ -4035,44 +4742,8 @@ async function recordDanClears(env, playerId, found) {
     if (!changed) return false;
   });
 }
-/**
- * Dan clears in a player's synced plays: any copy of a dan's chart, no mods, at the clear accuracy or more (worked out
- * here from the play's judgements against the dan's own chart). The game sends a clear when the play ends, but only
- * for copies it knows are dans: other copies, and older games, are caught here. How many were new or better.
- */
-async function danClearsFromPlays(env, playerId, charts, resetAt) {
-  const idx = await danIndex(env);
-  if (!idx.size || !Array.isArray(charts)) return 0;
-  const found = [];
-  for (const [key, c] of charts) {
-    if (!c || typeof c !== "object" || typeof c.difficulty !== "string") continue;
-    const e = findDan(idx, String(key).split("/")[0], c.difficulty, c.board);
-    if (!e) continue;
-    if (chartProblems(e.it, e.chart, { keys: c.keyCount, stars: c.stars, sv: STAR_VERSION, chartId: String(key).split("/")[1] }, e.dan.songId, e.via).length) continue; // a changed copy
-    let best = null;
-    for (const p of Array.isArray(c.top) ? c.top : []) {
-      if (!p || typeof p !== "object" || p.failed === true || (p.mods && String(p.mods).trim())) continue;
-      if (resetAt && !(Date.parse(p.date) > resetAt)) continue;
-      const acc = countsAccuracy(p.counts, e.chart.notes);
-      if (acc !== null && acc >= DAN_CLEAR_ACC && (!best || acc > best.acc)) best = { e, acc, at: p.date };
-    }
-    if (best) found.push(best);
-  }
-  const before = found.length;
-  const w = await recordDanClears(env, playerId, found);
-  if (w) await writeCosmetics(env, playerId, w);
-  return w ? before : 0;
-}
-
-function countsAccuracy(counts, notes) {
-  if (!Array.isArray(counts) || counts.length !== 6) return null;
-  const c = counts.map((n) => Math.round(Number(n)));
-  if (c.some((n) => !Number.isFinite(n) || n < 0 || n > 1_000_000)) return null;
-  const total = c.reduce((a, b) => a + b, 0);
-  // every note is judged once (long notes may be judged at both ends)
-  if (!(notes > 0) || total < notes || total > notes * 2 + 2) return null;
-  return c.reduce((a, n, i) => a + n * ACC_WEIGHTS[i], 0) / total;
-}
+// Dan clears only come from /play/dan/clear, judged from the play's replay. (Until 1.6.6 the ranking sync also credited
+// clears from a player's synced plays, which carry only the game's own numbers: that's gone.)
 
 async function displayName(env, id) {
   try { const ov = moderation.overrides[id] || {}; return String(ov.name || (await publicItems(config(env), id, ["card"])).card?.name || "Player").slice(0, 40); } catch { return "Player"; }
@@ -4179,7 +4850,7 @@ async function playRoutes(request, env, url) {
       const all = (c.scores || []).slice().sort((a, b) => b.points - a.points || b.acc - a.acc || Date.parse(a.at) - Date.parse(b.at));
       const at = who ? all.findIndex((x) => x.id === who.playerId) : -1;
       const me = at >= 0 ? { ...all[at], rank: at + 1 } : null;
-      return { ...c, scores: undefined, top: all.slice(0, 10), players: all.length, me, mine: w ? w.attempts[attemptKey(d, date, t.tier)] || null : null, preview: c.itemId ? `${WORKER_BASE}/api/preview/${c.itemId}` : null };
+      return { ...c, scores: undefined, top: all.slice(0, 200), players: all.length, me, mine: w ? w.attempts[attemptKey(d, date, t.tier)] || null : null, preview: c.itemId ? `${WORKER_BASE}/api/preview/${c.itemId}` : null };
     });
     const supporterMultiplier = who && (await isSupporterNow(env, who.playerId)) ? SUPPORTER_DAILY_MULT : 1;
     return reply({ date, tiers, wallet: w ? walletPublic(w, who.playerId) : null, supporterMultiplier, nextAt: new Date(Date.parse(date + "T00:00:00Z") + 86_400_000).toISOString() });
@@ -4191,6 +4862,8 @@ async function playRoutes(request, env, url) {
     if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
     const t = dailyTier(String(b.tier || ""));
     if (!t) fail(400, "Pick Easy, Normal or Hard.");
+    // a daily play only counts with its replay (judged here): a game too old to send it is stopped before the attempt is used
+    if (!versionAtLeast(b.v, DAILY_REPLAY_GAME)) fail(426, `Update OCTIVE to play the daily charts: plays are now checked from their replays (OCTIVE ${DAILY_REPLAY_GAME} or newer).`);
     const date = todayUtc();
     const d = await dailyOf(env, date);
     if (!d.charts[t.tier]) fail(404, `There's no ${t.name} daily chart today.`);
@@ -4223,7 +4896,7 @@ async function playRoutes(request, env, url) {
   }
   if (path === "/play/daily/submit" && request.method === "POST") {
     const who = await signedIn(request, env);
-    const b = await bodyOf(request, 4_000);
+    const b = await bodyOf(request, 2_600_000); // the play's replay comes with it
     const t = dailyTier(String(b.tier || ""));
     if (!t) fail(400, "Pick Easy, Normal or Hard.");
     const date = todayUtc();
@@ -4231,8 +4904,19 @@ async function playRoutes(request, env, url) {
     const c = d.charts[t.tier];
     if (!c) fail(404, `There's no ${t.name} daily chart today.`);
     if (String(b.mods || "").trim()) fail(400, "The daily charts are played without mods.");
-    const acc = countsAccuracy(b.counts, c.notes);
-    if (acc === null) fail(400, "That play doesn't match the daily chart.");
+    // the play is judged again from its replay, against the day's chart in its Workshop upload: the accuracy (and the
+    // points) come from that, never from the game's numbers
+    const rep = replayBytes(b.replay);
+    if (!rep) fail(400, "The daily chart only counts with the play's replay. Update OCTIVE.");
+    const it = ((await judgeDb(env)).items || []).find((x) => x.id === c.itemId);
+    const mc = ((it && it.meta && it.meta.songs) || []).find((x) => x.songId === c.songId)?.charts?.find((x) => x.difficulty === c.difficulty);
+    const where = it ? await judgeChartOf(env, it, c.songId, { chartId: mc && mc.chartId, difficulty: c.difficulty }) : null;
+    const { result } = await judgePlay(who, rep, where, { what: "The daily chart", noMods: true, noModsText: "The daily charts are played without mods." });
+    // the same chart can come round again on another day: a replay counts once, for one player
+    const scope = `daily|${c.itemId}|${c.songId}|${c.difficulty}`;
+    await refuseCopies(env, scope, who, result, false);
+    await judgeFlags(env, who.playerId, `daily ${date} ${t.tier}`, result, { accuracy: claimedAccuracy(b.counts) });
+    const acc = result.accuracy;
     const points = dailyPoints(acc, t);
     const mult = (await isSupporterNow(env, who.playerId)) ? SUPPORTER_DAILY_MULT : 1;
     const earned = points * mult;
@@ -4250,6 +4934,7 @@ async function playRoutes(request, env, url) {
       remember(w, { kind: "daily", tier: t.tier, points: earned, base: mult > 1 ? points : undefined, mult: mult > 1 ? mult : undefined, acc: a.acc, title: c.title });
     });
     if (!w) fail(409, why || "That didn't count.");
+    await rememberReplay(env, scope, who.playerId, result.signature);
     const name = await displayName(env, who.playerId);
     await r2update(env, `daily/${date}.json`, () => null, (x) => {
       if (!x || !x.charts || !x.charts[t.tier]) return false;
@@ -4258,7 +4943,8 @@ async function playRoutes(request, env, url) {
       ch.scores.push({ id: who.playerId, name, acc: Math.round(acc * 100) / 100, points, at: new Date().toISOString() });
     });
     // "points": what went into the wallet (older games show this); the board keeps basePoints
-    return reply({ ok: true, tier: t.tier, points: earned, basePoints: points, multiplier: mult, accuracy: Math.round(acc * 100) / 100, balance: w.balance, streak: w.streak });
+    return reply({ ok: true, tier: t.tier, points: earned, basePoints: points, multiplier: mult, accuracy: Math.round(acc * 100) / 100, balance: w.balance, streak: w.streak,
+      judged: { score: result.score, counts: result.counts, maxCombo: result.maxCombo, fullCombo: result.fullCombo, grade: result.grade } });
   }
 
   // ---- the shop
@@ -4434,7 +5120,9 @@ async function playRoutes(request, env, url) {
   // ---- what everyone has equipped (titles, frames, icons, showcases, dans)
   if (path === "/play/cosmetics" && request.method === "GET") {
     if (!cosmeticsCache || Date.now() - cosmeticsAt > 30_000) {
-      const raw = (await r2json(env, COSMETICS_KEY, { players: {} })).players || {};
+      let doc = await r2json(env, COSMETICS_KEY, { players: {} });
+      if (!doc.danClears) doc = await backfillDanClears(env, doc).catch((err) => { console.log("dan clears", err && err.message); return doc; });
+      const raw = doc.players || {};
       cosmeticsCache = Object.fromEntries(Object.entries(raw).map(([k, e]) => [k, iconsV2Entry(e)]));
       cosmeticsAt = Date.now();
     }
@@ -4467,7 +5155,7 @@ async function playRoutes(request, env, url) {
   }
   if (path === "/play/dan/clear" && request.method === "POST") {
     const who = await signedIn(request, env);
-    const b = await bodyOf(request, 4_000);
+    const b = await bodyOf(request, 2_600_000); // the play's replay comes with it
     if (String(b.mods || "").trim()) fail(400, "Dans are played without mods.");
     const songId = String(b.songId || ""), difficulty = String(b.difficulty || "");
     // the marked song, or any copy of it (another upload, their own osu! import)
@@ -4475,14 +5163,23 @@ async function playRoutes(request, env, url) {
     if (!e) fail(404, "That difficulty isn't a dan.");
     const changed = chartProblems(e.it, e.chart, b.chart, e.dan.songId, e.via);
     if (changed.length) failModified(changed, e.it.id, "the dan");
-    const acc = countsAccuracy(b.counts, e.chart.notes);
-    if (acc === null) fail(400, "That play doesn't match the dan.");
+    // the play is judged again from its replay, against the dan's own chart: the accuracy comes from that
+    const rep = replayBytes(b.replay);
+    if (!rep) fail(400, "A dan only counts with the play's replay. Update OCTIVE.");
+    const where = await judgeChartOf(env, e.it, e.dan.songId, { chartId: e.chart.chartId, difficulty: e.dan.difficulty });
+    const { result } = await judgePlay(who, rep, where, { what: "A dan", noMods: true, noModsText: "Dans are played without mods." });
+    const scope = `dan|${e.dan.songId}|${e.dan.difficulty}`;
+    await refuseCopies(env, scope, who, result);
+    await judgeFlags(env, who.playerId, `dan ${e.dan.level} ${e.dan.difficulty}`, result, { accuracy: claimedAccuracy(b.counts) });
+    const acc = result.accuracy;
     const cleared = acc >= DAN_CLEAR_ACC;
     if (cleared) {
       const w = await recordDanClears(env, who.playerId, [{ e, acc, at: new Date().toISOString() }]);
       if (w) await writeCosmetics(env, who.playerId, w);
     }
-    return reply({ ok: true, cleared, level: e.dan.level, accuracy: Math.round(acc * 100) / 100, needed: DAN_CLEAR_ACC });
+    await rememberReplay(env, scope, who.playerId, result.signature);
+    return reply({ ok: true, cleared, level: e.dan.level, accuracy: Math.round(acc * 100) / 100, needed: DAN_CLEAR_ACC,
+      judged: { score: result.score, counts: result.counts, maxCombo: result.maxCombo, fullCombo: result.fullCombo, grade: result.grade } });
   }
   fail(404, "Not found");
 }
@@ -4858,33 +5555,85 @@ async function workshopRoutes(request, env, url, ctx) {
     verIdx = null; danIdx = null;
     return reply({ ok: errors.length === 0, done, errors, left: Math.max(0, todo.length - done.length) });
   }
-  // ---- dan clears from everyone's synced plays so far (copies of dans the game didn't know about). A few per call:
-  // pass every id back in "skip".
+  // ---- dan clears from synced plays: retired (synced plays carry only the game's own numbers; clears are judged from
+  // the play's replay at /play/dan/clear now)
   if (path === "/api/admin/dan-scan" && request.method === "POST") {
     if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
-    const b = await bodyOf(request, 50_000).catch(() => ({}));
-    const skip = new Set(Array.isArray(b.skip) ? b.skip.map(String) : []);
-    const ids = new Set();
-    for (const prefix of ["rank/players/", "points/"]) {
-      let cursor;
-      do {
-        const list = await env.RELEASES.list({ prefix, cursor });
-        for (const o of list.objects) ids.add(o.key.slice(prefix.length).replace(/\.json$/, ""));
-        cursor = list.truncated ? list.cursor : undefined;
-      } while (cursor);
+    fail(410, "Dan clears only come from replays now (/play/dan/clear); synced plays aren't scanned any more.");
+  }
+  // ---- board scores kept before plays were judged from their replays: each one with its replay is judged now. A dry
+  // run (the default) only reports. With { dry: false } every judged replay's hit timing is kept (so a copy of it is
+  // refused like any other) and the judged numbers replace different ones; { drop: true } also takes off scores that
+  // can't be judged (no replay, an unreadable one, someone else's, autoplay). A few scores per call: pass "after" back
+  // until "left" is 0 (Tools/board_rejudge.py does).
+  if (path === "/api/admin/board-rejudge" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 20_000).catch(() => ({}));
+    const dry = b.dry !== false, drop = b.drop === true && !dry;
+    let budget = Math.max(1, Math.min(40, Number(b.limit) || 8));
+    const keys = [];
+    let cursor;
+    do {
+      const list = await env.RELEASES.list({ prefix: "scores/", cursor });
+      for (const o of list.objects) if (o.key.endsWith(".json")) keys.push(o.key);
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
+    keys.sort();
+    const [afterKey, afterN] = String(b.after || "").split("#");
+    const out = { judged: 0, same: 0, differ: [], fixed: [], noReplay: [], unjudgeable: [], dropped: [] };
+    let after = null, finished = true;
+    for (const key of keys) {
+      if (afterKey && key < afterKey) continue;
+      const m = /^scores[/]([^/]+)[/]([^/]+)[.]json$/.exec(key);
+      if (!m) continue;
+      const songId = m[1], chartId = m[2];
+      const data = await r2json(env, key, { entries: [] });
+      const entries = data.entries || [];
+      let n = key === afterKey ? Number(afterN) || 0 : 0;
+      if (!entries.slice(n).some((e) => !e.judged)) continue;
+      if (budget <= 0) { finished = false; break; }
+      let where = null, whereWhy = null;
+      try { where = await boardChartOf(env, songId, chartId, data.difficulty || null); } catch (err) { whereWhy = err.message; }
+      const changes = new Map(); // playerId -> { date, drop } or { date, set }
+      for (; n < entries.length && budget > 0; n++) {
+        const e = entries[n];
+        if (e.judged) continue; // judged when it was sent
+        budget--;
+        const tag = { board: `${songId}/${chartId}`, playerId: e.playerId, name: e.name, score: e.score };
+        if (!e.replay) { out.noReplay.push(tag); if (drop) changes.set(e.playerId, { date: e.date, drop: true }); continue; }
+        let replay = null, why = null;
+        try {
+          const o = await env.RELEASES.get(boardReplayKey(songId, chartId, e.playerId));
+          if (!o) why = "its replay is missing";
+          else replay = await readReplay(new Uint8Array(await o.arrayBuffer()));
+        } catch (err) { why = err instanceof JudgeDataError ? "its replay couldn't be read: " + err.message : "its replay couldn't be read"; }
+        if (!why && replay.playerId && replay.playerId !== e.playerId) why = "the replay is another player's";
+        if (!why && replay.autoplay) why = "the replay is autoplay";
+        if (why) { out.unjudgeable.push({ ...tag, why }); if (drop) changes.set(e.playerId, { date: e.date, drop: true }); continue; }
+        if (!where) { out.unjudgeable.push({ ...tag, why: whereWhy ? "the chart couldn't be read: " + whereWhy : "the chart isn't in the Workshop" }); continue; }
+        const r = judgeReplay(where.compiled, replay, { nearest: replay.version >= 2 });
+        out.judged++;
+        if (!dry) await rememberReplay(env, `board|${songId}|${chartId}`, e.playerId, r.signature);
+        const counts = Array.isArray(e.counts) && e.counts.length === 6 ? e.counts : null;
+        const set = { score: r.score, accuracy: round2(r.accuracy), grade: r.grade, maxCombo: r.maxCombo, fullCombo: r.fullCombo, counts: r.counts, judged: JUDGE_VERSION };
+        if (r.score === e.score && (!counts || counts.join() === r.counts.join())) { out.same++; if (!dry) changes.set(e.playerId, { date: e.date, set: { judged: JUDGE_VERSION } }); continue; }
+        const d = { ...tag, accuracy: e.accuracy, counts, judgedScore: set.score, judgedAccuracy: set.accuracy, judgedCounts: set.counts };
+        if (dry) out.differ.push(d);
+        else { out.fixed.push(d); changes.set(e.playerId, { date: e.date, set }); }
+      }
+      after = `${key}#${n}`;
+      if (changes.size) {
+        await r2update(env, key, () => ({ entries: [] }), (x) => {
+          x.entries = (x.entries || []).filter((e) => { const c = changes.get(e.playerId); return !(c && c.drop && c.date === e.date); });
+          for (const e of x.entries) { const c = changes.get(e.playerId); if (c && c.set && c.date === e.date) Object.assign(e, c.set); }
+          x.entries.sort((a, c) => c.score - a.score || c.accuracy - a.accuracy || Date.parse(a.date) - Date.parse(c.date));
+        });
+        boards.delete(key);
+        for (const [playerId, c] of changes) if (c.drop) { out.dropped.push({ board: `${songId}/${chartId}`, playerId }); await env.RELEASES.delete(boardReplayKey(songId, chartId, playerId)).catch(() => {}); }
+      }
+      if (budget <= 0 && n < entries.length) { finished = false; break; }
     }
-    const todo = [...ids].filter((id) => /^[A-Za-z0-9_-]{8,64}$/.test(id) && !skip.has(id)).sort();
-    const limit = Math.max(1, Math.min(25, Number(b.limit) || 15));
-    const done = [], errors = [];
-    for (const id of todo.slice(0, limit)) {
-      try {
-        const data = (await privateItems(env, id, ["scores"]).catch(() => ({}))).scores;
-        const charts = data && typeof data === "object" && data.charts && typeof data.charts === "object" ? Object.entries(data.charts) : [];
-        const reset = await r2json(env, `rank/reset/${id}.json`, null);
-        done.push({ id, added: charts.length ? await danClearsFromPlays(env, id, charts, reset ? Date.parse(reset.at) || 0 : 0) : 0 });
-      } catch (err) { errors.push({ id, error: err.message }); if (errors.length >= 3) break; }
-    }
-    return reply({ ok: errors.length === 0, done, errors, left: Math.max(0, todo.length - limit) });
+    return reply({ ok: true, dry, ...out, after, left: finished ? 0 : 1 });
   }
   // ---- everyone's ranking worked out again from their plays, written to the leaderboard and their card. For when the
   // server got it wrong: it left out plays it wrongly took for impossible, kept PR formula 4 as 3, and never managed to
@@ -5187,6 +5936,11 @@ async function workshopRoutes(request, env, url, ctx) {
   }
 
   // ---- a score shared from the results screen: the picture goes to #octive-scores
+  // Nothing in the post comes from the request as it is: the play is the one saved to the player's account (found
+  // by its chart and score, and checked like the ranking checks plays), the words are plain text (no links,
+  // headings or mentions), and the picture must be the game's own 1920×1080 drawing whose score and name or
+  // accuracy (read back from it) match the play. A picture that doesn't match or can't be read is left out; one
+  // that isn't a results screen at all stops the share and the player is flagged for moderators.
   if (path === "/api/score-share" && request.method === "POST") {
     if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID) fail(503, "Score sharing isn't set up on the server.");
     const who = await signedIn(request, env);
@@ -5206,59 +5960,114 @@ async function workshopRoutes(request, env, url, ctx) {
     if (len > 8_500_000) fail(413, "That picture is too big.");
     let form;
     try { form = await request.formData(); } catch { fail(400, "The share wasn't readable (multipart/form-data expected)."); }
-    const file = form.get("image");
-    if (!file || typeof file === "string") fail(400, "No picture was attached.");
-    if (file.size > 8_000_000) fail(413, "That picture is too big.");
-    const bytes = new Uint8Array(await file.arrayBuffer());
-    const kind = imageType(bytes);
-    if (kind !== "png" && kind !== "jpg") fail(400, "The picture must be a PNG or JPG.");
     let info = {};
     try { info = JSON.parse(String(form.get("info") || "{}")) || {}; } catch { /* none */ }
-    const clean = (v, n) => String(v ?? "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@\u200b$1").replace(/[*_~`|>]/g, "").trim().slice(0, n);
-    const num = (v, lo, hi) => { const x = Number(v); return Number.isFinite(x) ? Math.min(hi, Math.max(lo, x)) : null; };
+
+    // the play, as it's saved to the account
+    const songId = String(info.songId || ""), chartId = String(info.chartId || "");
+    if (!/^[A-Za-z0-9._-]{1,100}$/.test(songId) || !/^[A-Za-z0-9._-]{1,100}$/.test(chartId)) fail(400, "Update OCTIVE to share scores.");
+    const want = Math.round(Number(info.score));
+    const saved = ((await privateItems(env, who.playerId, ["scores"]).catch(() => ({}))).scores || {});
+    const c = (saved.charts && typeof saved.charts === "object" ? saved.charts : {})[`${songId}/${chartId}`];
+    const top = c && Array.isArray(c.top) ? c.top.filter((x) => x && typeof x === "object") : [];
+    const play = Number.isFinite(want) ? top.find((x) => Math.round(Number(x.score)) === want && !x.failed) : null;
+    if (!play) fail(409, "That play isn't saved to your account yet (only your 10 best plays of a chart are). Try again in a moment.");
+    const n = (v, lo, hi) => { const x = Number(v); return Number.isFinite(x) && x >= lo && x <= hi ? x : null; };
+    const score = n(play.score, 0, SCORE_MAX), acc = n(play.accuracy, 0, 100), stars = n(play.stars ?? c.stars, 0, V.maxStars);
+    const combo = n(play.maxCombo, 0, V.maxCombo), notes = n(play.notes, 0, V.maxCombo);
+    const counts = Array.isArray(play.counts) ? play.counts.slice(0, 6).map((x) => n(x, 0, V.maxCombo) ?? -1) : [];
+    let pr = n(play.pp, 0, playPRMax(V.maxStars));
+    // checked like the ranking checks plays: anything impossible and the play isn't shared
+    const odd =
+      score === null ? "score" : acc === null ? "accuracy" :
+      notes !== null && combo !== null && notes > 0 && combo > notes ? "combo past the notes" :
+      counts.some((x) => x < 0) ? "judgements" :
+      notes && counts.length === 6 && counts.reduce((a, b) => a + b, 0) > notes * 2 + 10 ? "judgements past the notes" :
+      pr !== null && pr > (stars !== null ? playPRMax(stars, acc) * 1.05 + 1 : playPRMax(V.maxStars)) ? "PR past the chart's stars" : null;
+    if (odd) {
+      await flagPlayer(env, who.playerId, `score share refused (${odd}) on ${songId}/${chartId}`).catch(() => {});
+      fail(400, "That play doesn't add up, so it can't be shared.");
+    }
+    if (pr !== null && pr <= 0) pr = null;
+
+    // plain words: no links, invites, headings, quotes, masked links, mentions or markdown
+    const plain = (v, max) => String(v ?? "").replace(/[\u0000-\u001F\u007F\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF]/g, " ")
+      .replace(/(?:https?:\/\/|www\.)\S+/gi, "").replace(/\b(?:discord\.gg|discord(?:app)?\.com\/invite)\/\S+/gi, "")
+      .replace(/<[@#:][^>]*>/g, "").replace(/@(everyone|here)/gi, "$1").replace(/[\[\]<>*_~`|#\\]/g, "").replace(/\s+/g, " ").trim().slice(0, max);
+    const title = plain(c.title || play.title, 100) || "A song";
+    const diff = plain(c.difficulty || play.difficulty, 60);
+    const keys = n(c.keyCount || play.keyCount, 1, 20);
+    const mods = String(play.mods || "").replace(/[^A-Za-z0-9. ]/g, "").slice(0, 40);
+    // its labels, worked out here from the play
+    const fc = counts.length === 6 ? counts[5] === 0 : play.fullCombo === true;
+    const tagsOut = [];
+    if (counts.length === 6 && counts[1] + counts[2] + counts[3] + counts[4] + counts[5] === 0 && counts[0] > 0) tagsOut.push("ALL MARVELOUS");
+    else if (counts.length === 6 && counts[2] + counts[3] + counts[4] + counts[5] === 0 && counts[0] + counts[1] > 0) tagsOut.push("PERFECT PLAY");
+    else if (fc) tagsOut.push("FULL COMBO");
+    const best = top.reduce((a, x) => Math.max(a, Number(x.score) || 0), 0);
+    if (score >= best && top.length > 1) tagsOut.push("PERSONAL BEST");
+    const grade = String(play.grade || "").replace(/[^A-Z+]/g, "").slice(0, 3);
+
     const card = (await publicItems(cfg, who.playerId, ["card"]).catch(() => ({}))).card || {};
-    const name = clean(moderation.overrides[who.playerId]?.name || card.name || who.username || "Player", 40);
-    const title = clean(info.title, 120) || "A song";
-    const sub = clean(info.subtitle, 160);
-    const grade = clean(info.grade, 4);
-    const score = num(info.score, 0, 10_000_000), acc = num(info.accuracy, 0, 100), pr = num(info.pp, 0, 100_000), stars = num(info.stars, 0, 100);
-    const combo = num(info.maxCombo, 0, 1_000_000), notes = num(info.notes, 0, 1_000_000);
-    const tags = (Array.isArray(info.tags) ? info.tags : []).map((t) => clean(t, 20)).filter(Boolean).slice(0, 4);
+    const name = plain(moderation.overrides[who.playerId]?.name || card.name || who.username || "Player", 40) || "Player";
+
+    // the picture: the game's own drawing, read back and matched against the play
+    let bytes = null, kind = null, picNote = null;
+    const file = form.get("image");
+    if (file && typeof file !== "string" && file.size <= 8_000_000) {
+      const b = new Uint8Array(await file.arrayBuffer());
+      const im = chatImageInfo(b);
+      if (!im || (im.type !== "jpeg" && im.type !== "png") || im.w !== 1920 || im.h !== 1080) fail(400, "That picture isn't one OCTIVE drew, so the score wasn't shared.");
+      const check = await sharePictureCheck(env, b, { name, score, acc, title });
+      if (check === "fake") {
+        await flagPlayer(env, who.playerId, `score share refused (the picture isn't a results screen) on ${songId}/${chartId}`).catch(() => {});
+        fail(400, "That picture isn't a results screen from OCTIVE, so the score wasn't shared.");
+      }
+      // a picture that shows this play goes with it; anything else (a different play, unreadable) is left out
+      if (check === "ok") { bytes = b; kind = im.type === "png" ? "png" : "jpg"; }
+      else picNote = "picture left out: " + check;
+    }
+
     let discordId = null;
     try { const rec = await record(env, who.playerId); discordId = rec.discord?.id || null; } catch { /* not linked */ }
-
     const channelId = await scoresChannelId(env);
     if (!channelId) fail(503, "The #octive-scores channel wasn't found on the OCTIVE Discord.");
     const avatarHash = moderation.overrides[who.playerId]?.avatar ? "mod-" + Date.parse(moderation.overrides[who.playerId].at) : (card.avatar || "");
     const gradeColor = { X: 0x7FF5FF, SS: 0x7FF5FF, S: 0xF2C14E, A: 0x3DDC84, B: 0x5DA9FF, C: 0xB69BFF, D: 0xFF6F6F }[grade] || C_ACCENT;
+    const fmt = (x) => Math.round(x).toLocaleString("en-US");
     const fields = [
-      ...(score !== null ? [{ name: "Score", value: Math.round(score).toLocaleString("en-US"), inline: true }] : []),
-      ...(acc !== null ? [{ name: "Accuracy", value: `${acc.toFixed(2)}%${grade ? ` · ${grade}` : ""}`, inline: true }] : []),
-      ...(pr !== null ? [{ name: "Performance", value: `${Math.round(pr).toLocaleString("en-US")} PR${stars !== null ? ` · ★${stars.toFixed(2)}` : ""}`, inline: true }] : []),
-      ...(combo !== null ? [{ name: "Max combo", value: `${Math.round(combo).toLocaleString("en-US")}x${notes ? ` / ${Math.round(notes).toLocaleString("en-US")}` : ""}`, inline: true }] : []),
-      ...(tags.length ? [{ name: "\u200b", value: tags.map((t) => `**${t}**`).join(" · "), inline: true }] : []),
+      { name: "Score", value: fmt(score), inline: true },
+      { name: "Accuracy", value: `${acc.toFixed(2)}%${grade ? ` · ${grade}` : ""}`, inline: true },
+      ...(pr !== null ? [{ name: "Performance", value: `${fmt(pr)} PR${stars !== null ? ` · ★${stars.toFixed(2)}` : ""}`, inline: true }] : []),
+      ...(combo !== null ? [{ name: "Max combo", value: `${fmt(combo)}x${notes ? ` / ${fmt(notes)}` : ""}`, inline: true }] : []),
+      ...(counts.length === 6 ? [{ name: "Judgements", value: counts.map(fmt).join(" · "), inline: true }] : []),
+      ...(tagsOut.length ? [{ name: "​", value: tagsOut.map((t) => `**${t}**`).join(" · "), inline: true }] : []),
     ];
+    const footer = [diff, keys ? `${keys}K` : "", mods, "Shared from OCTIVE"].filter(Boolean).join("  ·  ");
     const embed = {
       color: gradeColor,
       author: { name, url: `${SITE}#/u/${encodeURIComponent(who.playerId)}`, ...(avatarHash ? { icon_url: `${WORKER_BASE}/avatar/${encodeURIComponent(who.playerId)}?v=${encodeURIComponent(avatarHash)}` } : {}) },
-      title: title.slice(0, 256), description: sub || undefined, fields,
-      image: { url: `attachment://score.${kind}` },
-      footer: { text: "Shared from OCTIVE" }, timestamp: new Date().toISOString(),
+      title: title.slice(0, 256), fields,
+      ...(bytes ? { image: { url: `attachment://score.${kind}` } } : {}),
+      footer: { text: footer.slice(0, 2000) }, timestamp: new Date().toISOString(),
     };
-    const fd = new FormData();
-    fd.append("payload_json", JSON.stringify({
-      content: discordId ? `<@${discordId}> shared a score` : undefined,
-      embeds: [embed], allowed_mentions: { parse: [] },
-      attachments: [{ id: 0, filename: `score.${kind}` }],
-    }));
-    fd.append("files[0]", new Blob([bytes], { type: kind === "png" ? "image/png" : "image/jpeg" }), `score.${kind}`);
-    const posted = await discordApi(env, "POST", `/channels/${channelId}/messages`, fd, true);
+    const payload = { content: discordId ? `<@${discordId}> shared a score` : undefined, embeds: [embed], allowed_mentions: { parse: [], users: discordId ? [discordId] : [] } };
+    let posted;
+    if (bytes) {
+      const fd = new FormData();
+      payload.attachments = [{ id: 0, filename: `score.${kind}` }];
+      fd.append("payload_json", JSON.stringify(payload));
+      fd.append("files[0]", new Blob([bytes], { type: kind === "png" ? "image/png" : "image/jpeg" }), `score.${kind}`);
+      posted = await discordApi(env, "POST", `/channels/${channelId}/messages`, fd, true);
+    } else posted = await discordApi(env, "POST", `/channels/${channelId}/messages`, payload);
+    if (picNote) console.log("score share", who.playerId, picNote);
     scoreShareAt.set(who.playerId, now);
     if (scoreShareAt.size > 5000) scoreShareAt.delete(scoreShareAt.keys().next().value);
     rate.n += 1;
     await r2put(env, rateKey, rate);
-    return reply({ ok: true, url: `https://discord.com/channels/${env.DISCORD_GUILD_ID}/${channelId}/${posted.id}` });
+    return reply({ ok: true, url: `https://discord.com/channels/${env.DISCORD_GUILD_ID}/${channelId}/${posted.id}`, picture: !!bytes });
   }
+
 
   // ---- update (the creator, or developers and moderators): a new file, title or description. The post in the
   // OCTIVE Discord is edited in place (same link), and downloads get the new file at once.
@@ -5476,7 +6285,7 @@ async function streakReminders(env) {
   console.log("streak reminders sent:", sent);
 }
 
-async function dmRoutes(request, env, url) {
+async function dmRoutes(request, env, url, ctx) {
   const path = url.pathname;
   let m;
   const who = await signedIn(request, env);
@@ -5552,10 +6361,21 @@ async function dmRoutes(request, env, url) {
 
   // conversations, newest first, with unread counts
   if (path === "/dm/inbox") {
+    // Discord replies reach the public chat (and their pop-ups) even while nobody has it open
+    if (ctx) ctx.waitUntil(Promise.resolve(chatPull(env)).catch(() => {}));
     const box = await r2json(env, dmInboxKey(me), dmEmptyInbox());
     const threads = Object.entries(box.threads || {}).map(([id, t]) => ({ with: id, ...t })).sort((a, b) => (b.last || 0) - (a.last || 0));
     const unread = threads.reduce((n, t) => n + (t.unread || 0), 0);
-    return reply({ me, name: box.name || who.username || "", friends: box.friends || [], synced: !!box.synced, threads, unread, unfriend: box.unfriend || [], now: Date.now() });
+    // answers and @names in the public chat since the last look (each shown once; a day at most)
+    let chat = [];
+    try {
+      await r2update(env, `chat/pings/${me}.json`, () => ({ items: [] }), (p) => {
+        chat = (p.items || []).filter((x) => Date.now() - (x.at || 0) < 24 * 3600_000);
+        if (!(p.items || []).length) return false;
+        p.items = [];
+      });
+    } catch { chat = []; }
+    return reply({ me, name: box.name || who.username || "", friends: box.friends || [], synced: !!box.synced, threads, unread, unfriend: box.unfriend || [], chat, now: Date.now() });
   }
 
   // one conversation (messages after "since", in ms)
@@ -5746,7 +6566,7 @@ export default {
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/dm/")) {
-      try { return await dmRoutes(request, env, url); }
+      try { return await dmRoutes(request, env, url, ctx); }
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/scores/")) {
