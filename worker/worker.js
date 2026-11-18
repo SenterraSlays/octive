@@ -17,7 +17,12 @@
 // pictures, badges) is read here too, so banned players disappear from the site as well.
 
 // the game's judge, so plays are judged again from their replays (board scores, daily charts, dans): deploy judge.js with this file
-import { JUDGE_VERSION, JudgeDataError, loadChart, compileChart, packCompiled, unpackCompiled, readReplay, judgeReplay, parseMods, rateOf, signatureMatch, REPLAY_VERSION } from "./judge.js";
+import { JUDGE_VERSION, JudgeDataError, loadChart, compileChart, packCompiled, unpackCompiled, readReplay, judgeReplay, parseMods, rateOf, signatureMatch, REPLAY_VERSION, chartStats, seededRandom, botPlay } from "./judge.js";
+/**
+ * The oldest replay version whose plays still count (boards, dailies, dans). 3 = 2.0 and newer (no early misses), raised
+ * when 2.0 came out (2026-11-17): plays from 1.x get "Update the game and play it again".
+ */
+const SCORE_REPLAY_MIN = 3;
 
 const LEADERBOARD = "global-pp";
 const TOP = 100;                   // players shown
@@ -153,10 +158,16 @@ function boardProblem(e, card, meta) {
 }
 
 /** A public card's numbers made safe to show (anything impossible becomes the empty value). */
+/** The player's country (2.0): where Cloudflare sees their connection come from, as a 2-letter code ("" unknown). */
+function countryOf(request) {
+  const c = String((request && request.cf && request.cf.country) || "").toUpperCase();
+  return /^[A-Z]{2}$/.test(c) && c !== "XX" && c !== "T1" ? c : "";
+}
 function safeCard(card) {
   const c = card && typeof card === "object" && !Array.isArray(card) ? card : {};
   return {
     ...c,
+    country: /^[A-Z]{2}$/.test(String(c.country || "")) ? c.country : "",
     name: validName(c.name) ? c.name : undefined,
     pp: isNum(c.pp, 0, V.maxTotalPR) ? c.pp : 0,
     accuracy: isNum(c.accuracy, 0, 100) ? c.accuracy : 0,
@@ -236,31 +247,21 @@ async function rankFromPlays(env, cfg, playerId) {
   const charts = data.charts && typeof data.charts === "object" ? Object.entries(data.charts).slice(0, V.maxCharts) : [];
   const plays = [], problems = [];
   let fullCombos = 0, bestCombo = 0, oldAfterReset = false;
-  // verified songs (OCTIVE's own, or checked by Senterra / Octive) give their full PR, every other chart a third
-  const verified = (await verifiedSongs(env).catch(() => ({ songs: {} }))).songs || {};
-  const vidx = await verifiedIndex(env).catch(() => null);
-  const prFactor = (key, c) => {
-    const ids = [typeof c.board === "string" ? c.board : null, String(key).split("/")[0]].filter(Boolean);
-    return ids.some((id) => officialSong(id) || (songIdOk(id) && verified[id])) ? 1 : 1 / 3;
-  };
   for (const [key, c] of charts) {
     if (!c || typeof c !== "object") continue;
     if (resetAt && !(Date.parse(c.lastPlayed) > resetAt)) { oldAfterReset = true; continue; }
     if (c.fullCombo === true) fullCombos++;
     if (isInt(c.maxCombo, 0, V.maxCombo)) bestCombo = Math.max(bestCombo, c.maxCombo);
-    if (!(isNum(c.bestPP, 0, V.maxTotalPR) && c.bestPP > 0)) continue;
-    const why =
-      !isNum(c.stars, 0, V.maxStars) ? `stars ${c.stars}` :
-      !isNum(c.ppAccuracy, 0, 100) ? `accuracy ${c.ppAccuracy}` :
-      c.bestScore !== undefined && !isInt(c.bestScore, 0, SCORE_MAX) ? `score ${c.bestScore}` :
-      c.bestAccuracy !== undefined && !isNum(c.bestAccuracy, 0, 100) ? `accuracy ${c.bestAccuracy}` : null;
-    if (why) { problems.push(`${String(key).slice(0, 60)}: ${why}`); continue; }
-    let pp = c.bestPP;
-    // a verified chart: its stars are known here, so its PR is never more than they give at that accuracy (whatever was sent)
-    const known = vidx ? findVerified(vidx, String(key).split("/")[0], String(c.difficulty || ""), c.board) : null;
-    const ks = known ? Number(known.chart.stars) : 0;
-    if (ks > 0) pp = Math.min(pp, playPRMax(ks + 0.15, c.ppAccuracy) * 1.03 + 0.5);
-    plays.push({ pp: round2(pp * prFactor(key, c)), acc: c.ppAccuracy });
+  }
+  // 2.0: PR comes only from plays the server judged from their replays, on verified charts and OCTIVE's own (their
+  // board scores); the numbers the game syncs don't count, and charts the server has no copy of can't be judged
+  // (if they can't be read, this fails: better no update than a ranking of 0)
+  const judged = await judgedPlays(env, playerId, charts);
+  for (const [k, p] of Object.entries(judged.charts || {})) {
+    if (!p || !isNum(p.pp, 0, V.maxTotalPR) || !(p.pp > 0) || !isNum(p.acc, 0, 100)) continue;
+    if (!(await boardSong(env, k.split("/")[0]).catch(() => false))) continue; // no longer verified
+    if (resetAt && !(Date.parse(p.at) > resetAt)) continue; // from before the player's reset
+    plays.push({ pp: round2(p.pp), acc: p.acc });
   }
   // totals: after a reset the device must have started over; numbers from before don't count
   const fresh = resetAt && oldAfterReset;
@@ -279,6 +280,194 @@ async function rankFromPlays(env, cfg, playerId) {
     counted: plays.length, problems,
     charts, resetAt,
   };
+}
+
+// ---------------------------------------------------------------- the server-made ranking (2.0)
+// Only plays the server judged from their replays count toward PR: board scores on verified charts and OCTIVE's own.
+// Each player's best judged PR per board is kept in rank/judged/<id>.json: added to with every board score, and built
+// once from the boards for players who had scores before (the charts their game synced say which boards to look at).
+const judgedKey = (id) => `rank/judged/${id}.json`;
+
+/** Keeps a judged board play for the ranking (the best PR per board). */
+async function rememberJudged(env, playerId, songId, chartId, entry) {
+  if (!(entry && isNum(entry.pp, 0, V.maxTotalPR) && entry.pp > 0)) return;
+  await r2update(env, judgedKey(playerId), () => ({ v: 1, charts: {} }), (d) => {
+    d.charts ||= {};
+    const k = `${songId}/${chartId}`, cur = d.charts[k];
+    if (cur && cur.pp >= entry.pp) return false;
+    d.charts[k] = { pp: entry.pp, acc: entry.accuracy, fc: !!entry.fullCombo, combo: entry.maxCombo || 0, at: entry.date || new Date().toISOString() };
+  });
+}
+
+/**
+ * Moves the ranking over to judged plays for everyone, not just players who play again: a few ranking entries an hour
+ * (offset kept in rank/recompute.json) get their PR and accuracy worked out again and written to the ranking, their
+ * card and their pace record. It stops once it has been through the whole ranking; after that, playing keeps it current.
+ */
+async function recomputeRanking(env, max = 6) {
+  const state = await r2json(env, "rank/recompute.json", { offset: 0, done: false, changed: 0 });
+  if (state.done) return state;
+  const cfg = config(env);
+  await loadModeration(cfg);
+  const page = await api(`${cfg.scores}?offset=${state.offset}&limit=${max}&includeMetadata=true`, cfg.auth);
+  const results = (page && page.results) || [];
+  for (const e of results) {
+    const id = e.playerId;
+    if (!id || isOfficial(id) || moderation.bans[id]) continue;
+    try {
+      const r = await rankFromPlays(env, cfg, id);
+      if (Math.abs((Number(e.score) || 0) - r.pp) < 0.01) continue;
+      let meta = null; try { meta = e.metadata ? JSON.parse(e.metadata) : null; } catch { /* none */ }
+      if (!meta || !meta.n) {
+        const one = await api(`${cfg.scores}/players/${encodeURIComponent(id)}?includeMetadata=true`, cfg.auth).catch(() => null);
+        try { meta = one && one.metadata ? JSON.parse(one.metadata) : null; } catch { meta = null; }
+      }
+      if (!meta || !meta.n) continue; // its details unknown: left for the player's next sync
+      await serverWrite(async () => {
+        await writeScore(env, id, r.pp, { ...meta, a: r.accuracy });
+        const card = (await publicItems(cfg, id, ["card"]).catch(() => ({}))).card;
+        if (card && typeof card === "object") { card.pp = r.pp; card.accuracy = r.accuracy; await saveItem(env, id, "card", card, true); }
+      });
+      const pk = `rank/players/${id}.json`, rec = await r2json(env, pk, null);
+      if (rec) { rec.pp = r.pp; rec.hist = []; await r2put(env, pk, rec); }
+      cards.delete(id);
+      state.changed = (state.changed || 0) + 1;
+    } catch (err) { console.log("ranking recompute", id, err && err.message); }
+  }
+  state.offset += results.length;
+  if (results.length < max) { state.done = true; state.finishedAt = new Date().toISOString(); }
+  await r2put(env, "rank/recompute.json", state);
+  return state;
+}
+
+/** A player's judged plays, built from the boards the first time (see above). */
+async function judgedPlays(env, playerId, charts) {
+  const have = await r2json(env, judgedKey(playerId), null);
+  if (have && have.built) return have;
+  const found = {}, sets = new Set();
+  let reads = 0;
+  for (const [key, c] of charts || []) {
+    if (reads >= 200) break; // a very long play history: the rest come in as they play
+    if (!c || typeof c !== "object") continue;
+    const [sid, cid] = String(key).split("/");
+    const board = typeof c.board === "string" && /^osu-[0-9]+$/.test(c.board) ? c.board : sid;
+    if (!(await boardSong(env, board).catch(() => false))) continue;
+    const files = [];
+    if (/^osu-[0-9]+$/.test(board)) {
+      // an osu! set's boards are by .osu file: every board of the set is looked at once
+      if (sets.has(board)) continue;
+      sets.add(board);
+      const list = await env.RELEASES.list({ prefix: `scores/${board}/`, limit: 60 });
+      for (const o of list.objects || []) { const m = /^scores\/[^/]+\/([A-Za-z0-9_-]{1,80})\.json$/.exec(o.key); if (m) files.push(m[1]); }
+    } else if (chartIdOk(cid)) files.push(cid);
+    for (const ch of files) {
+      const k = `${board}/${ch}`;
+      if (found[k]) continue;
+      reads++;
+      const e = (await readBoard(env, board, ch)).entries.find((x) => x.playerId === playerId);
+      if (e && isNum(e.pp, 0, V.maxTotalPR) && e.pp > 0) found[k] = { pp: e.pp, acc: e.accuracy, fc: !!e.fullCombo, combo: e.maxCombo || 0, at: e.date };
+    }
+  }
+  return r2update(env, judgedKey(playerId), () => ({ v: 1, charts: {} }), (d) => {
+    d.charts ||= {};
+    for (const [k, v] of Object.entries(found)) if (!d.charts[k] || d.charts[k].pp < v.pp) d.charts[k] = v;
+    d.built = new Date().toISOString();
+  });
+}
+
+// ---------------------------------------------------------------- progress over time and the skill radar (2.0)
+// Every ranking sync keeps the day's PR, accuracy, global rank and level in rank/history/<id>.json (one point a UTC
+// day, the last of the day wins, two years at most). Before that existed, PR and accuracy are rebuilt week by week from
+// the judged best plays and their dates. The skill radar reads the same plays against each verified chart's pattern tags.
+const historyKey = (id) => `rank/history/${id}.json`;
+
+/** Keeps today's numbers for the progress graphs. */
+async function rememberDay(env, id, pp, acc, rank, level) {
+  const day = new Date(Date.now()).toISOString().slice(0, 10);
+  await r2update(env, historyKey(id), () => ({ v: 1, days: [] }), (d) => {
+    d.days ||= [];
+    const point = [day, round2(Number(pp) || 0), round2(Number(acc) || 0), Number(rank) || 0, Number(level) || 1];
+    const last = d.days[d.days.length - 1];
+    if (last && last[0] === day) {
+      if (last[1] === point[1] && last[2] === point[2] && last[3] === point[3] && last[4] === point[4]) return false;
+      d.days[d.days.length - 1] = point;
+    } else d.days.push(point);
+    if (d.days.length > 730) d.days = d.days.slice(-730);
+  });
+}
+
+/** Every verified chart's stars and pattern tags by its board key ("song/chart", osu! sets as "osu-<set>/<md5>"). */
+let shapeIndexCache = null, shapeIndexAt = 0;
+async function chartShapeIndex(env) {
+  if (shapeIndexCache && Date.now() - shapeIndexAt < 60_000) return shapeIndexCache;
+  const out = new Map();
+  for (const it of (await judgeDb(env)).items || []) {
+    if (it.type !== "charts" || it.removed || !it.verified || !it.meta) continue;
+    for (const sg of it.meta.songs || []) {
+      if (!sg || !sg.songId) continue;
+      const set = Math.round(Number(sg.osuSet) || 0), board = set > 0 ? "osu-" + set : sg.songId;
+      for (const c of sg.charts || []) {
+        const ch = set > 0 && c.osuMd5 ? c.osuMd5 : c.chartId;
+        if (!ch || !(Number(c.stars) > 0)) continue;
+        out.set(`${board}/${ch}`, { stars: Number(c.stars), keys: Number(c.keys) || 0, tags: (c.autoTags || []).map(String) });
+      }
+    }
+  }
+  shapeIndexCache = out; shapeIndexAt = Date.now();
+  return out;
+}
+
+/** The radar's axes: a name and the chart tags that count for it. */
+const SKILL_AXES = [
+  ["stream", "Stream", ["stream"]],
+  ["jumpstream", "Jumpstream", ["jumpstream"]],
+  ["handstream", "Handstream", ["handstream"]],
+  ["jacks", "Jacks", ["jacks", "chordjack"]],
+  ["ln", "Long notes", ["ln", "hybrid"]],
+  ["speed", "Speed", ["speed", "stamina"]],
+];
+
+/**
+ * A player's skill on each pattern, in stars: each judged play is a level (its stars × an accuracy factor, the same
+ * rule as Ranked placement), and an axis is the average of its 3 best levels on charts with those tags.
+ */
+function skillsFrom(plays, idx) {
+  const levels = SKILL_AXES.map(() => []), all = [];
+  for (const [k, p] of plays) {
+    const sh = idx.get(k);
+    if (!sh) continue;
+    const lv = rkLevel(sh.stars, Number(p.acc) || 0, false, !!p.fc);
+    all.push(lv);
+    SKILL_AXES.forEach(([, , tags], i) => { if (sh.tags.some((t) => tags.includes(t))) levels[i].push(lv); });
+  }
+  const top = (a, n) => { const s = [...a].sort((x, y) => y - x).slice(0, n); return s.length ? round2(s.reduce((x, y) => x + y, 0) / s.length) : 0; };
+  return { overall: top(all, 5), plays: all.length, axes: SKILL_AXES.map(([key, name], i) => ({ key, name, level: top(levels[i], 3), plays: levels[i].length })) };
+}
+
+/** What a profile's Progress shows: the kept days, the rebuilt weeks before them, and the skill radar. */
+async function progressOf(env, id) {
+  const [hist, judged, idx, reset] = await Promise.all([
+    r2json(env, historyKey(id), null), r2json(env, judgedKey(id), null), chartShapeIndex(env), r2json(env, `rank/reset/${id}.json`, null),
+  ]);
+  const resetAt = reset ? Date.parse(reset.at) || 0 : 0;
+  const plays = Object.entries((judged && judged.charts) || {})
+    .filter(([, p]) => p && isNum(p.pp, 0, V.maxTotalPR) && p.pp > 0 && isNum(p.acc, 0, 100) && !(resetAt && !(Date.parse(p.at) > resetAt)));
+  const days = ((hist && hist.days) || []).filter((d) => Array.isArray(d) && typeof d[0] === "string");
+  const built = [];
+  const dated = plays.map(([, p]) => ({ pp: round2(p.pp), acc: p.acc, t: Date.parse(p.at) || 0 })).filter((p) => p.t > 0).sort((a, b) => a.t - b.t);
+  if (dated.length) {
+    const WEEK = 7 * 86_400_000, now = Date.now();
+    const stop = days.length ? Date.parse(days[0][0] + "T00:00:00Z") : now;
+    const cur = [];
+    let i = 0;
+    for (let t = dated[0].t + WEEK; t < stop && built.length < 160; t += WEEK) {
+      while (i < dated.length && dated[i].t < t) cur.push(dated[i++]);
+      built.push([new Date(t).toISOString().slice(0, 10), totalPR(cur.map((p) => p.pp)), weightedAccuracy(cur)]);
+    }
+    // nothing kept yet: the rebuilt line ends today, at everything
+    if (!days.length) built.push([new Date(now).toISOString().slice(0, 10), totalPR(dated.map((p) => p.pp)), weightedAccuracy(dated)]);
+  }
+  return { days, built, skills: skillsFrom(plays, idx) };
 }
 
 /**
@@ -443,6 +632,7 @@ async function buildBoard(env) {
       // a recalculated total on the card (PP rework) wins over an older leaderboard entry
       pp: Number(card.ppVersion) >= PP_VERSION && typeof card.pp === "number" ? Math.round(card.pp * 100) / 100 : Math.round(e.score * 100) / 100,
       name: ov.name || card.name || meta.n || stripTag(e.playerName),
+      country: card.country || (/^[A-Z]{2}$/.test(String(meta.c || "")) ? meta.c : ""),
       accuracy: card.accuracy ?? meta.a ?? 0,
       level: card.level ?? meta.l ?? 1,
       levelProgress: card.levelProgress ?? meta.lp ?? 0,
@@ -693,6 +883,149 @@ async function statelessToken(env) {
   statelessTok = j.accessToken; statelessUntil = Date.now() + 45 * 60_000;
   return statelessTok;
 }
+/**
+ * Unity's Custom ID sign-in (server side, with the service account): with an access token it ties the id to that
+ * player; without one it signs in as the player the id is tied to. Gives { idToken, sessionToken, userId }.
+ * (Needs the Custom ID provider switched on, and the service account's "Player Authentication Token Issuer" role.)
+ */
+async function customIdSignIn(env, externalId, accessToken) {
+  const res = await fetch(`https://player-auth.services.api.unity.com/v1/projects/${env.UGS_PROJECT_ID}/authentication/server/custom-id`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", UnityEnvironment: env.UGS_ENVIRONMENT_NAME || "production", Authorization: "Bearer " + (await statelessToken(env)) },
+    body: JSON.stringify(accessToken ? { externalId, accessToken } : { externalId }),
+  });
+  const text = await res.text();
+  if (!res.ok) { console.log("custom id", res.status, text.slice(0, 300)); fail(res.status === 409 ? 409 : 502, res.status === 409 ? "That Discord is tied to another OCTIVE account." : "Unity's sign-in didn't work right now. Try again in a moment."); }
+  let j = {};
+  try { j = JSON.parse(text); } catch { /* none */ }
+  return { idToken: j.idToken, sessionToken: j.sessionToken, userId: j.userId || (j.user && j.user.id) || jwtSubject(j.idToken) };
+}
+/** The player id ("sub") inside a Unity id token. */
+function jwtSubject(t) {
+  try { const p = String(t || "").split(".")[1]; return JSON.parse(atob(p.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(p.length / 4) * 4, "="))).sub || null; } catch { return null; }
+}
+
+/**
+ * Playing inside Discord (2.0): the Activity page sends the code Discord gave it; it's exchanged for the player's
+ * Discord, and when that Discord is linked to an OCTIVE account (and tied to it for signing in), the server signs
+ * them in to that account. Not linked: the page says to link it in the game first.
+ */
+async function activityToken(request, env) {
+  const b = await bodyOf(request, 2_000);
+  const code = String(b.code || "");
+  if (!/^[A-Za-z0-9_-]{10,200}$/.test(code)) fail(400, "That Discord code isn't valid.");
+  if (!env.DISCORD_CLIENT_SECRET) fail(503, "Playing inside Discord isn't set up on the server yet.");
+  const res = await fetch("https://discord.com/api/oauth2/token", {
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: DISCORD_APP_ID, client_secret: env.DISCORD_CLIENT_SECRET, grant_type: "authorization_code", code }),
+  });
+  const tok = await res.json().catch(() => ({}));
+  if (!res.ok || !tok.access_token) fail(401, "Discord didn't accept the sign-in.");
+  const me = await fetch("https://discord.com/api/users/@me", { headers: { Authorization: "Bearer " + tok.access_token } }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  if (!me || !me.id) fail(401, "Discord didn't say who you are.");
+  const out = { access_token: tok.access_token, discordName: me.global_name || me.username || "" };
+  const playerId = await linkedPlayer(env, me.id);
+  if (!playerId) return reply({ ...out, linked: false });
+  const rec = await record(env, playerId);
+  if (!rec.discord || rec.discord.id !== me.id) return reply({ ...out, linked: false });
+  await loadModeration(config(env));
+  if (moderation.bans[playerId]) fail(403, "This account is banned.");
+  if (!rec.discord.activity) return reply({ ...out, linked: true, ready: false });
+  const s = await customIdSignIn(env, "discord-" + me.id);
+  if (!s.idToken || (s.userId && s.userId !== playerId)) fail(409, "Your Discord sign-in doesn't match your OCTIVE account: open OCTIVE, unlink and link Discord again.");
+  return reply({ ...out, linked: true, ready: true, token: s.idToken, sessionToken: s.sessionToken, playerId });
+}
+
+/**
+ * The Discord Activity's page: Discord's SDK (through the "/sdk" URL mapping), the sign-in above, every address the game
+ * reaches sent through Discord's proxy (the Developer Portal's URL mappings), then the browser build, like the website's
+ * play page. Documentation/DISCORD_ACTIVITY.md lists the mappings.
+ */
+const ACTIVITY_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>OCTIVE</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #07080e; color: #eef0ff; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; }
+  #game { width: 100%; height: 100%; display: block; background: #000; outline: none; }
+  #loading { position: fixed; inset: 0; display: grid; place-items: center; z-index: 10; background: radial-gradient(900px 500px at 50% 30%, #2a1f6644, transparent 60%), #07080e; transition: opacity .5s; }
+  #loading.gone { opacity: 0; pointer-events: none; }
+  .box { width: min(440px, 88vw); display: flex; flex-direction: column; align-items: center; gap: 16px; text-align: center; }
+  .word { font-weight: 800; letter-spacing: .4em; font-size: 24px; margin-right: -.4em; }
+  .track { width: 100%; height: 8px; border-radius: 4px; background: #ffffff10; overflow: hidden; }
+  .fill { height: 100%; width: 0; border-radius: 4px; background: linear-gradient(90deg, #8b7bff, #4fd6e8); transition: width .2s; }
+  .status { color: #9aa0bd; font-size: 14px; min-height: 1.4em; line-height: 1.6; }
+  .error { color: #ff9aaa; font-size: 15px; line-height: 1.6; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="game" tabindex="-1" aria-label="OCTIVE"></canvas></div>
+<div id="loading" role="status" aria-live="polite"><div class="box">
+  <div class="word">OCTIVE</div>
+  <div class="track"><div class="fill" id="fill"></div></div>
+  <div class="status" id="status">Connecting to Discord…</div>
+</div></div>
+<script type="module">
+import { DiscordSDK, patchUrlMappings } from "/.proxy/sdk/npm/@discord/embedded-app-sdk@2.1.0/+esm";
+const CLIENT_ID = "1569883934827745330";
+const canvas = document.getElementById("game"), fill = document.getElementById("fill"), status = document.getElementById("status"), loading = document.getElementById("loading");
+function fail(text) { status.className = "error"; status.textContent = text; fill.parentElement.hidden = true; }
+canvas.addEventListener("pointerdown", () => canvas.focus());
+// everything the game reaches goes through Discord's proxy (an Activity can't reach other addresses)
+patchUrlMappings([
+  { prefix: "/w", target: "octive-rankings-api.lunalazum18.workers.dev" },
+  { prefix: "/ugs-auth", target: "player-auth.services.api.unity.com" },
+  { prefix: "/ugs-save", target: "cloud-save.services.api.unity.com" },
+  { prefix: "/ugs-lb", target: "leaderboards.services.api.unity.com" },
+  { prefix: "/ugs-social", target: "social.services.api.unity.com" },
+  { prefix: "/ugs-lobby", target: "lobby.services.api.unity.com" },
+  { prefix: "/ugs-relay", target: "relay-allocations.services.api.unity.com" },
+  { prefix: "/ugs-api", target: "services.api.unity.com" },
+  { prefix: "/osu", target: "b.ppy.sh" },
+]);
+(async () => {
+  try {
+    const sdk = new DiscordSDK(CLIENT_ID);
+    await sdk.ready();
+    status.textContent = "Signing in with Discord…";
+    const a = await sdk.commands.authorize({ client_id: CLIENT_ID, response_type: "code", state: "", prompt: "none", scope: ["identify"] });
+    const code = a && (a.code || (a.data && a.data.code));
+    const r = await fetch("/activity/token", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: code }) });
+    const auth = await r.json().catch(() => ({}));
+    if (!r.ok) { fail(auth.error || "Couldn't sign in."); return; }
+    try { await sdk.commands.authenticate({ access_token: auth.access_token }); } catch (e) { /* the game doesn't need it */ }
+    if (!auth.linked) { fail("Link your Discord to your OCTIVE account first: in OCTIVE (on your computer, phone or the website) open Settings → Profile → Discord and link it. Then start the activity again."); return; }
+    if (!auth.ready) { fail("Almost there: open OCTIVE once, signed in, on your computer or phone (it finishes setting up Discord sign-in). Then start the activity again."); return; }
+    // the game signs in with these (WebPlatform.DiscordActivityAuth)
+    window.octiveDiscord = { token: auth.token, sessionToken: auth.sessionToken, playerId: auth.playerId, name: auth.discordName, instance: sdk.instanceId || "" };
+    status.textContent = "Finding the latest version…";
+    const m = await fetch("/releases/latest.json", { cache: "no-cache" }).then((x) => x.json());
+    if (!m || !m.web) { fail("The browser version isn't out yet."); return; }
+    const w = m.web, base = "/web/" + w.version + "/~" + (w.build || String(m.published || "").replace(/[^0-9]/g, ""));
+    status.textContent = "Loading OCTIVE " + w.version + "…";
+    const script = document.createElement("script");
+    script.src = base + "/Build/" + w.loader;
+    script.onerror = () => fail("The game couldn't be loaded. Close the activity and start it again.");
+    script.onload = () => {
+      createUnityInstance(canvas, {
+        dataUrl: base + "/Build/" + w.data, frameworkUrl: base + "/Build/" + w.framework, codeUrl: base + "/Build/" + w.code, streamingAssetsUrl: base + "/StreamingAssets",
+        companyName: "Hazelwood", productName: "OCTIVE", productVersion: w.version, matchWebGLToCanvasSize: true, autoSyncPersistentDataPath: true,
+        devicePixelRatio: Math.min(window.devicePixelRatio || 1, 2),
+      }, (p) => { fill.style.width = Math.round(p * 100) + "%"; status.textContent = p < 0.9 ? "Downloading… " + Math.round(p * 100) + "%" : "Starting…"; })
+        .then(() => { loading.classList.add("gone"); canvas.focus(); })
+        .catch((e) => fail("OCTIVE couldn't start: " + String((e && e.message) || e)));
+    };
+    document.body.appendChild(script);
+  } catch (e) { fail("OCTIVE couldn't start inside Discord: " + String((e && e.message) || e)); }
+})();
+</script>
+</body>
+</html>`;
+
 async function socialAdmin(env, method, path, body, asPlayer) {
   const ways = socialAuthWay ? [socialAuthWay] : ["bearer", "basic"];
   const tried = [];
@@ -1226,19 +1559,28 @@ async function account(request, env, route) {
         }
       }
       const name = validName(b.name) ? b.name : validName(who.username) ? who.username : "Player";
+      // their country (2.0): from where the connection comes from, every sync
+      const country = countryOf(request);
       const card = {
-        name, pp: pub.pp, accuracy: pub.accuracy, level: pub.level, levelProgress: pub.levelProgress, avatar: avatarHash,
+        name, pp: pub.pp, accuracy: pub.accuracy, level: pub.level, levelProgress: pub.levelProgress, avatar: avatarHash, country,
         totalScore: pub.totalScore, xp: pub.xp, playCount: pub.playCount, fullCombos: pub.fullCombos, maxCombo: pub.maxCombo,
         playTimeMs: pub.playTimeMs, bio: cleanBio(b.bio), devFriend: await isDevFriend(env, id).catch(() => false), rank: 0,
         socials: badgesOf(id).includes("CREATOR") ? socialsOf({ socials: b.socials }) : {},
         version: typeof b.version === "string" && /^\d{1,3}\.\d{1,3}\.\d{1,4}$/.test(b.version) ? b.version : "",
         ppVersion: pub.ppVersion, achievements: cleanAchievements(b.achievements),
       };
+      // friends see new achievements (only a few at once: a first sync, or many unlocked together, isn't news)
+      const achNow = Object.keys(card.achievements || {});
+      if (Array.isArray(rec.ach) && !official) {
+        const fresh = achNow.filter((a) => !rec.ach.includes(a));
+        if (fresh.length > 0 && fresh.length <= 8) await addFeed(env, id, { kind: "achievements", ids: fresh.slice(0, 6), n: fresh.length }).catch(() => {});
+      }
+      if (achNow.length) rec.ach = achNow;
       const platform = typeof b.platform === "string" && /^[a-z0-9-]{1,24}$/.test(b.platform) ? b.platform : "";
       let rank = 0;
       await serverWrite(async () => {
         if (!official) {
-          const meta = { n: name, l: pub.level, lp: pub.levelProgress, a: pub.accuracy, av: avatarHash, ts: pub.totalScore, pc: pub.playCount, fc: pub.fullCombos, pv: pub.ppVersion };
+          const meta = { n: name, l: pub.level, lp: pub.levelProgress, a: pub.accuracy, av: avatarHash, ts: pub.totalScore, pc: pub.playCount, fc: pub.fullCombos, pv: pub.ppVersion, c: country || undefined };
           const e = await writeScore(env, id, pub.pp, meta);
           rank = isInt(e?.rank, 0, 1e9) ? e.rank + 1 : 0;
         }
@@ -1251,7 +1593,10 @@ async function account(request, env, route) {
       rec.at = new Date(now).toISOString();
       await env.RELEASES.put(key, JSON.stringify(rec), { httpMetadata: { contentType: "application/json" } });
       cards.delete(id);
-      return reply({ ok: true, pp: pub.pp, level: pub.level, rank, held, leftOut: r.problems.length, counted: r.counted });
+      // the profile's progress graphs (what the ranking shows today), and their crew's score
+      if (!official) await rememberDay(env, id, pub.pp, pub.accuracy, rank, pub.level).catch((e) => console.log("progress day", e && e.message));
+      if (!official) await crewTouch(env, id, pub.pp).catch((e) => console.log("crew", e && e.message));
+      return reply({ ok: true, pp: pub.pp, level: pub.level, rank, held, leftOut: r.problems.length, counted: r.counted, country });
     }
     case "rank/seen": {
       // the online heartbeat (written by the server: nobody can make anyone else look online)
@@ -1358,6 +1703,57 @@ async function account(request, env, route) {
       await env.RELEASES.put(key, JSON.stringify(rec), { httpMetadata: { contentType: "application/json" } });
       return reply({ ok: true, approvedUntil: rec.approvedUntil });
     }
+    case "mod/anticheat": {
+      // Senterra / Octive: the anti-cheat's state (bans on or watching only, the trusted players); { bans } switches it
+      const b = await bodyOf(request, 2_000);
+      const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      let cfg = await r2json(env, AC_CONFIG, { bans: false });
+      if (typeof b.bans === "boolean" && b.bans !== (cfg.bans === true)) {
+        const by = await displayName(env, who.playerId);
+        cfg = { bans: b.bans, by, at: new Date().toISOString() };
+        await r2put(env, AC_CONFIG, cfg);
+        await modPost(env, { title: b.bans ? "Anti-cheat: bans are ON" : "Anti-cheat: watching only (bans off)", color: b.bans ? 0xFF4D6D : 0x5DA9FF,
+          description: b.bans ? `${modText(by, 40)} switched bans on: a sign now holds a play back, and proof bans the account (trusted players excepted).` : `${modText(by, 40)} switched bans off: the anti-cheat only posts what it would do.`,
+          timestamp: cfg.at });
+      }
+      const trusted = (await r2json(env, AC_TRUSTED, { players: {} })).players || {};
+      return reply({ ok: true, bans: cfg.bans === true, since: cfg.at || null, trusted: Object.entries(trusted).map(([id, t]) => ({ id, name: t.name, by: t.by, at: t.at })) });
+    }
+    case "mod/trust": {
+      // Senterra / Octive: a player the anti-cheat never holds back or bans (top players close to its limits)
+      const b = await bodyOf(request, 2_000);
+      const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can mark players as trusted.");
+      const id = String(b.playerId || "");
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
+      const on = b.trusted !== false;
+      const [by, name] = await Promise.all([displayName(env, who.playerId), displayName(env, id)]);
+      await r2update(env, AC_TRUSTED, () => ({ players: {} }), (d) => {
+        d.players ||= {};
+        if (on) d.players[id] = { name, by, at: new Date().toISOString() };
+        else if (d.players[id]) delete d.players[id];
+        else return false;
+      });
+      await modPost(env, { title: on ? "Anti-cheat: trusted player added" : "Anti-cheat: trusted mark removed", color: 0x5DA9FF,
+        description: `${modText(by, 40)} ${on ? "marked" : "took the mark off"} ${modText(name, 60)} (${id})${on ? ": the anti-cheat won't hold back their plays or ban them (alerts still post)." : "."}`,
+        timestamp: new Date().toISOString() });
+      return reply({ ok: true, trusted: on });
+    }
+    case "report": {
+      // a player reports another (cheating, an offensive name or picture, chat): it goes to #moderator-only
+      const b = await bodyOf(request, 4_000);
+      const who = await signedIn(request, env);
+      await fileReport(env, who, String(b.playerId || ""), b.reason, b.details, b.where);
+      return reply({ ok: true });
+    }
+    case "mod/chart-shapes": {
+      // Senterra / Octive: fill in older uploads' chart shapes now (the 6-hourly job does it a batch at a time)
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+      return reply({ ok: true, ...(await fillChartShapes(env, Math.max(1, Math.min(12, Number(b.uploads) || 6)))) });
+    }
     case "mod/verify": {
       // verify (or un-verify) a song: its charts get a global leaderboard
       const b = await bodyOf(request);
@@ -1427,7 +1823,24 @@ async function account(request, env, route) {
       const who = await signedIn(request, env);
       const rec = await record(env, who.playerId);
       const p = rec.discordPrefs || {};
-      return reply({ linked: rec.discord?.id ? { name: rec.discord.name || "", at: rec.discord.at } : null, prefs: { dmAlerts: !!p.dmAlerts, updates: !!p.updates, show: !!p.show, streak: p.streak !== false } });
+      return reply({ linked: rec.discord?.id ? { name: rec.discord.name || "", at: rec.discord.at } : null, prefs: { dmAlerts: !!p.dmAlerts, updates: !!p.updates, show: !!p.show, streak: p.streak !== false },
+        activity: !!rec.discord?.activity });
+    }
+    case "discord/activity-link": {
+      // playing inside Discord (2.0): the linked Discord becomes a way to sign in to this account (Unity's Custom ID
+      // sign-in, tied to the account with the player's own access token, this request's), so the Discord Activity can
+      // sign them in. The game asks for it once, signed in, after Discord is linked.
+      await bodyOf(request);
+      const who = await signedIn(request, env);
+      const rec = await record(env, who.playerId);
+      if (!rec.discord?.id) fail(400, "Link your Discord first.");
+      if (rec.discord.activity) return reply({ ok: true, already: true });
+      const token = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
+      const s = await customIdSignIn(env, "discord-" + rec.discord.id, token);
+      if (s.userId && s.userId !== who.playerId) fail(409, "That Discord is tied to another OCTIVE account.");
+      rec.discord.activity = true;
+      await saveRecord(env, who.playerId, rec);
+      return reply({ ok: true });
     }
     case "discord/prefs": {
       // the Discord options (linked accounts only): DMs from the bot, the updates role, Discord on the profile
@@ -2084,6 +2497,22 @@ async function discordCommand(env, it) {
       const role = !env.DISCORD_SUPPORTER_ROLE_ID ? "" : !member ? "\nJoin the OCTIVE Discord server to get the supporter role." : st.active ? "\nYou have the **OCTIVE Supporter** role." : "\nThe supporter role was removed.";
       return { embeds: [{ color: st.active ? C_PINK : C_ACCENT, title: "🔄 Updated", description: `${name}: you're ${what}.${role}` }], flags: EPHEMERAL };
     }
+    case "tournament": {
+      // staff only (Senterra and the official account, by their linked Discord): the same as the game's /tournament
+      const id = await linkedPlayer(env, user.id);
+      if (!id || (id !== OWNER && !isOfficial(id))) return { content: "Only Senterra and the official OCTIVE account run tournaments.", flags: EPHEMERAL };
+      const sub = (data.options || [])[0] || {}, so = { options: sub.options || [] };
+      const body = { action: sub.name || "status" };
+      if (sub.name === "create") {
+        const range = String(opt(so, "stars") || "").split("-").map((x) => Number(x));
+        Object.assign(body, { name: opt(so, "name"), size: opt(so, "size"), minutes: opt(so, "minutes"), lo: range[0], hi: range[1], prize: opt(so, "prize"), channel: opt(so, "channel") });
+      }
+      if (sub.name === "win") body.player = opt(so, "player");
+      try {
+        const r = await tourAdmin(env, { playerId: id }, body);
+        return { content: r.text, flags: EPHEMERAL };
+      } catch (e) { return { content: "Couldn't: " + (e.message || "error"), flags: EPHEMERAL }; }
+    }
     case "unlink": {
       const id = await linkedPlayer(env, user.id);
       if (!id) return { content: "Your Discord isn't linked to an OCTIVE account.", flags: EPHEMERAL };
@@ -2304,6 +2733,8 @@ async function chartScores(request, env, url) {
       const ks = kn ? Number(kn.chart.stars) : 0;
       if (ks > 0) entry.pp = Math.min(entry.pp, round2(playPRMax(ks + 0.15, entry.accuracy) * 1.03 + 0.5));
     } catch { /* as sent, within the limits above */ }
+    // the server-made ranking: this judged play's PR counts (its best per board), whether or not it beats their board score
+    await rememberJudged(env, who.playerId, songId, chartId, entry).catch((e) => console.log("judged play", e && e.message));
     const key = `scores/${songId}/${chartId}.json`;
     boards.delete(key);
     const data = await readBoard(env, songId, chartId);
@@ -2345,8 +2776,16 @@ async function chartScores(request, env, url) {
       }
     }
     const rank = data.entries.findIndex((e) => e.playerId === who.playerId) + 1;
+    // friends see a new best on a verified chart
+    if (improved) await addFeed(env, who.playerId, { kind: "pb", songId, chartId, title: title || data.title || undefined, difficulty: difficulty || data.difficulty || undefined,
+      score, acc: entry.accuracy, fc: !!result.fullCombo, place: rank || undefined }).catch((e) => console.log("feed", e && e.message));
+    // crew wars: a better play on one of the week's charts can raise your crew's score
+    if (improved || i < 0) await warPlay(env, who.playerId, songId, chartId, entry.pp).catch((e) => console.log("war", e && e.message));
+    // weekly (and event) missions: this judged play counts
+    const missions = await missionEvent(env, who.playerId, { kind: "board", chart: `${songId}/${chartId}`, acc: entry.accuracy, fc: !!result.fullCombo, fresh: i < 0 })
+      .catch((e) => { console.log("missions", e && e.message); return []; });
     // what the server's judging gave (the game shows it if it differs from its own)
-    return reply({ ok: true, improved, rank: rank || null, total: data.entries.length,
+    return reply({ ok: true, improved, rank: rank || null, total: data.entries.length, missions: missions.length ? missions : undefined,
       judged: { score, accuracy: Math.round(acc * 100) / 100, maxCombo: result.maxCombo, counts: result.counts, fullCombo: result.fullCombo, grade: result.grade } });
   }
   fail(404, "Not found");
@@ -3616,37 +4055,79 @@ async function chatRoutes(request, env, url, ctx) {
 
 // ---------------------------------------------------------------- shared score pictures, read back
 // A shared score's picture is drawn by the game, so the server reads it back (Workers AI, a vision model: the AI
-// binding in wrangler.toml) and compares it with the play saved to the account: the score, and the player's name
-// or the accuracy.
+// binding in wrangler.toml) before it goes on Discord: it has to be a results screen, with something on it that matches
+// the play saved to the account. The post's numbers always come from the saved play, so a misread number doesn't
+// matter; the check keeps other pictures off the Discord. (It used to need the exact score as well, and the model
+// misreads long numbers often enough that most shares lost their picture.)
 const SHARE_VISION = "@cf/meta/llama-3.2-11b-vision-instruct";
 let shareVisionAgreed = false;
-/** "ok": the picture shows this play; "fake": it isn't a results screen at all; "different" or "unread" otherwise. */
+/**
+ * { check, read, why }: check is "ok" (a results screen showing something of this play), "fake" (not a results screen
+ * at all), "different" (nothing on it matches the play) or "unread" (the model gave no usable answer).
+ */
 async function sharePictureCheck(env, bytes, want) {
-  if (!env.AI) return "unread";
+  if (!env.AI) return { check: "unread", why: "no AI binding" };
   const prompt = 'This image should be the results screen of the rhythm game OCTIVE. Reply with JSON only, no other words: {"results": true or false (is it a rhythm game results screen?), "player": "the player name written at the top", "score": "the big score number", "accuracy": "the accuracy percentage", "title": "the song title"}';
-  const run = () => env.AI.run(SHARE_VISION, { prompt, image: Array.from(bytes), max_tokens: 160, temperature: 0 });
-  let out;
-  try { out = await run(); }
-  catch (e) {
-    // the model's license is accepted once for the account
-    if (shareVisionAgreed || !/agree|licen[cs]e/i.test(String(e && e.message))) { console.log("share vision", e && e.message); return "unread"; }
-    try { await env.AI.run(SHARE_VISION, { prompt: "agree" }); shareVisionAgreed = true; out = await run(); }
-    catch (e2) { console.log("share vision", e2 && e2.message); return "unread"; }
+  const image = Array.from(bytes);
+  let why = null;
+  // two tries: now and then the model fails, or answers with something that can't be read
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let out;
+    try { out = await env.AI.run(SHARE_VISION, { prompt, image, max_tokens: 160, temperature: attempt ? 0.2 : 0 }); }
+    catch (e) {
+      why = String((e && e.message) || e).slice(0, 160);
+      // the model's license is accepted once for the account
+      if (!shareVisionAgreed && /agree|licen[cs]e/i.test(why)) {
+        try { await env.AI.run(SHARE_VISION, { prompt: "agree" }); shareVisionAgreed = true; } catch (e2) { why = String((e2 && e2.message) || e2).slice(0, 160); }
+      }
+      continue;
+    }
+    const text = String(out?.response ?? out?.description ?? "");
+    const r = readShareReply(text);
+    if (r) return matchSharePicture(r, want);
+    why = "reply: " + text.slice(0, 120);
   }
-  const m = String(out?.response ?? out?.description ?? "").match(/\{[\s\S]*\}/);
-  if (!m) return "unread";
-  let r;
-  try { r = JSON.parse(m[0]); } catch { return "unread"; }
-  if (r.results === false || r.results === "false") return "fake";
+  console.log("share vision", why);
+  return { check: "unread", why };
+}
+
+/** The model's reading of a score picture: its JSON, or the fields picked out one by one when the JSON is broken. */
+function readShareReply(text) {
+  const m = text.match(/\{[\s\S]*\}/);
+  if (m) { try { const r = JSON.parse(m[0]); if (r && typeof r === "object" && !Array.isArray(r)) return r; } catch { /* field by field */ } }
+  const field = (k) => {
+    const x = text.match(new RegExp(`"?${k}"?\\s*[:=]\\s*(?:"([^"\\n]*)"|([^,}\\n]+))`, "i"));
+    return x ? (x[1] ?? x[2]).trim() : null;
+  };
+  const r = { results: field("results"), player: field("player"), score: field("score"), accuracy: field("accuracy"), title: field("title") };
+  return Object.values(r).some((v) => v != null && v !== "") ? r : null;
+}
+
+/** Compares the model's reading with the play: any one of the score, accuracy, name or song title is enough. */
+function matchSharePicture(r, want) {
+  if (r.results === false || /^\s*false\s*$/i.test(String(r.results ?? ""))) return { check: "fake", read: r };
   const digits = (v) => String(v ?? "").replace(/[^0-9]/g, "");
-  const scoreOk = digits(r.score) !== "" && digits(r.score) === String(Math.round(want.score));
+  const got = digits(r.score);
+  const scoreOk = got.length >= 3 && digitEdits(got, String(Math.round(want.score))) <= 1;
   const a = parseFloat(String(r.accuracy ?? "").replace(",", ".").replace(/[^0-9.]/g, ""));
-  const accOk = Number.isFinite(a) && Math.abs(a - want.acc) <= 0.06;
+  const accOk = Number.isFinite(a) && Math.abs(a - want.acc) <= 0.1;
   const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-  const nameOk = norm(r.player).length >= 2 && (norm(r.player).includes(norm(want.name)) || norm(want.name).includes(norm(r.player)));
-  // the score has to be right, with the name or the accuracy (small text can be misread)
-  if (scoreOk && (accOk || nameOk)) return "ok";
-  return digits(r.score) !== "" || norm(r.player) !== "" ? "different" : "unread";
+  const near = (x, y, min) => { x = norm(x); y = norm(y); return x.length >= min && y.length >= min && (x.includes(y) || y.includes(x)); };
+  const nameOk = near(r.player, want.name, 2), titleOk = near(r.title, want.title, 3);
+  if (scoreOk || accOk || nameOk || titleOk) return { check: "ok", read: r };
+  return { check: got !== "" || norm(r.player) !== "" ? "different" : "unread", read: r };
+}
+
+/** How many digits differ between two numbers as read (Levenshtein; short strings only). */
+function digitEdits(a, b) {
+  if (Math.abs(a.length - b.length) > 2) return 3;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length];
 }
 
 /**
@@ -4071,6 +4552,65 @@ async function judgeChartOf(env, it, songId, want) {
   return null;
 }
 
+/** Puts a chart's shape on its Workshop details: len (seconds), ln (long-note share), nps (notes a second), autoTags. */
+function setChartShape(ch, st) {
+  if (!ch || !st) return;
+  ch.len = st.len; ch.ln = st.ln; ch.nps = st.nps; ch.autoTags = st.tags;
+}
+
+/**
+ * Fills in the shape of charts uploaded before shapes were worked out, a few uploads at a time, verified ones first.
+ * Each chart is read through the judge's cache (from B2 the first time). A chart that can't be read as a chart gets
+ * len 0 (not tried again); an upload whose files couldn't be fetched is tried again, three times at most. Run by the
+ * 6-hourly job and the owner's account/mod/chart-shapes.
+ */
+async function fillChartShapes(env, maxItems = 6) {
+  const db = await r2json(env, WS_DB, { items: [] });
+  const missing = (it) => it.type === "charts" && !it.removed && it.meta && (it.b2Files || []).length && (it.meta.shapeTries || 0) < 3 &&
+    (it.meta.songs || []).some((sg) => (sg.charts || []).some((c) => c.len === undefined));
+  const all = (db.items || []).filter(missing);
+  const todo = all.sort((a, b) => (b.verified ? 1 : 0) - (a.verified ? 1 : 0)).slice(0, maxItems);
+  const found = [], tried = [];
+  for (const it of todo) {
+    const songs = it.meta.songs || [], files = it.b2Files || [];
+    let any = false;
+    for (let fi = 0; fi < files.length && fi < 20; fi++) {
+      const f = files[fi];
+      if (!f || !f.key || Number(f.size) > 200 * 1048576) continue;
+      let m;
+      try { m = await judgeManifest(env, f); } catch (e) { console.log("chart shapes", it.id, e && e.message); continue; }
+      // its song in the details: by song id, else the same place in the list
+      let si = m.songId ? songs.findIndex((s) => s.songId === m.songId) : -1;
+      if (si < 0 && songs.length === files.length) si = fi;
+      if (si < 0) continue;
+      const charts = songs[si].charts || [];
+      for (let j = 0; j < charts.length && j < m.charts.length; j++) {
+        if (charts[j].len !== undefined) continue;
+        let st;
+        try { st = chartStats(await judgeCompiled(env, f, m, j)); } catch { st = { len: 0, ln: 0, nps: 0, tags: [] }; }
+        found.push([it.id, si, j, st]);
+        any = true;
+      }
+    }
+    if (!any) tried.push(it.id);
+  }
+  if (found.length || tried.length) {
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      const byId = new Map((d.items || []).map((x) => [x.id, x]));
+      for (const [id, si, j, st] of found) {
+        const sg = byId.get(id)?.meta?.songs?.[si];
+        const ch = sg?.charts?.[j];
+        if (!ch || ch.len !== undefined) continue;
+        setChartShape(ch, st);
+        if (!(sg.durationUs > 0) && st.len > 0) sg.durationUs = Math.round(st.len * 1e6);
+      }
+      for (const id of tried) { const it = byId.get(id); if (it && it.meta) it.meta.shapeTries = (it.meta.shapeTries || 0) + 1; }
+    });
+    judgeDbCache = null;
+  }
+  return { uploads: todo.length, charts: found.length, left: Math.max(0, all.length - todo.length) };
+}
+
 let judgeDbCache = null, judgeDbAt = 0;
 async function judgeDb(env) {
   if (judgeDbCache && Date.now() - judgeDbAt < 60_000) return judgeDbCache;
@@ -4108,7 +4648,8 @@ async function judgePlay(who, bytes, where, opts = {}) {
   let replay;
   try { replay = await readReplay(bytes); }
   catch (e) { if (e instanceof JudgeDataError) fail(400, "The play's replay couldn't be read: " + e.message); throw e; }
-  if (replay.version < REPLAY_VERSION) fail(400, "That replay comes from an older OCTIVE. Update the game and play it again.");
+  // (REPLAY_VERSION is the newest the judge reads; older plays are judged by the rules they were played with)
+  if (replay.version < SCORE_REPLAY_MIN) fail(400, "That replay comes from an older OCTIVE. Update the game and play it again.");
   if (replay.autoplay) fail(400, "Autoplay doesn't count.");
   if (!replay.playerId || replay.playerId !== who.playerId) fail(403, "That replay isn't your own play.");
   if (opts.noMods && (parseMods(replay.mods) !== 0 || rateOf(replay.mods) !== 1)) fail(400, opts.noModsText || "This is played without mods.");
@@ -4129,16 +4670,118 @@ function claimedAccuracy(counts) {
   return total > 0 ? c.reduce((a, n, i) => a + (Number.isFinite(n) && n > 0 ? n : 0) * ACC_WEIGHTS[i], 0) / total : null;
 }
 
-/** Writes down (for moderators; the play still counts as judged) a game that claimed more than its replay gives, or timing too exact for a person. */
-async function judgeFlags(env, playerId, what, result, claimed) {
-  const notes = [];
+// ---------------------------------------------------------------- anti-cheat (2.0)
+// Every play the server judges from its replay (board scores, daily charts, dans; Ranked when it comes) is read for signs
+// of a bot or edited numbers. It starts watching only: it posts in #moderator-only what it would do and changes nothing.
+// Once Senterra or Octive switch bans on (account/mod/anticheat), one sign holds the play back (it doesn't count) and
+// clear proof bans the account: two strong signs in one play, or the same strong sign on 3 plays. Players they mark as
+// trusted are never held back or banned by it (their alerts still post, marked trusted). Only plays sent after it was
+// added are checked. A ban goes in the moderators' list, so Unban in the player pop-up undoes it.
+const AC_CONFIG = "anticheat/config.json", AC_TRUSTED = "anticheat/trusted.json";
+const acPlayerKey = (id) => `anticheat/players/${id}.json`;
+
+/** The signs in one judged play. A strong sign is a ban when it comes with another, or on a third play. */
+function cheatSigns(result, claimed) {
+  const signs = [];
   if (claimed) {
     const s = Number(claimed.score), a = Number(claimed.accuracy);
     if ((Number.isFinite(s) && s > result.score + 5000) || (Number.isFinite(a) && a > result.accuracy + 0.5))
-      notes.push(`${what}: the game sent ${Number.isFinite(s) ? Math.round(s) + " / " : ""}${Number.isFinite(a) ? a.toFixed(2) + "%" : "?"}, its replay gives ${result.score} / ${result.accuracy.toFixed(2)}%`);
+      signs.push({ id: "numbers", strong: true, text: `the game sent ${Number.isFinite(s) ? Math.round(s) + " / " : ""}${Number.isFinite(a) ? a.toFixed(2) + "%" : "?"}, its replay gives ${result.score} / ${result.accuracy.toFixed(2)}%` });
   }
-  if (result.hits >= 100 && result.stdMs < 3) notes.push(`${what}: hit timing spread ${result.stdMs.toFixed(2)} ms over ${result.hits} hits (too exact for a person?)`);
-  for (const n of notes) await flagPlayer(env, playerId, n);
+  if (result.hits >= 100 && result.stdMs < 3)
+    signs.push({ id: "tight", strong: true, text: `hit timing spread ${result.stdMs.toFixed(2)} ms over ${result.hits} hits (people drift by several ms)` });
+  if (result.hits >= 100 && result.exactShare >= 0.4)
+    signs.push({ id: "dead-on", strong: true, text: `${Math.round(result.exactShare * 100)}% of hits within 1 ms of the note (about 8% for a person)` });
+  if (result.presses >= 100 && result.sameHold >= 0.9)
+    signs.push({ id: "same-hold", strong: true, text: `${Math.round(result.sameHold * 100)}% of ${result.presses} taps held for exactly ${result.holdMs} ms` });
+  if (result.chords >= 50 && result.sameChord >= 0.95)
+    signs.push({ id: "same-chord", strong: false, text: `${Math.round(result.sameChord * 100)}% of ${result.chords} chords pressed at the very same instant (cheap keyboards batch keys, so only a supporting sign)` });
+  return signs;
+}
+
+/**
+ * Checks a judged play (see cheatSigns) and acts on it. Watching (the start): posts what it would do in
+ * #moderator-only, the play counts. Bans on: one sign holds the play back, proof bans the account (this fails the
+ * request, so the play isn't kept). The signs also go in the moderators' flags, as before.
+ */
+async function judgeFlags(env, playerId, what, result, claimed) {
+  const signs = cheatSigns(result, claimed);
+  if (!signs.length) return;
+  for (const s of signs) await flagPlayer(env, playerId, `${what}: ${s.text}`);
+  const [cfg, trustedDoc] = await Promise.all([r2json(env, AC_CONFIG, { bans: false }), r2json(env, AC_TRUSTED, { players: {} })]);
+  const trusted = !!(trustedDoc.players || {})[playerId];
+  // strong signs are counted per player: the same one on a third play is proof
+  const strong = signs.filter((s) => s.strong);
+  let counts = {};
+  try {
+    const rec = await r2update(env, acPlayerKey(playerId), () => ({ counts: {}, plays: [] }), (d) => {
+      d.counts ||= {}; d.plays ||= [];
+      for (const s of strong) d.counts[s.id] = (d.counts[s.id] || 0) + 1;
+      d.plays.push({ at: new Date().toISOString(), what, signs: signs.map((s) => s.id) });
+      if (d.plays.length > 30) d.plays = d.plays.slice(-30);
+    });
+    counts = rec.counts || {};
+  } catch (e) { console.log("anti-cheat record", e && e.message); }
+  const repeated = strong.find((s) => (counts[s.id] || 0) >= 3);
+  const proof = strong.length >= 2 || !!repeated;
+  const live = cfg.bans === true && !trusted;
+  const name = await displayName(env, playerId).catch(() => playerId);
+  const verdict = proof ? (live ? "Banned" : "Would ban") : (live ? "Play held back" : "Would hold the play back");
+  await modPost(env, {
+    title: `Anti-cheat: ${verdict}${trusted ? " (trusted player: nothing done)" : ""}`,
+    color: proof ? 0xFF4D6D : 0xF2C14E,
+    description: cfg.bans === true ? "Bans are on." : "Watching only: nothing was done to the player or the play.",
+    fields: [
+      { name: "Player", value: `${modText(name, 60)} · \`${playerId}\`\n${SITE}#/u/${encodeURIComponent(playerId)}`, inline: false },
+      { name: "Play", value: modText(what, 200) || "?", inline: false },
+      { name: "Signs", value: signs.map((s) => `${s.strong ? "•" : "◦"} ${s.text}${repeated && s.id === repeated.id ? ` (on ${counts[s.id]} plays now)` : ""}`).join("\n").slice(0, 1000), inline: false },
+    ],
+    footer: { text: proof ? (repeated && strong.length < 2 ? "Proof: the same sign on 3 plays" : "Proof: two strong signs in one play") : "One sign" },
+    timestamp: new Date().toISOString(),
+  });
+  if (!live) return;
+  if (proof) await anticheatBan(env, playerId, name, signs.map((s) => s.text).join("; "));
+  fail(409, proof
+    ? "This account was banned by OCTIVE's anti-cheat. If you think that's a mistake, ask the moderators on the OCTIVE Discord."
+    : "This play was held back for a check by the moderators, so it doesn't count.");
+}
+
+/** Bans a player in the moderators' list (so Unban in the player pop-up undoes it), from the anti-cheat. */
+async function anticheatBan(env, playerId, name, reason) {
+  const cfg = config(env);
+  const cur = (await publicItems(cfg, OWNER, ["moderation-mods"]).catch(() => ({})))["moderation-mods"] || {};
+  const list = { bans: cur.bans || {}, overrides: cur.overrides || {}, updated: new Date().toISOString() };
+  list.bans[playerId] = { name, reason: ("Anti-cheat: " + reason).slice(0, 200), by: "OCTIVE anti-cheat", byId: "anti-cheat", at: new Date().toISOString() };
+  await serverWrite(() => saveItem(env, OWNER, "moderation-mods", JSON.stringify(list), true));
+  await loadModeration(cfg); moderationAt = Date.now();
+  cards.delete(playerId);
+}
+
+let modChannel = null, modChannelAt = 0;
+/** #moderator-only, the staff's private channel on the OCTIVE Discord: found by name (cached 10 minutes). */
+async function modChannelId(env) {
+  if (modChannel && Date.now() - modChannelAt < 600_000) return modChannel;
+  const list = await discordApi(env, "GET", `/guilds/${env.DISCORD_GUILD_ID}/channels`);
+  const c = (list || []).find((x) => x.name === "moderator-only" && (x.type === 0 || x.type === 5));
+  modChannel = c ? c.id : null; modChannelAt = Date.now();
+  return modChannel;
+}
+
+/** Posts an embed in #moderator-only (anti-cheat, player reports, trusted marks). Never fails what it's part of. */
+async function modPost(env, embed) {
+  try {
+    if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID) return false;
+    const ch = await modChannelId(env);
+    if (!ch) { console.log("moderator post: #moderator-only not found (or the bot can't see it)"); return false; }
+    await discordApi(env, "POST", `/channels/${ch}/messages`, { embeds: [embed], allowed_mentions: { parse: [] } });
+    return true;
+  } catch (e) { console.log("moderator post", e && e.message); return false; }
+}
+
+/** Plain words for an embed: no mentions, links or markdown from players' text. */
+function modText(v, max) {
+  return String(v ?? "").replace(/[\u0000-\u001F\u007F\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF]/g, " ")
+    .replace(/<[@#:][^>]*>/g, "").replace(/@(everyone|here)/gi, "$1").replace(/[\[\]<>*_~`|\\]/g, "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
 // The same play sent by someone else (a replay passed on or downloaded from a board, its player id changed): the hit
@@ -4208,10 +4851,11 @@ async function wsMeta(kind, u8) {
       const m = JSON.parse(new TextDecoder().decode(await zipRead(u8, man, 4 * 1048576)));
       const tags = Array.isArray(m.song?.tags) ? m.song.tags : [];
       const set = tags.map((t) => /^osu-set:(\d+)$/i.exec(String(t))).find(Boolean);
-      return {
+      const src = (Array.isArray(m.charts) ? m.charts : []).slice(0, 60);
+      const out = {
         songId: String(m.songId || "").slice(0, 100) || null, title: String(m.song?.title || "").slice(0, 160), artist: String(m.song?.artist || "").slice(0, 160),
         bpm: Number(m.song?.bpm) || 0, durationUs: Number(m.song?.durationUs) || 0, osuSet: set ? Number(set[1]) : 0,
-        charts: (Array.isArray(m.charts) ? m.charts : []).slice(0, 60).map((c) => ({
+        charts: src.map((c) => ({
           difficulty: String(c.difficulty || "").slice(0, 100), keys: Number(c.keyCount) || 0, stars: Math.round((Number(c.rating) || 0) * 100) / 100,
           notes: Number(c.noteCount) || 0, creator: String(c.creator || "").slice(0, 60),
           // the chart's own id, and (charts from osu!) its .osu file's MD5: what the verified-copy check compares
@@ -4220,6 +4864,18 @@ async function wsMeta(kind, u8) {
           od: Number.isFinite(Number(c.od)) && c.od !== null && Number(c.od) >= 0 && Number(c.od) <= 10 ? Number(c.od) : undefined,
         })),
       };
+      // each chart's shape (its length, long notes, density and pattern tags), worked out from its notes
+      const byName = new Map(entries.map((e) => [e.name.split(BACKSLASH).join("/").toLowerCase(), e]));
+      for (let i = 0; i < src.length; i++) {
+        try {
+          const e = byName.get(String(src[i]?.file || "").split(BACKSLASH).join("/").toLowerCase());
+          const bytes = e ? await zipRead(u8, e, 16 * 1048576) : null;
+          if (!bytes) continue;
+          setChartShape(out.charts[i], chartStats(compileChart(loadChart(new TextDecoder().decode(bytes)))));
+        } catch { /* left without: filled in later by fillChartShapes */ }
+      }
+      if (!(out.durationUs > 0)) out.durationUs = Math.round(Math.max(0, ...out.charts.map((c) => c.len || 0)) * 1e6);
+      return out;
     }
     if (kind === "skins") {
       const entries = zipEntries(u8);
@@ -4423,7 +5079,7 @@ async function retireItems(env, id) {
   let cur = await walletOf(env, id);
   // Senterra and the official account: everything in the shop is theirs
   if (infinitePoints(id)) {
-    const all = SHOP.filter((x) => OWNABLE.includes(x.kind) && shopActive(x)).map((x) => x.id);
+    const all = SHOP.filter((x) => OWNABLE.includes(x.kind) && shopActive(x) && !x.reward).map((x) => x.id); // (Ranked's season rewards are earned)
     if (all.some((x) => !(cur.owned || []).includes(x))) {
       cur = (await walletUpdate(env, id, (w) => { for (const x of all) if (!w.owned.includes(x)) w.owned.push(x); })) || cur;
       await writeCosmetics(env, id, cur);
@@ -4470,7 +5126,14 @@ function titlesAtoZ(list) {
   let i = 0;
   return list.map((x) => (x.kind === "title" ? titles[i++] : x));
 }
-const shopFor = (url) => titlesAtoZ(url.searchParams.get("all") === "1" ? SHOP.filter((x) => shopActive(x)) : SHOP.filter((x) => shopActive(x) && (!x.minVersion || versionAtLeast(url.searchParams.get("v"), x.minVersion))));
+const shopFor = (url) => {
+  rkEnsureRewardItems(); ensureSeasonCollections();
+  if (url.searchParams.get("all") === "1") return titlesAtoZ(SHOP.filter((x) => shopActive(x) && !x.reward));
+  const v = url.searchParams.get("v"), now = Date.now();
+  // past seasons' collections stay in the game's list (their owners can still see and use them), not for sale
+  return titlesAtoZ(SHOP.filter((x) => (!x.minVersion || versionAtLeast(v, x.minVersion)) && (shopActive(x, now) || (x.collection != null && Date.parse(x.from) <= now)))
+    .map((x) => (x.collection != null && !shopActive(x, now) ? { ...x, reward: true, note: `Season ${x.collection} collection (no longer in the shop)` } : x)));
+};
 
 const newWallet = () => ({ balance: 0, earned: 0, streak: 0, bestStreak: 0, lastDay: null, freezes: 0, owned: [], equipped: {}, showcase: [], dans: {}, attempts: {}, history: [] });
 async function walletOf(env, id) { return { ...newWallet(), ...(await r2json(env, `points/${id}.json`, null) || {}) }; }
@@ -4508,7 +5171,8 @@ async function writeCosmetics(env, id, w) {
   const hd = highestDanClear(w);
   const best = hd ? DAN_LEVELS.indexOf(hd.level) : -1;
   const e = { title: w.equipped.title || undefined, frame: w.equipped.frame || undefined, icon: w.equipped.icon || undefined, titleColor: w.equipped.titleColor || undefined, iconColor: w.equipped.iconColor || undefined, iconsV2: w.iconsV2 || undefined, hasShowcase: (w.owned || []).includes("showcase") || undefined,
-    showcase: (w.showcase || []).length ? w.showcase : undefined, dan: best >= 0 ? DAN_LEVELS[best] : undefined, danClear: hd ? danClearPublic(hd.d) : undefined, dans: Object.keys(w.dans || {}).length || undefined };
+    showcase: (w.showcase || []).length ? w.showcase : undefined, dan: best >= 0 ? DAN_LEVELS[best] : undefined, danClear: hd ? danClearPublic(hd.d) : undefined, dans: Object.keys(w.dans || {}).length || undefined,
+    crew: w.crew && w.crew.id ? { id: w.crew.id, tag: w.crew.tag, color: w.crew.color } : undefined };
   const empty = Object.values(e).every((v) => v === undefined);
   await r2update(env, COSMETICS_KEY, () => ({ players: {} }), (d) => { d.players ||= {}; if (empty) delete d.players[id]; else d.players[id] = e; });
   cosmeticsCache = null;
@@ -4726,13 +5390,16 @@ function findVerified(idx, songId, difficulty, board) {
 /** Writes dan clears ({ e, acc, at }) to a wallet when they beat what's there; the wallet when anything changed. */
 async function recordDanClears(env, playerId, found) {
   if (!found.length) return null;
-  return walletUpdate(env, playerId, (w) => {
+  let firsts = [];
+  const w = await walletUpdate(env, playerId, (w) => {
     w.dans ||= {};
     let changed = false;
+    firsts = [];
     for (const { e, acc, at } of found) {
       const key = `${e.dan.songId}|${e.dan.difficulty}`;
       const a = Math.round(acc * 100) / 100;
       if (w.dans[key] && w.dans[key].acc >= a) continue;
+      if (!w.dans[key]) firsts.push({ level: e.dan.level, title: String(e.song.title || e.it.title || "").slice(0, 80), acc: a });
       const when = Date.parse(at);
       w.dans[key] = { level: e.dan.level, acc: a, at: Number.isFinite(when) ? new Date(when).toISOString() : new Date().toISOString(),
         title: String(e.song.title || e.it.title || "").slice(0, 80), difficulty: String(e.dan.difficulty).slice(0, 60) };
@@ -4741,6 +5408,38 @@ async function recordDanClears(env, playerId, found) {
     }
     if (!changed) return false;
   });
+  // friends see a dan cleared for the first time
+  for (const f of firsts) await addFeed(env, playerId, { kind: "dan", level: f.level, title: f.title, acc: f.acc }).catch(() => {});
+  return w;
+}
+
+// ---- the friends feed (2.0): what each player did lately (a rank-up, a new best on a verified chart, an upload, new
+// achievements, a dan cleared), kept by the server in feed/<id>.json (the last 40), and read for a player's friends.
+const FEED_KEEP = 40;
+async function addFeed(env, id, item) {
+  if (!okPlayerId(id) || isOfficial(id)) return;
+  const entry = { at: new Date(Date.now()).toISOString(), ...item };
+  await r2update(env, `feed/${id}.json`, () => ({ items: [] }), (d) => { d.items = [entry, ...(d.items || [])].slice(0, FEED_KEEP); });
+}
+const feedCache = new Map();
+/** A player's friends' feed: the last three weeks, newest first (friends from the message server's copy of their list). */
+async function feedFor(env, me) {
+  const c = feedCache.get(me);
+  if (c && Date.now() - c.at < 60_000) return c.data;
+  const box = await r2json(env, dmInboxKey(me), null);
+  const friends = ((box && box.friends) || []).filter((f) => f && okPlayerId(f.id) && !isOfficial(f.id) && !moderation.bans[f.id]).slice(0, 80);
+  const since = Date.now() - 21 * 86_400_000, out = [];
+  for (let i = 0; i < friends.length; i += 10) {
+    await Promise.all(friends.slice(i, i + 10).map(async (f) => {
+      const d = await r2json(env, `feed/${f.id}.json`, null);
+      for (const it of (d && d.items) || []) if (Date.parse(it.at) > since) out.push({ ...it, who: f.id, name: f.name || "Friend" });
+    }));
+  }
+  out.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  const data = { items: out.slice(0, 100), friends: friends.length };
+  feedCache.set(me, { at: Date.now(), data });
+  if (feedCache.size > 2000) feedCache.delete(feedCache.keys().next().value);
+  return data;
 }
 // Dan clears only come from /play/dan/clear, judged from the play's replay. (Until 1.6.6 the ranking sync also credited
 // clears from a player's synced plays, which carry only the game's own numbers: that's gone.)
@@ -4749,9 +5448,2266 @@ async function displayName(env, id) {
   try { const ov = moderation.overrides[id] || {}; return String(ov.name || (await publicItems(config(env), id, ["card"])).card?.name || "Player").slice(0, 40); } catch { return "Player"; }
 }
 
+/**
+ * A player's report about another (the player pop-up's Report, a Ranked match's): checked, rate-limited (5 an hour, the
+ * same player once a day), posted to #moderator-only with the anti-cheat's record, and kept in R2 reports/log.json.
+ */
+async function fileReport(env, who, id, reasonKey, detailsRaw, whereRaw) {
+  const cfg = config(env);
+  await loadModeration(cfg);
+  if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
+  if (id === who.playerId) fail(400, "You can't report yourself.");
+  const REASONS = { cheating: "Cheating", name: "Offensive name or picture", chat: "Harassment or spam in chat", other: "Something else" };
+  const reason = REASONS[String(reasonKey || "")] ? String(reasonKey) : null;
+  if (!reason) fail(400, "Pick a reason.");
+  const details = modText(detailsRaw, 300), where = modText(whereRaw, 60) || "Player pop-up";
+  // a few reports an hour, and the same player once a day
+  const now = Date.now(), rateKey = `reports/rate/${who.playerId}.json`;
+  const rate = await r2json(env, rateKey, { times: [], targets: {} });
+  rate.times = (rate.times || []).filter((t) => now - t < 3_600_000);
+  rate.targets = Object.fromEntries(Object.entries(rate.targets || {}).filter(([, t]) => now - t < 86_400_000));
+  if (rate.times.length >= 5) fail(429, "You've sent a lot of reports this hour. Try again later.");
+  if (rate.targets[id]) fail(429, "You've already reported this player today. The moderators have it.");
+  rate.times.push(now); rate.targets[id] = now;
+  await r2put(env, rateKey, rate);
+  const [byName, name, ac] = await Promise.all([displayName(env, who.playerId), displayName(env, id), r2json(env, acPlayerKey(id), null)]);
+  const acLine = ac && ac.counts && Object.keys(ac.counts).length ? Object.entries(ac.counts).map(([k, n]) => `${k} x${n}`).join(", ") : "none";
+  const posted = await modPost(env, {
+    title: `Player report: ${REASONS[reason]}`, color: 0xFF8A3D,
+    fields: [
+      { name: "Reported", value: `${modText(name, 60)} (${id}) ${SITE}#/u/${encodeURIComponent(id)}`, inline: false },
+      { name: "By", value: `${modText(byName, 60)} (${who.playerId})`, inline: true },
+      { name: "Where", value: where, inline: true },
+      ...(details ? [{ name: "What they said", value: details, inline: false }] : []),
+      { name: "Anti-cheat signs on record", value: acLine, inline: false },
+    ],
+    timestamp: new Date(now).toISOString(),
+  });
+  await r2update(env, "reports/log.json", () => ({ reports: [] }), (d) => {
+    d.reports ||= [];
+    d.reports.push({ at: new Date(now).toISOString(), by: who.playerId, player: id, reason, details, where, posted });
+    if (d.reports.length > 300) d.reports = d.reports.slice(-300);
+  }).catch(() => {});
+}
+
+// ================================================================ Ranked (2.0)
+// 1v1, best of 3, 4K only, on verified Workshop charts chosen by star rating. The server runs every match: it picks the
+// charts, takes the bans, judges each play from its replay, plays the AI opponents (botPlay: a real input stream judged
+// like anyone's, which the game shows as a live score), decides the rounds and moves the ranks.
+//   Ranks: Rookie (until placed), Contender, Challenger, Rockstar, Superstar, Elite (I-III each), Champion and Legend
+//   (Legends are numbered by a hidden rating). A 0-100% bar per division and no demotion within a season.
+//   Seasons: a month each, from midnight UTC on the 1st (Season 0 runs from 2.0's launch to the next month); a new season
+//   moves everyone 4 steps down.
+//   Placement: three solo songs (2-3.5, 4-4.5 and 5-6 stars) shown one at a time; the best one places you (Contender I
+//   to Superstar II). Quitting one fails all three.
+//   Leaving mid-song (or quitting during bans, closing the game, a crash, not coming back) fails every song of the
+//   match: a 2-0 loss. Ranked opens after 10 played songs.
+// Kept in R2: ranked/players/<id>.json (a player's rank), ranked/matches/<id>.json, ranked/queue.json, ranked/board.json.
+// 7K Ranked (2.0): a second ladder on 7K charts with its own queue, board, ranks and seasons (ranked/7k/...; a match
+// says which ladder it's on in m.mode). It opens once the Workshop has RK_MIN_SONGS verified 7K songs (staff can try it
+// before; opened at 2.0's launch with 10); its seasons give their own titles ("Season N 7K Rockstar") and points.
+const RK_NAMES = ["Rookie", "Contender I", "Contender II", "Contender III", "Challenger I", "Challenger II", "Challenger III",
+  "Rockstar I", "Rockstar II", "Rockstar III", "Superstar I", "Superstar II", "Superstar III", "Elite I", "Elite II", "Elite III", "Champion", "Legend"];
+// each rank: [first tier, last tier, lowest stars, highest stars] (a chart right on a boundary belongs to the higher rank)
+const RK_GROUPS = [[1, 3, 2, 3], [4, 6, 3, 4], [7, 9, 4, 5], [10, 12, 5, 5.5], [13, 15, 5.5, 6], [16, 16, 6, 6.5], [17, 17, 6.5, 8]];
+const RK_LEGEND = 17, RK_PLACEMENT_CAP = 11, RK_BOT_MAX_TIER = 15, RK_UNLOCK_PLAYS = 10;
+const RK_BOT_MIN = 7_000, RK_BOT_MAX = 11_000, RK_ACCEPT = 10_000, RK_BAN = 10_000, RK_ROUND_GAP = 15_000, RK_QUEUE_STALE = 8_000, RK_RESERVE = 20_000;
+const RK_SEASON0_MONTH = 2026 * 12 + 10; // Season 0's month (November 2026): set to 2.0's launch month
+const RK_PLACE_BANDS = [[2, 3.5], [4, 4.5], [5, 6]];
+const rkMode = (m) => (Number(m) === 7 ? 7 : 4);
+const rkPrefix = (mode) => (rkMode(mode) === 7 ? "ranked/7k/" : "ranked/");
+const rkQueueKey = (mode) => rkPrefix(mode) + "queue.json", rkBoardKey = (mode) => rkPrefix(mode) + "board.json";
+const RK_QUEUE = rkQueueKey(4), RK_BOARD = rkBoardKey(4);
+const RK_MIN_SONGS = 5; // (a ladder opens with this many verified songs of its keys: a round shows 5; with fewer than 15 a match's later rounds may repeat a song)
+const rkPlayerKey = (id, mode) => `${rkPrefix(mode)}players/${id}.json`, rkMatchKey = (id) => `ranked/matches/${id}.json`;
+// each round's plays (the gzip replay files, for the match's history) and the friendly-match invites a player has
+const rkReplayKey = (mid, n, i) => `ranked/replays/${mid}/${n}-${i}.octreplay`, rkInviteKey = (id) => `ranked/invites/${id}.json`;
+const RK_INVITE_TTL = 120_000;
+const rkSeasonKey = (n, mode) => `${rkPrefix(mode)}seasons/${n}.json`;
+// live matches (anyone can watch): the list, and each round's play as it's sent (every second or two)
+const RK_LIVE = "ranked/live/index.json", rkLiveKey = (mid, n, i) => `ranked/live/${mid}/${n}-${i}.json`;
+const RK_DISCORD = "ranked/discord.json";
+const rkStars = (t) => { for (const [a, b, lo, hi] of RK_GROUPS) if (t >= a && t <= b) return [lo, hi]; return [2, 3]; };
+const rkBotRating = (t) => 900 + t * 60;
+const rkNewId = () => [...crypto.getRandomValues(new Uint8Array(10))].map((x) => x.toString(16).padStart(2, "0")).join("");
+const rkSeed = () => crypto.getRandomValues(new Uint32Array(1))[0];
+const rkScope = (c) => `ranked|${c.itemId}|${c.songId}|${c.chartId || c.difficulty}`;
+
+function rkSeason(now = Date.now()) {
+  const d = new Date(now), m = d.getUTCFullYear() * 12 + d.getUTCMonth();
+  return { n: Math.max(0, m - RK_SEASON0_MONTH), ends: Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) };
+}
+
+// ---- season rewards, by the highest rank reached in a season (granted once, the first time a player is in Ranked after it
+// ends): shop points; a "Season N <rank>" title; from Superstar the rank's emblem as a leaderboard icon; from Elite a rank
+// frame; for Legend a gold icon colour; and the season's top 10 Legends a numbered title. They're shop items nobody can buy.
+const RK_GROUP_KEYS = [null, "contender", "challenger", "rockstar", "superstar", "elite", "champion", "legend"];
+const RK_GROUP_NAMES = [null, "Contender", "Challenger", "Rockstar", "Superstar", "Elite", "Champion", "Legend"];
+const RK_REWARD_POINTS = [0, 300, 600, 1000, 1500, 2500, 4000, 6000];
+const rkGroupOf = (t) => (t <= 0 ? 0 : t <= 15 ? Math.floor((t - 1) / 3) + 1 : t === 16 ? 6 : 7);
+function rkRewardItems(upTo) {
+  const r = { price: 0, reward: true, minVersion: "2.0.0" }, out = [];
+  for (const [g, name] of [["superstar", "Superstar"], ["elite", "Elite"], ["champion", "Champion"], ["legend", "Legend"]])
+    out.push({ ...r, id: `icon-rank-${g}`, kind: "icon", name: `${name} emblem`, shape: `rank-${g}`, color: "#FFFFFF", note: `Reach ${name} in a Ranked season` });
+  out.push({ ...r, id: "frame-rank-elite", kind: "frame", name: "Elite frame", color: "#B880FF", note: "Reach Elite in a Ranked season" });
+  out.push({ ...r, id: "frame-rank-champion", kind: "frame", name: "Champion frame (animated)", color: "#FF6180", anim: "pulse", note: "Reach Champion in a Ranked season" });
+  out.push({ ...r, id: "frame-rank-legend", kind: "frame", name: "Legend frame (animated)", color: "#FFE894", color2: "#FFFFFF", anim: "duo", note: "Reach Legend in a Ranked season" });
+  out.push({ ...r, id: "iconcolor-legend", kind: "iconcolor", name: "Legend gold icon colour", color: "#FFD95A", note: "Reach Legend in a Ranked season" });
+  for (let n = 0; n <= upTo; n++) {
+    for (let g = 1; g <= 7; g++) out.push({ ...r, id: `title-s${n}-${RK_GROUP_KEYS[g]}`, kind: "title", name: `Season ${n} ${RK_GROUP_NAMES[g]}`, note: `Reach ${RK_GROUP_NAMES[g]} in Ranked season ${n}` });
+    for (let k = 1; k <= 10; k++) out.push({ ...r, id: `title-s${n}-legend-${k}`, kind: "title", name: `Season ${n} Legend #${k}`, note: `Finish Ranked season ${n} as Legend #${k}` });
+    for (let g = 1; g <= 7; g++) out.push({ ...r, id: `title-s${n}-7k-${RK_GROUP_KEYS[g]}`, kind: "title", name: `Season ${n} 7K ${RK_GROUP_NAMES[g]}`, note: `Reach ${RK_GROUP_NAMES[g]} in 7K Ranked season ${n}` });
+    for (let k = 1; k <= 10; k++) out.push({ ...r, id: `title-s${n}-7k-legend-${k}`, kind: "title", name: `Season ${n} 7K Legend #${k}`, note: `Finish 7K Ranked season ${n} as Legend #${k}` });
+  }
+  return out;
+}
+let rkRewardsUpTo = -1;
+/** The reward items in the shop's list, up to next season's (new seasons' titles appear as the months go by). */
+function rkEnsureRewardItems() {
+  const want = rkSeason().n + 1;
+  if (rkRewardsUpTo >= want) return;
+  const have = new Set(SHOP.map((x) => x.id));
+  for (const x of rkRewardItems(want)) if (!have.has(x.id)) SHOP.push(x);
+  rkRewardsUpTo = want;
+}
+
+/** Where a player finished among a season's Legends (by rating), from its final standings; null when they weren't one. */
+async function rkLegendNumber(env, id, n, mode) {
+  const [board, past] = await Promise.all([r2json(env, rkBoardKey(mode), { players: {} }), r2json(env, rkSeasonKey(n, mode), { players: {} })]);
+  const all = { ...(past.players || {}) };
+  for (const [pid, p] of Object.entries(board.players || {})) if (p && p.season === n) all[pid] = p;
+  const legends = Object.entries(all).filter(([pid, p]) => p && p.tier >= RK_LEGEND && !isOfficial(pid) && !moderation.bans[pid]).sort((a, b) => (b[1].rating || 0) - (a[1].rating || 0));
+  const i = legends.findIndex(([pid]) => pid === id);
+  return i >= 0 ? i + 1 : null;
+}
+
+/** Grants the rewards of the seasons a player has finished and not been rewarded for; gives their record (with the summary to show). */
+async function rkSeasonRewards(env, id, rec, mode) {
+  const due = (rec.seasons || []).filter((x) => !x.rewarded);
+  if (!due.length) return rec;
+  rkEnsureRewardItems();
+  const k7 = rkMode(mode) === 7, tag = k7 ? "7k-" : "";
+  const grants = [];
+  for (const sn of due) {
+    const tier = sn.peak || sn.tier || 0, g = rkGroupOf(tier);
+    if (g <= 0) continue;
+    const items = [`title-s${sn.n}-${tag}${RK_GROUP_KEYS[g]}`];
+    if (g >= 4) items.push(`icon-rank-${RK_GROUP_KEYS[g]}`);
+    if (g >= 5) items.push(`frame-rank-${RK_GROUP_KEYS[g]}`);
+    if (g >= 7) items.push("iconcolor-legend");
+    let legend = null;
+    if ((sn.tier || 0) >= RK_LEGEND) { legend = await rkLegendNumber(env, id, sn.n, mode); if (legend && legend <= 10) items.push(`title-s${sn.n}-${tag}legend-${legend}`); }
+    grants.push({ n: sn.n, tier, group: g, points: RK_REWARD_POINTS[g], items, legend, stats: sn.stats || {}, wins: sn.wins || 0, losses: sn.losses || 0 });
+  }
+  const free = infinitePoints(id);
+  let applied = [];
+  if (grants.length) {
+    const listKey = k7 ? "seasonRewards7k" : "seasonRewards"; // (each ladder's seasons are rewarded on their own)
+    await walletUpdate(env, id, (w) => {
+      applied = [];
+      w[listKey] ||= [];
+      for (const gr of grants) {
+        if (w[listKey].includes(gr.n)) continue; // (once a season, whatever happens)
+        applied.push(gr);
+        w[listKey].push(gr.n);
+        if (!free) { w.balance = (w.balance || 0) + gr.points; w.earned = (w.earned || 0) + gr.points; }
+        for (const it of gr.items) if (!w.owned.includes(it)) w.owned.push(it);
+        remember(w, { kind: "season", season: gr.n, rank: (k7 ? "7K " : "") + (RK_NAMES[gr.tier] || ""), points: gr.points });
+      }
+      if (!applied.length) return false;
+    });
+  }
+  const summary = applied.length ? {
+    at: Date.now(), seen: false, mode: k7 ? 7 : 4,
+    seasons: applied.map((gr) => ({ n: gr.n, tier: gr.tier, rank: RK_NAMES[gr.tier] || "", points: gr.points, legend: gr.legend, stats: gr.stats, wins: gr.wins, losses: gr.losses,
+      items: gr.items.map((x) => { const it = SHOP.find((y) => y.id === x); return { id: x, kind: it ? it.kind : null, name: it ? it.name : x, shape: it ? it.shape : undefined, color: it ? it.color : undefined }; }) })),
+  } : null;
+  return rkChange(env, id, (d) => {
+    for (const x of d.seasons) if (due.some((y) => y.n === x.n)) x.rewarded = true;
+    if (summary) d.reward = summary;
+  }, mode);
+}
+
+const rkFresh = (n) => ({ v: 1, season: n, tier: 0, progress: 0, rating: 1000, placed: false, wins: 0, losses: 0, streak: 0, peak: 0, recent: [], seasons: [], settled: [], active: null });
+
+/** A record moved into this season when a new one has started: 4 steps down for each new season, the bar back to 0. */
+function rkRoll(rec, n) {
+  rec.settled ||= []; rec.recent ||= []; rec.seasons ||= [];
+  if (!(rec.season < n)) return rec;
+  if (rec.placed) {
+    if (!rec.seasons.some((x) => x.n === rec.season))
+      rec.seasons = [...rec.seasons, { n: rec.season, tier: rec.tier, peak: rec.peak || rec.tier, wins: rec.wins || 0, losses: rec.losses || 0, rating: Math.round(rec.rating || 0), stats: rec.stats || {} }].slice(-24);
+    rec.tier = Math.max(1, rec.tier - 4 * (n - rec.season));
+    rec.peak = rec.tier;
+  } else rec.placement = null;
+  rec.progress = 0; rec.streak = 0; rec.wins = 0; rec.losses = 0; rec.recent = []; rec.active = null; rec.season = n; rec.stats = {};
+  return rec;
+}
+
+async function rkLoad(env, id, mode) {
+  const n = rkSeason().n;
+  return rkRoll((await r2json(env, rkPlayerKey(id, mode), null)) || rkFresh(n), n);
+}
+
+/** Changes a player's rank record safely: the change runs again when another request wrote it at the same moment. */
+const rkChange = (env, id, change, mode) => { const n = rkSeason().n; return r2update(env, rkPlayerKey(id, mode), () => rkFresh(n), (d) => change(rkRoll(d, n))); };
+// the same with the ladder first (rankedRoutes and rkSettle: rkChange(env, … becomes rkChangeM(mode, env, …)
+const rkLoadM = (mode, env, id) => rkLoad(env, id, mode);
+const rkChangeM = (mode, env, id, change) => rkChange(env, id, change, mode);
+const rkBoardSetM = (mode, env, id, rec, name) => rkBoardSet(env, id, rec, name, mode);
+const rkPoolM = (mode, env) => rkPool(env, mode);
+const rkUnlockedM = (mode, env, id, rec) => rkUnlocked(env, id, rec, mode);
+const rkLegendNoM = (mode, env, id, rec) => rkLegendNo(env, id, rec, mode);
+const rkBoardListM = (mode, env, n) => rkBoardList(env, n, mode);
+const rkSeasonRewardsM = (mode, env, id, rec) => rkSeasonRewards(env, id, rec, mode);
+const rkNewMatchM = (mode, ...args) => { const m = rkNewMatch(...args); if (rkMode(mode) === 7) m.mode = 7; return m; };
+
+/** The ranked board (the Ranked tab): every placed player's rank this season. */
+async function rkBoardSet(env, id, rec, name, mode) {
+  if (!rec || !rec.placed) return;
+  let finished = null;
+  await r2update(env, rkBoardKey(mode), () => ({ players: {} }), (d) => {
+    d.players ||= {};
+    const old = d.players[id] || {};
+    finished = typeof old.season === "number" && old.season < rec.season ? old : null;
+    d.players[id] = { name: name || old.name || "Player", tier: rec.tier, progress: Math.round(rec.progress), rating: Math.round(rec.rating),
+      season: rec.season, wins: rec.wins || 0, losses: rec.losses || 0, platform: rec.platform || old.platform || "" };
+  }).catch((e) => console.log("ranked board", e && e.message));
+  // (the season it came from keeps it: its final standings number the Legends)
+  if (finished) await r2update(env, rkSeasonKey(finished.season, mode), () => ({ players: {} }), (d) => { d.players ||= {}; if (d.players[id]) return false; d.players[id] = finished; })
+    .catch((e) => console.log("ranked season archive", e && e.message));
+}
+
+const rkNames = new Map();
+async function rkName(env, id) {
+  const c = rkNames.get(id);
+  if (c && Date.now() - c.at < 600_000) return c.name;
+  const name = await displayName(env, id);
+  rkNames.set(id, { name, at: Date.now() });
+  return name;
+}
+
+function rkPublic(rec, legendNo = null) {
+  const t = rec.tier || 0;
+  return { tier: t, name: RK_NAMES[t] || "Rookie", progress: Math.round(rec.progress || 0), placed: !!rec.placed, wins: rec.wins || 0, losses: rec.losses || 0,
+    streak: rec.streak || 0, peak: rec.peak || 0, peakName: RK_NAMES[rec.peak || 0] || "Rookie", legend: legendNo, stars: rkStars(Math.max(1, t)), seasons: (rec.seasons || []).slice(-6),
+    statsNow: rec.stats || {}, season: rec.season };
+}
+
+/** Every verified chart of a ladder's keys (4 or 7) Ranked can pick, with what the ban screen shows (cached a minute, like the judge's list). */
+const rkPoolCache = { 4: null, 7: null }, rkPoolAt = { 4: 0, 7: 0 };
+async function rkPool(env, mode) {
+  const keys = rkMode(mode);
+  if (rkPoolCache[keys] && Date.now() - rkPoolAt[keys] < 60_000) return rkPoolCache[keys];
+  const out = [];
+  for (const it of (await judgeDb(env)).items || []) {
+    if (it.type !== "charts" || it.removed || !it.verified || !it.meta || !(it.b2Files || []).length) continue;
+    for (const sg of it.meta.songs || []) {
+      if (!sg || !sg.songId) continue;
+      for (const c of sg.charts || []) {
+        const stars = Number(c.stars);
+        if (Number(c.keys) !== keys || !(stars > 0) || c.len === 0) continue; // (len 0: a chart the server couldn't read)
+        out.push({
+          itemId: it.id, version: it.version || 1, songId: sg.songId, chartId: c.chartId || null, osuMd5: c.osuMd5 || null, difficulty: c.difficulty || "",
+          stars, title: sg.title || it.title || "", artist: sg.artist || "", creator: c.creator || it.creator || "", bpm: Math.round(Number(sg.bpm) || 0),
+          notes: Number(c.notes) || 0, len: Math.round(Number(c.len) || (Number(sg.durationUs) || 0) / 1e6), ln: Math.round((Number(c.ln) || 0) * 100) / 100,
+          tags: [...new Set([...(c.autoTags || []), ...(Array.isArray(it.tags) ? it.tags : [])].map(String))].slice(0, 5),
+          preview: it.preview ? `${WORKER_BASE}/api/preview/${it.id}` : null, osuSet: Number(sg.osuSet) || 0, keys,
+        });
+      }
+    }
+  }
+  rkPoolCache[keys] = out; rkPoolAt[keys] = Date.now();
+  return out;
+}
+
+/** How many different songs a ladder can pick from (it opens at RK_MIN_SONGS). */
+const rkPoolSongs = async (env, mode) => new Set((await rkPool(env, mode)).map((c) => c.songId)).size;
+
+/** n charts in a star range, one per song and none from songs already used; widens the range when there aren't enough. */
+function rkPick(pool, lo, hi, n, used, rnd) {
+  let cand = [];
+  for (let widen = 0; widen <= 2; widen += 0.25) {
+    cand = pool.filter((c) => c.stars >= lo - widen && c.stars < hi + widen && !used.has(c.songId));
+    if (new Set(cand.map((c) => c.songId)).size >= n) break;
+  }
+  for (let i = cand.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [cand[i], cand[j]] = [cand[j], cand[i]]; }
+  const outside = (c) => Math.ceil(Math.max(0, lo - c.stars, c.stars - hi + 1e-9) / 0.25); // the ones in range first
+  cand.sort((a, b) => outside(a) - outside(b));
+  const out = [], songs = new Set();
+  for (const c of cand) { if (songs.has(c.songId)) continue; songs.add(c.songId); out.push({ ...c }); if (out.length >= n) break; }
+  return out.sort((a, b) => a.stars - b.stars);
+}
+
+async function rkUnlocked(env, id, rec, mode) {
+  if (id === OWNER || isOfficial(id) || rec.unlocked) return { ok: true, plays: null };
+  let plays = 0;
+  try { const s = (await privateItems(env, id, ["scores"])).scores; if (s && typeof s === "object") plays = Math.max(0, Math.floor(Number(s.totalPlays) || 0)); }
+  catch (e) { console.log("ranked plays", e && e.message); }
+  if (plays >= RK_UNLOCK_PLAYS) await rkChange(env, id, (d) => { d.unlocked = true; }, mode);
+  return { ok: plays >= RK_UNLOCK_PLAYS, plays };
+}
+
+// the AI opponents: made-up players (a name nobody on the ranked board has, a picture drawn from a number)
+const RK_BOT_A = ["neo", "kai", "luna", "rin", "hex", "zen", "vex", "aki", "sora", "miko", "juno", "nyx", "echo", "pix", "drift", "nova", "haze", "rio",
+  "kuro", "yuki", "mika", "remi", "taro", "ivy", "jinx", "koda", "lumi", "milo", "nami", "orbit", "sable", "tempo", "kiri", "ash", "rue", "piko"];
+const RK_BOT_B = ["", "", "", "x", "beats", "tap", "fm", "flux", "line", "keys", "rush", "jack", "wave", "mania", "chord", "sync", "dash", "byte", "z"];
+function rkBotName(rnd, taken) {
+  for (let i = 0; i < 30; i++) {
+    let n = RK_BOT_A[Math.floor(rnd() * RK_BOT_A.length)] + RK_BOT_B[Math.floor(rnd() * RK_BOT_B.length)];
+    if (rnd() < 0.5) n += String(Math.floor(rnd() * 100));
+    if (rnd() < 0.3) n = n[0].toUpperCase() + n.slice(1);
+    if (rnd() < 0.15) n += "_";
+    if (n.length >= 3 && !taken.has(n.toLowerCase())) return n;
+  }
+  return "player" + Math.floor(rnd() * 100000);
+}
+
+function rkNewMatch(id, a, b, now, taken) {
+  const seed = rkSeed(), rnd = seededRandom(seed);
+  const m = { v: 1, id, season: rkSeason(now).n, created: now, seed, kind: b ? "human" : "bot", players: [a, b], state: "accept", acceptBy: now + RK_ACCEPT,
+    accepted: [false, false], score: [0, 0], rounds: [], used: [], winner: null, leaver: null, results: [null, null], settled: false };
+  if (!b) {
+    m.players[1] = { bot: true, name: rkBotName(rnd, taken), tier: a.tier, rating: rkBotRating(a.tier), avatar: Math.floor(rnd() * 1e9), platform: rnd() < 0.7 ? "Windows" : "Android" };
+    m.accepted[1] = true; m.botAcceptAt = now + 900 + Math.floor(rnd() * 2200);
+  }
+  return m;
+}
+
+async function rkNewRound(env, m, opens) {
+  const mode = rkMode(m.mode);
+  const ranges = m.players.map((p) => rkStars(Math.max(1, p.tier)));
+  // players of different ranks get the range between theirs (a tournament match: the tournament's)
+  const lo = m.stars ? m.stars[0] : (ranges[0][0] + ranges[1][0]) / 2, hi = m.stars ? m.stars[1] : (ranges[0][1] + ranges[1][1]) / 2;
+  const rnd = seededRandom((m.seed + (m.rounds.length + 1) * 7919) >>> 0);
+  const pool = await rkPool(env, mode);
+  let charts = rkPick(pool, lo, hi, 5, new Set(m.used), rnd);
+  if (charts.length < 2) charts = rkPick(pool, lo, hi, 5, new Set(), rnd); // (a small pool: a song may come up again)
+  if (charts.length < 2) { m.state = "cancelled"; m.why = "There aren't enough verified charts for Ranked yet."; return; }
+  for (const c of charts) m.used.push(c.songId);
+  const r = { n: m.rounds.length + 1, charts, bans: [null, null], opens, banBy: opens + RK_BAN, pick: null, playFrom: null, playBy: null, results: [null, null], winner: null };
+  if (m.players[1].bot) {
+    // the AI bans too (most often the hardest chart), a few seconds in; it plays at 90-96%
+    let hardest = 0;
+    charts.forEach((c, i) => { if (c.stars > charts[hardest].stars) hardest = i; });
+    r.bans[1] = rnd() < 0.55 ? hardest : Math.floor(rnd() * charts.length);
+    r.botBanAt = opens + 1800 + Math.floor(rnd() * 5600);
+    r.botAcc = 90 + rnd() * 6;
+  }
+  m.rounds.push(r);
+  m.state = "bans";
+}
+
+/** Bans are in: a random chart from the ones left (one the judge can read), and the AI's play of it. */
+async function rkResolvePick(env, m, r, now) {
+  const banned = new Set(r.bans.filter((x) => x !== null));
+  let left = r.charts.map((_, i) => i).filter((i) => !banned.has(i));
+  if (!left.length) left = r.charts.map((_, i) => i);
+  const rnd = seededRandom((m.seed ^ Math.imul(r.n, 104729)) >>> 0);
+  for (let i = left.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [left[i], left[j]] = [left[j], left[i]]; }
+  const db = (await judgeDb(env)).items || [];
+  for (const k of left) {
+    const c = r.charts[k];
+    const it = db.find((x) => x.id === c.itemId);
+    let where = null;
+    try { where = it ? await judgeChartOf(env, it, c.songId, { chartId: c.chartId, osuMd5: c.osuMd5, difficulty: c.difficulty }) : null; }
+    catch (e) { console.log("ranked chart", c.itemId, e && e.message); }
+    if (!where) continue;
+    r.pick = k;
+    c.chartId = where.chartId || c.chartId; c.difficulty = where.difficulty || c.difficulty;
+    r.playFrom = now; r.playBy = now + Math.max(60, c.len || 240) * 1500 + 180_000;
+    if (m.players[1].bot) {
+      const bp = botPlay(where.compiled, r.botAcc, (m.seed ^ Math.imul(r.n, 2654435761)) >>> 0);
+      r.live = bp.inputs;
+      r.results[1] = { acc: round2(bp.result.accuracy), score: bp.result.score, maxCombo: bp.result.maxCombo, fullCombo: !!bp.result.fullCombo, failed: false, at: now + Math.round((c.len || 120) * 1000) };
+    }
+    m.state = "play";
+    return;
+  }
+  m.state = "cancelled"; m.why = "The server couldn't read these charts. Try again in a moment.";
+}
+
+function rkDecideRound(m, r) {
+  const [a, b] = r.results;
+  let w;
+  if (a.failed !== b.failed) w = a.failed ? 1 : 0;
+  else if (a.acc !== b.acc) w = a.acc > b.acc ? 0 : 1;
+  else if (a.score !== b.score) w = a.score > b.score ? 0 : 1;
+  else w = a.at <= b.at ? 0 : 1;
+  r.winner = w;
+  m.score[w]++;
+}
+
+function rkEnd(m, winner, now, leaver = null) {
+  m.state = "done"; m.winner = winner; m.leaver = leaver; m.ended = now;
+  if (leaver === 0 || leaver === 1) { m.score[leaver] = 0; m.score[1 - leaver] = 2; } // leaving fails every song of the match
+}
+
+/** Moves a match on as time passes and plays come in: accept, bans, the pick, rounds, the end. */
+async function rkAdvance(env, m, now) {
+  for (let guard = 0; guard < 8; guard++) {
+    if (m.state === "accept") {
+      const botIn = !m.players[1].bot || now >= (m.botAcceptAt || 0);
+      if (m.accepted[0] && m.accepted[1] && botIn) { await rkNewRound(env, m, now + 2000); continue; }
+      if (now > m.acceptBy) { m.state = "cancelled"; m.why = "The match wasn't accepted in time."; m.declined = m.accepted.map((x) => !x); }
+      return;
+    }
+    if (m.state === "bans") {
+      const r = m.rounds[m.rounds.length - 1];
+      if (now < r.opens) return;
+      const both = r.bans[0] !== null && r.bans[1] !== null && (!m.players[1].bot || now >= r.botBanAt);
+      // (timed at the ban deadline when nobody was looking then: closing the game during bans doesn't stop the clock)
+      if (both || now >= r.banBy) { await rkResolvePick(env, m, r, Math.min(now, r.banBy)); continue; }
+      return;
+    }
+    if (m.state === "play") {
+      const r = m.rounds[m.rounds.length - 1];
+      if (r.results[0] && r.results[1]) {
+        rkDecideRound(m, r);
+        if (m.score[0] >= 2 || m.score[1] >= 2) { rkEnd(m, m.score[0] >= 2 ? 0 : 1, now); return; }
+        await rkNewRound(env, m, now + RK_ROUND_GAP);
+        continue;
+      }
+      // a play that never came back counts as leaving
+      if (now > r.playBy) {
+        if (!r.results[0] && !r.results[1]) rkEnd(m, null, now, "both");
+        else { const gone = r.results[0] ? 1 : 0; rkEnd(m, 1 - gone, now, gone); }
+      }
+      return;
+    }
+    return;
+  }
+}
+
+/**
+ * How far a match moves the progress bar: about +25% for a win and -20% for a loss, then the adjustments below. Gives the
+ * change and its parts ([what, %] in order, adding up to it), which the end of a match shows as tags.
+ */
+function rkDelta(rec, opp, won, acc, stars, mine, theirs, left) {
+  const parts = [];
+  let d = 0;
+  const add = (what, v) => { v = Math.round(v); if (v) { parts.push([what, v]); d += v; } };
+  const gap = Math.max(-4, Math.min(4, (opp.tier || rec.tier) - rec.tier));
+  add(won ? "Win" : left ? "Left the match" : "Loss", won ? 25 : -20);
+  // 5% for each division between the players
+  if (gap) add(won ? (gap > 0 ? "Beat a higher rank" : "Lower-ranked opponent") : (gap > 0 ? "Higher-ranked opponent" : "Lost to a lower rank"), 5 * gap);
+  const [lo, hi] = rkStars(Math.max(1, rec.tier));
+  const st = Math.max(-4, Math.min(8, (stars - (lo + hi) / 2) * 8)); // harder charts count for more
+  add(st >= 0 ? "Harder charts" : "Easier charts", st);
+  if (won && acc > 95) add("Accuracy over 95%", Math.min(8, (acc - 95) * 2));
+  if (!won && !left && acc >= 96 && d < 0) add("96%+ accuracy", -d * 0.4); // a loss at 96% or better costs less
+  if (won && theirs === 0) add("2-0 sweep", 5);
+  if (!won && !left && mine === 1 && d < 0) add("Close 1-2", -d * 0.25); // a close loss costs less
+  if (won && (rec.streak || 0) >= 2) add("Win streak", 5); // the third win in a row, and on
+  const slow = [1, 1, 1, 1, 0.95, 0.95, 0.95, 0.9, 0.9, 0.9, 0.85, 0.85, 0.85, 0.8, 0.8, 0.8, 0.75, 0.7][rec.tier] ?? 1;
+  if (won && slow < 1) add("Higher ranks climb slower", d * (slow - 1));
+  let total = won ? Math.max(5, Math.min(70, d)) : Math.min(-3, Math.max(-45, d));
+  if (left) total = Math.min(total, -20); // leaving is always a full loss
+  if (total !== d) parts.push([won ? "Minimum gain" : d > total ? "Minimum loss" : "Maximum loss", total - d]);
+  return { delta: total, parts };
+}
+
+/** A finished match moves each player's rank once (each record keeps the matches it has counted). */
+async function rkSettle(env, m) {
+  const mode = rkMode(m.mode);
+  if (m.state !== "done" || m.settled) return false;
+  m.results = m.results || [null, null];
+  const rounds = m.rounds.filter((r) => r.winner !== null && r.pick !== null);
+  for (let i = 0; i < 2; i++) {
+    const p = m.players[i];
+    if (!p || p.bot) continue;
+    const opp = m.players[1 - i], won = m.winner === i, left = m.leaver === i || m.leaver === "both";
+    const accs = rounds.map((r) => r.results[i] && r.results[i].acc).filter((x) => typeof x === "number");
+    const acc = accs.length ? accs.reduce((s, x) => s + x, 0) / accs.length : 0;
+    const stars = rounds.length ? rounds.reduce((s, r) => s + r.charts[r.pick].stars, 0) / rounds.length : null;
+    let result = null, applied = false;
+    const rec = await rkChangeM(mode, env, p.id, (d) => {
+      applied = false;
+      if (d.settled.includes(m.id)) { result = (d.recent.find((x) => x.match === m.id) || {}).result || null; return false; }
+      applied = true;
+      d.settled = [m.id, ...d.settled].slice(0, 40);
+      if (d.active === m.id) d.active = null;
+      if (m.kind === "friendly" || m.kind === "tournament") { // a friendly or tournament match: in the recent list, the rank doesn't move
+        d.recent = [{ at: new Date(m.ended || Date.now()).toISOString(), match: m.id, won, left, friendly: true, tournament: m.kind === "tournament" ? m.tournamentName || true : undefined, score: [m.score[i], m.score[1 - i]], opp: opp.name, oppTier: opp.tier }, ...d.recent].slice(0, 20);
+        return;
+      }
+      if (d.season !== m.season || !d.placed) return; // a match from last season doesn't move this season's rank
+      const before = { tier: d.tier, progress: Math.round(d.progress) };
+      const { delta, parts } = rkDelta(d, opp, won, acc, stars ?? rkStars(Math.max(1, d.tier))[0], m.score[i], m.score[1 - i], left);
+      const exp = 1 / (1 + Math.pow(10, ((opp.rating || 1000) - d.rating) / 400));
+      d.rating = Math.round((d.rating + 32 * ((won ? 1 : 0) - exp)) * 10) / 10; // the hidden rating: orders the Legends
+      if (won) { d.wins = (d.wins || 0) + 1; d.streak = (d.streak || 0) + 1; } else { d.losses = (d.losses || 0) + 1; d.streak = 0; }
+      d.progress = (d.progress || 0) + delta;
+      let ups = 0;
+      while (d.progress >= 100 && d.tier < RK_LEGEND) { d.progress -= 100; d.tier++; ups++; }
+      d.progress = Math.max(0, Math.min(100, d.progress)); // no demotion within a season
+      d.peak = Math.max(d.peak || 0, d.tier);
+      // the season's numbers (its recap)
+      const st = d.stats ||= {};
+      st.matches = (st.matches || 0) + 1;
+      st.rounds = (st.rounds || 0) + rounds.length;
+      st.roundsWon = (st.roundsWon || 0) + rounds.filter((r) => r.winner === i).length;
+      for (const r of rounds) {
+        const a = r.results[i] && r.results[i].acc;
+        if (typeof a === "number") { st.accSum = Math.round(((st.accSum || 0) + a) * 100) / 100; st.accN = (st.accN || 0) + 1; st.bestAcc = Math.max(st.bestAcc || 0, a); }
+        const t = String(r.charts[r.pick].title || "").slice(0, 80);
+        if (t) { st.songs ||= {}; st.songs[t] = (st.songs[t] || 0) + 1; }
+      }
+      if (st.songs && Object.keys(st.songs).length > 12) st.songs = Object.fromEntries(Object.entries(st.songs).sort((a, b) => b[1] - a[1]).slice(0, 12));
+      if (won && m.score[1 - i] === 0) st.sweeps = (st.sweeps || 0) + 1;
+      if (won && rounds.length >= 3 && rounds[0].winner !== i) st.comebacks = (st.comebacks || 0) + 1;
+      st.bestStreak = Math.max(st.bestStreak || 0, d.streak || 0);
+      if (ups) st.rankUps = (st.rankUps || 0) + ups;
+      result = { before, after: { tier: d.tier, progress: Math.round(d.progress) }, delta, parts, rankUp: ups > 0, won, left };
+      d.recent = [{ at: new Date(m.ended || Date.now()).toISOString(), match: m.id, won, left, score: [m.score[i], m.score[1 - i]], opp: opp.name, oppTier: opp.tier, result }, ...d.recent].slice(0, 20);
+    });
+    m.results[i] = result;
+    await rkBoardSetM(mode, env, p.id, rec, p.name);
+    // the week's "win Ranked rounds" mission (Ranked matches only, counted once: the record's settled list says so)
+    if (m.kind !== "friendly" && m.kind !== "tournament" && applied && result) await missionEvent(env, p.id, { kind: "ranked", roundsWon: rounds.filter((r) => r.winner === i).length }).catch((e) => console.log("missions", e && e.message));
+    // friends see a rank-up
+    if (m.kind !== "friendly" && m.kind !== "tournament" && applied && result && result.rankUp) await addFeed(env, p.id, { kind: "rankup", tier: result.after.tier, rank: (mode === 7 ? "7K " : "") + (RK_NAMES[result.after.tier] || "") }).catch(() => {});
+  }
+  m.settled = true;
+  // a tournament match: its winner goes through
+  if (m.kind === "tournament") await tourMatchDone(env, m).catch((e) => console.log("tournament", e && e.message));
+  return true;
+}
+
+/** Reads, changes and writes a match safely when both players act at once (the change runs again after a clash). */
+async function rkUpdateMatch(env, id, change) {
+  for (let i = 0; i < 6; i++) {
+    const o = await env.RELEASES.get(rkMatchKey(id));
+    if (!o) fail(404, "That match can't be found.");
+    const m = await o.json();
+    const was = JSON.stringify(m);
+    await change(m);
+    let ok = JSON.stringify(m) === was;
+    if (!ok) ok = !!(await env.RELEASES.put(rkMatchKey(id), JSON.stringify(m), { httpMetadata: { contentType: "application/json" }, onlyIf: { etagMatches: o.etag } }));
+    if (ok) { if (await rkSettle(env, m)) await r2put(env, rkMatchKey(id), m); return m; }
+  }
+  fail(503, "The match is busy. Try again in a moment.");
+}
+
+/** A match as one player sees it: both players, the round's charts and bans, results (the opponent's after the round). */
+function rkView(m, me, now, wantLive = false) {
+  const opp = m.players[1 - me], you = m.players[me], r = m.rounds[m.rounds.length - 1] || null;
+  const pub = (p) => ({ name: p.name, tier: p.tier, rank: RK_NAMES[p.tier] || "Rookie", id: p.bot ? null : p.id, picture: p.bot ? p.avatar : null, platform: p.platform || "" });
+  const done = m.state === "done";
+  const v = {
+    id: m.id, mode: rkMode(m.mode), kind: m.kind === "friendly" || m.kind === "tournament" ? "friendly" : "ranked", tournament: m.kind === "tournament" ? m.tournamentName || "Tournament" : undefined, created: m.created, season: m.season, state: m.state, why: m.why || null, now, score: [m.score[me], m.score[1 - me]], acceptBy: m.acceptBy, accepted: !!m.accepted[me],
+    oppAccepted: !!m.accepted[1 - me] && (!opp.bot || now >= (m.botAcceptAt || 0)), you: pub(you), opp: pub(opp),
+    rounds: m.rounds.filter((x) => x.winner !== null).map((x) => ({ n: x.n, chart: x.charts[x.pick], mine: x.results[me], theirs: x.results[1 - me], won: x.winner === me })),
+    winner: done ? m.winner === me : null, left: done ? m.leaver === me || m.leaver === "both" : null, oppLeft: done && (m.leaver === 1 - me || m.leaver === "both"),
+    result: m.results ? m.results[me] : null,
+  };
+  if (r) {
+    const botIn = !opp.bot || now >= (r.botBanAt || 0);
+    const shown = (r.bans[0] !== null && r.bans[1] !== null && botIn) || now >= r.banBy || r.pick !== null;
+    v.round = {
+      n: r.n, opens: r.opens, banBy: r.banBy, charts: r.charts, myBan: r.bans[me], oppBanned: r.bans[1 - me] !== null && botIn,
+      oppBan: shown ? r.bans[1 - me] : null, pick: r.pick, playFrom: r.playFrom, playBy: r.playBy, mine: r.results[me], decided: r.winner !== null,
+      won: r.winner === null ? null : r.winner === me, theirs: r.winner !== null ? r.results[1 - me] : null,
+      live: wantLive && r.pick !== null && r.live ? r.live : null,
+    };
+  }
+  return v;
+}
+
+/** A match for its players' history: every round's five charts, both bans, the pick and both plays, the rank change. */
+function rkSummary(m, me) {
+  const opp = m.players[1 - me], you = m.players[me];
+  const pub = (p) => ({ name: p.name, tier: p.tier, rank: RK_NAMES[p.tier] || "Rookie", id: p.bot ? null : p.id, picture: p.bot ? p.avatar : null, platform: p.platform || "" });
+  const done = m.state === "done";
+  const chart = (c) => ({ itemId: c.itemId, songId: c.songId, chartId: c.chartId, difficulty: c.difficulty, stars: c.stars, title: c.title, artist: c.artist,
+    creator: c.creator, bpm: c.bpm, notes: c.notes, len: c.len, ln: c.ln, tags: c.tags, preview: c.preview, osuSet: c.osuSet || 0 });
+  return {
+    id: m.id, mode: rkMode(m.mode), kind: m.kind === "friendly" || m.kind === "tournament" ? "friendly" : "ranked", tournament: m.kind === "tournament" ? m.tournamentName || "Tournament" : undefined, state: m.state, season: m.season, created: m.created, ended: m.ended || null,
+    score: [m.score[me], m.score[1 - me]], winner: done ? m.winner === me : null, left: done ? m.leaver === me || m.leaver === "both" : null,
+    oppLeft: done && (m.leaver === 1 - me || m.leaver === "both"), you: pub(you), opp: pub(opp), result: m.results ? m.results[me] : null,
+    rounds: m.rounds.filter((r) => r.pick !== null).map((r) => ({
+      n: r.n, charts: r.charts.map(chart), bans: [r.bans[me], r.bans[1 - me]], pick: r.pick,
+      mine: r.results[me], theirs: r.winner !== null ? r.results[1 - me] : null, won: r.winner === null ? null : r.winner === me,
+      replays: { mine: !!(r.replays && r.replays[me]), theirs: r.winner !== null && (opp.bot ? !!r.live : !!(r.replays && r.replays[1 - me])) },
+    })),
+  };
+}
+
+/** An AI opponent's play as a replay file (the same gzip JSON the game saves), from its inputs. */
+async function rkBotReplay(m, r, p) {
+  const c = r.charts[r.pick];
+  const rep = { format: "octive.replay", version: 3, octiveVersion: "2.0.0", player: p.name, songId: c.songId, chartId: c.chartId, title: c.title,
+    difficulty: c.difficulty, keyCount: rkMode(m.mode), playedAt: new Date(r.playFrom || m.created).toISOString(), autoplay: false, inputs: r.live };
+  const gz = new Response(new Blob([JSON.stringify(rep)]).stream().pipeThrough(new CompressionStream("gzip")));
+  return new Uint8Array(await gz.arrayBuffer());
+}
+
+function rkB64(u8) {
+  let bin = "";
+  for (let i = 0; i < u8.length; i += 0x8000) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+/** Judges a ranked or placement play from its replay (no mods; a replay counts once; the anti-cheat reads it too). */
+async function rkJudge(env, who, b, c, what) {
+  const rep = replayBytes(b.replay);
+  if (!rep) fail(400, "A ranked play only counts with its replay. Update OCTIVE.");
+  const it = ((await judgeDb(env)).items || []).find((x) => x.id === c.itemId);
+  const where = it ? await judgeChartOf(env, it, c.songId, { chartId: c.chartId, osuMd5: c.osuMd5, difficulty: c.difficulty }) : null;
+  let result;
+  try { ({ result } = await judgePlay(who, rep, where, { what: "A ranked play", noMods: true, noModsText: "Ranked is played without mods." })); }
+  catch (e) { if (e.status === 400 && /^Nothing was hit/.test(e.message || "")) return { accuracy: 0, score: 0, maxCombo: 0, fullCombo: false, signature: null }; throw e; }
+  await refuseCopies(env, rkScope(c), who, result, false);
+  const claimed = b.claimed && typeof b.claimed === "object" && b.failed !== true ? { accuracy: Number(b.claimed.accuracy) } : null;
+  await judgeFlags(env, who.playerId, what, result, claimed);
+  return result;
+}
+
+/** A placement song's level: its stars by how well it went (95%+ counts fully), a little more for a full combo. */
+function rkLevel(stars, acc, failed, fc) {
+  let f;
+  if (failed || acc < 50) f = 0.3;
+  else if (acc >= 95) f = 1;
+  else if (acc >= 90) f = 0.85 + (acc - 90) / 5 * 0.15;
+  else if (acc >= 80) f = 0.6 + (acc - 80) / 10 * 0.25;
+  else f = 0.3 + (acc - 50) / 30 * 0.3;
+  return stars * f + (fc && !failed ? 0.1 : 0);
+}
+/** The division a placement level gives: the rank whose stars it's in, thirds of the range for I/II/III. */
+function rkTierOfLevel(level) {
+  for (const [a, b, lo, hi] of RK_GROUPS) {
+    if (level >= hi && a !== RK_LEGEND) continue;
+    if (level < lo) return Math.max(1, a);
+    return Math.min(RK_PLACEMENT_CAP, a + Math.min(b - a, Math.floor((level - lo) / (hi - lo) * (b - a + 1))));
+  }
+  return RK_PLACEMENT_CAP;
+}
+
+async function rkLegendNo(env, id, rec, mode) {
+  if (rec.tier < RK_LEGEND) return null;
+  const all = (await r2json(env, rkBoardKey(mode), { players: {} })).players || {};
+  const legends = Object.entries(all).filter(([, p]) => p.tier >= RK_LEGEND && p.season === rec.season).sort((a, b) => b[1].rating - a[1].rating);
+  const i = legends.findIndex(([pid]) => pid === id);
+  return i >= 0 ? i + 1 : legends.length + 1;
+}
+
+/** Keeps a match's line in the live list (anyone can watch Ranked): added while it's on, gone when it ends. */
+async function rkLiveIndex(env, m) {
+  const on = m.state === "accept" || m.state === "bans" || m.state === "play";
+  const r = m.rounds[m.rounds.length - 1] || null;
+  const pub = (p) => ({ name: p.name, tier: p.tier, id: p.bot ? null : p.id, picture: p.bot ? p.avatar : null });
+  const c = r && r.pick !== null ? r.charts[r.pick] : null;
+  const entry = on ? { id: m.id, mode: rkMode(m.mode), kind: m.kind === "friendly" || m.kind === "tournament" ? "friendly" : "ranked", tournament: m.kind === "tournament" ? m.tournamentName || "Tournament" : undefined, state: m.state, players: m.players.map(pub), score: m.score, round: r ? r.n : 0,
+    chart: c ? { title: c.title, artist: c.artist, difficulty: c.difficulty, stars: c.stars, preview: c.preview } : null, playFrom: c ? r.playFrom : null, created: m.created } : null;
+  await r2update(env, RK_LIVE, () => ({ matches: {} }), (d) => {
+    d.matches ||= {};
+    const now = Date.now();
+    let changed = false;
+    for (const [k, v] of Object.entries(d.matches)) if (now - (v.at || 0) > 20 * 60_000) { delete d.matches[k]; changed = true; }
+    const old = d.matches[m.id];
+    if (!entry) { if (old) { delete d.matches[m.id]; changed = true; } return changed ? undefined : false; }
+    if (old && now - (old.at || 0) < 60_000) { const { at, ...rest } = old; if (JSON.stringify(rest) === JSON.stringify(entry)) return changed ? undefined : false; }
+    d.matches[m.id] = { ...entry, at: now };
+  }).catch((e) => console.log("ranked live", e && e.message));
+}
+
+/** This season's ranked board, best first (Legends by rating), without banned players and the official account. */
+async function rkBoardList(env, n, mode) {
+  const all = (await r2json(env, rkBoardKey(mode), { players: {} })).players || {};
+  return Object.entries(all).filter(([pid, p]) => p && p.season === n && !moderation.bans[pid] && !isOfficial(pid))
+    .sort((x, y) => y[1].tier - x[1].tier || (x[1].tier >= RK_LEGEND ? y[1].rating - x[1].rating : y[1].progress - x[1].progress) || y[1].wins - x[1].wins)
+    .map(([pid, p], i) => ({ id: pid, name: p.name, tier: p.tier, rank: RK_NAMES[p.tier] || "Rookie", progress: p.progress, wins: p.wins || 0, losses: p.losses || 0,
+      platform: p.platform || "", place: i + 1, legend: p.tier >= RK_LEGEND ? i + 1 : null }));
+}
+
+// ---- the weekly top 10 (Mondays from 18:00 UTC) and a season's final standings, posted by the bot. Off until Senterra or
+// Octive switch it on (/ranked discord on); the channel is found by name (#octive-scores unless they pick another).
+const RK_HEX = ["#9AA3B8", "#E08F54", "#CCDBF2", "#FFCC4D", "#54DEF5", "#B880FF", "#FF6180", "#FFE894"];
+function rkTopEmbed(list, title, description) {
+  const lines = list.slice(0, 10).map((p, i) => `**#${i + 1}** ${modText(p.name, 30)} · ${p.rank}${p.legend ? ` #${p.legend}` : ""}${p.tier < RK_LEGEND ? ` (${p.progress}%)` : ""} · ${p.wins}W ${p.losses}L`);
+  return { title, description: (description ? description + "\n\n" : "") + (lines.length ? lines.join("\n") : "Nobody is placed yet."),
+    color: parseInt(RK_HEX[rkGroupOf(list[0] ? list[0].tier : 0)].slice(1), 16), footer: { text: "OCTIVE Ranked" }, timestamp: new Date().toISOString() };
+}
+async function rkChannelByName(env, name) {
+  const list = await discordApi(env, "GET", `/guilds/${env.DISCORD_GUILD_ID}/channels`);
+  const c = (list || []).find((x) => x.name === name && (x.type === 0 || x.type === 5));
+  return c ? c.id : null;
+}
+function isoWeek(d) {
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const day = t.getUTCDay() || 7; t.setUTCDate(t.getUTCDate() + 4 - day);
+  const y = new Date(Date.UTC(t.getUTCFullYear(), 0, 1));
+  return `${t.getUTCFullYear()}-W${String(Math.ceil(((t - y) / 86_400_000 + 1) / 7)).padStart(2, "0")}`;
+}
+/** The hourly job: this week's top 10 (once a week) and a season that has ended (once), when switched on. */
+async function rkDiscordTick(env) {
+  if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID) return;
+  const cfg = await r2json(env, RK_DISCORD, { on: false });
+  if (!cfg.on) return;
+  await loadModeration(config(env));
+  const now = new Date(Date.now()), season = rkSeason(now.getTime());
+  const channel = await rkChannelByName(env, cfg.channel || "octive-scores");
+  if (!channel) { console.log("ranked discord: channel not found", cfg.channel); return; }
+  const posted = { ...cfg };
+  // a season that has ended: its final standings (after its first hour, so the last matches are in)
+  const prev = season.n - 1;
+  if (prev >= 0 && !(cfg.seasons || []).includes(prev) && now.getTime() - Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1) > 3_600_000) {
+    const [board, past] = await Promise.all([r2json(env, RK_BOARD, { players: {} }), r2json(env, rkSeasonKey(prev), { players: {} })]);
+    const all = { ...(past.players || {}) };
+    for (const [pid, p] of Object.entries(board.players || {})) if (p && p.season === prev) all[pid] = p;
+    const list = Object.entries(all).filter(([pid]) => !moderation.bans[pid] && !isOfficial(pid))
+      .sort((x, y) => y[1].tier - x[1].tier || (x[1].tier >= RK_LEGEND ? y[1].rating - x[1].rating : y[1].progress - x[1].progress))
+      .map(([, p], i) => ({ name: p.name, tier: p.tier, rank: RK_NAMES[p.tier], progress: p.progress, wins: p.wins || 0, losses: p.losses || 0, legend: p.tier >= RK_LEGEND ? i + 1 : null }));
+    await discordApi(env, "POST", `/channels/${channel}/messages`, { embeds: [rkTopEmbed(list, `Ranked Season ${prev} is over`, `The final standings. Season ${season.n} has started: everyone moved down 4 divisions.`)], allowed_mentions: { parse: [] } });
+    posted.seasons = [...(cfg.seasons || []), prev].slice(-24);
+  }
+  // the week's top 10
+  const week = isoWeek(now);
+  if (now.getUTCDay() === 1 && now.getUTCHours() >= 18 && cfg.week !== week) {
+    const list = await rkBoardList(env, season.n);
+    await discordApi(env, "POST", `/channels/${channel}/messages`, { embeds: [rkTopEmbed(list, `Ranked top 10 · Season ${season.n}, ${week.replace("-W", " week ")}`, null)], allowed_mentions: { parse: [] } });
+    posted.week = week;
+  }
+  if (JSON.stringify(posted) !== JSON.stringify(cfg)) await r2put(env, RK_DISCORD, posted);
+}
+
+/** The ranked board for everyone (the website's Ranked page): GET, no sign-in. */
+async function rankedPublicBoard(env, mode) {
+  await freshModeration(env);
+  const season = rkSeason();
+  const all = await rkBoardList(env, season.n, mode);
+  return reply({ season: season.n, ends: season.ends, total: all.length, players: all.slice(0, 100), mode: rkMode(mode) });
+}
+
+/** The model's reading of a rank card picture (a rank-up or a season recap): it has to be one, with this player or rank on it. */
+async function rankedPictureCheck(env, bytes, want) {
+  if (!env.AI) return { check: "unread" };
+  const prompt = 'This image should be a rank card from the rhythm game OCTIVE (a rank emblem, a player name and a rank such as "Superstar II"). Reply with JSON only, no other words: {"card": true or false (is it a rank card from a game?), "player": "the player name on it", "rank": "the rank name on it"}';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let out;
+    try { out = await env.AI.run(SHARE_VISION, { prompt, image: Array.from(bytes), max_tokens: 120, temperature: attempt ? 0.2 : 0 }); }
+    catch (e) { continue; }
+    const text = String(out?.response ?? out?.description ?? "");
+    const m = text.match(/\{[\s\S]*\}/);
+    let r = null;
+    try { r = m ? JSON.parse(m[0]) : null; } catch { r = null; }
+    if (!r) continue;
+    if (r.card === false || /^\s*false\s*$/i.test(String(r.card ?? ""))) return { check: "fake", read: r };
+    const norm = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const ok = (norm(r.player) && norm(want.name) && (norm(r.player).includes(norm(want.name)) || norm(want.name).includes(norm(r.player))))
+      || (norm(r.rank) && norm(want.rank) && (norm(r.rank).includes(norm(want.rank)) || norm(want.rank).includes(norm(r.rank))));
+    return { check: ok ? "ok" : "other", read: r };
+  }
+  return { check: "unread" };
+}
+
+/**
+ * Sharing a rank card to #octive-scores (POST /play/ranked/share, multipart: image + info {kind: "rankup", match} or
+ * {kind: "season", season}): what it says comes from the server's own records; the picture goes with it only when the
+ * model reads it as a rank card of this player or rank (the same check as score pictures).
+ */
+async function rankedShare(request, env) {
+  if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID) fail(503, "Sharing isn't set up on the server.");
+  const who = await signedIn(request, env);
+  const cfg = config(env);
+  await loadModeration(cfg);
+  if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+  const now = Date.now();
+  const last = scoreShareAt.get("ranked:" + who.playerId) || 0;
+  if (now - last < 20_000) fail(429, "Wait a few seconds before sharing again.");
+  if (Number(request.headers.get("Content-Length") || 0) > 8_500_000) fail(413, "That picture is too big.");
+  let form;
+  try { form = await request.formData(); } catch { fail(400, "The share wasn't readable (multipart/form-data expected)."); }
+  let info = {};
+  try { info = JSON.parse(String(form.get("info") || "{}")) || {}; } catch { /* none */ }
+  const id = who.playerId;
+  const card = (await publicItems(cfg, id, ["card"]).catch(() => ({}))).card || {};
+  const name = modText(moderation.overrides[id]?.name || card.name || who.username || "Player", 40) || "Player";
+  const shareMode = rkMode(info.mode); // (a season card: which ladder; a rank-up: its match says)
+  let k7 = shareMode === 7;
+  const rec = await rkLoad(env, id, shareMode);
+  let title, fields = [], tier, rankText;
+  if (info.kind === "rankup") {
+    const mid = String(info.match || "");
+    if (!/^[a-f0-9]{20}$/.test(mid)) fail(400, "That match can't be found.");
+    const m = await r2json(env, rkMatchKey(mid), null);
+    const me = m && m.players[0] && m.players[0].id === id ? 0 : m && m.players[1] && m.players[1].id === id ? 1 : -1;
+    const res = me >= 0 && m.results ? m.results[me] : null;
+    if (!res || !res.rankUp) fail(400, "That match didn't rank you up.");
+    k7 = rkMode(m.mode) === 7;
+    tier = res.after.tier; rankText = RK_NAMES[tier];
+    title = `${name} ranked up to ${rankText}${k7 ? " in 7K" : ""}!`;
+    fields = [{ name: "Match", value: `${m.score[me]}-${m.score[1 - me]} against ${modText(m.players[1 - me].name, 30)}`, inline: true },
+      { name: "Change", value: `${res.delta >= 0 ? "+" : ""}${res.delta}%`, inline: true }, { name: "Season", value: String(m.season), inline: true }];
+  } else if (info.kind === "season") {
+    const n = Math.floor(Number(info.season));
+    const sn = n === rec.season ? { n, tier: rec.tier, peak: rec.peak, wins: rec.wins, losses: rec.losses, stats: rec.stats || {}, now: true } : (rec.seasons || []).find((x) => x.n === n);
+    if (!sn || !rec.placed && sn.now) fail(400, "There's no season to share.");
+    tier = sn.peak || sn.tier || 0; rankText = RK_NAMES[tier];
+    const st = sn.stats || {}, games = (sn.wins || 0) + (sn.losses || 0);
+    title = sn.now ? `${name}'s ${k7 ? "7K " : ""}Ranked season ${n} so far` : `${name}'s ${k7 ? "7K " : ""}Ranked season ${n}`;
+    fields = [{ name: "Highest rank", value: rankText, inline: true }, { name: "Matches", value: `${sn.wins || 0}W ${sn.losses || 0}L${games ? ` (${Math.round(100 * (sn.wins || 0) / games)}%)` : ""}`, inline: true },
+      ...(st.bestStreak ? [{ name: "Best streak", value: `${st.bestStreak} wins`, inline: true }] : []),
+      ...(st.bestAcc ? [{ name: "Best round", value: `${Number(st.bestAcc).toFixed(2)}%`, inline: true }] : []),
+      ...(st.sweeps ? [{ name: "2-0 wins", value: String(st.sweeps), inline: true }] : [])];
+  } else fail(400, "Update OCTIVE to share this.");
+  // the picture
+  let bytes = null, kind = null;
+  const file = form.get("image");
+  if (file && typeof file !== "string" && file.size <= 8_000_000) {
+    const b = new Uint8Array(await file.arrayBuffer());
+    const im = chatImageInfo(b);
+    if (!im || (im.type !== "jpeg" && im.type !== "png") || im.w !== 1920 || im.h !== 1080) fail(400, "That picture isn't one OCTIVE drew, so it wasn't shared.");
+    const pc = await rankedPictureCheck(env, b, { name, rank: rankText });
+    if (pc.check === "fake") { await flagPlayer(env, id, "ranked share refused (the picture isn't a rank card)").catch(() => {}); fail(400, "That picture isn't a rank card from OCTIVE, so it wasn't shared."); }
+    if (pc.check === "ok") { bytes = b; kind = im.type === "png" ? "png" : "jpg"; }
+  }
+  let discordId = null;
+  try { const r = await record(env, id); discordId = r.discord?.id || null; } catch { /* not linked */ }
+  const channelId = await scoresChannelId(env);
+  if (!channelId) fail(503, "The #octive-scores channel wasn't found on the OCTIVE Discord.");
+  const avatarHash = moderation.overrides[id]?.avatar ? "mod-" + Date.parse(moderation.overrides[id].at) : (card.avatar || "");
+  const embed = {
+    color: parseInt(RK_HEX[rkGroupOf(tier)].slice(1), 16),
+    author: { name, url: `${SITE}#/u/${encodeURIComponent(id)}`, ...(avatarHash ? { icon_url: `${WORKER_BASE}/avatar/${encodeURIComponent(id)}?v=${encodeURIComponent(avatarHash)}` } : {}) },
+    title: title.slice(0, 256), fields, ...(bytes ? { image: { url: `attachment://rank.${kind}` } } : {}),
+    footer: { text: `Shared from OCTIVE · Ranked${k7 ? " 7K" : ""}` }, timestamp: new Date().toISOString(),
+  };
+  const payload = { content: discordId ? `<@${discordId}> shared a Ranked card` : undefined, embeds: [embed], allowed_mentions: { parse: [], users: discordId ? [discordId] : [] } };
+  let posted;
+  if (bytes) {
+    const fd = new FormData();
+    payload.attachments = [{ id: 0, filename: `rank.${kind}` }];
+    fd.append("payload_json", JSON.stringify(payload));
+    fd.append("files[0]", new Blob([bytes], { type: kind === "png" ? "image/png" : "image/jpeg" }), `rank.${kind}`);
+    posted = await discordApi(env, "POST", `/channels/${channelId}/messages`, fd, true);
+  } else posted = await discordApi(env, "POST", `/channels/${channelId}/messages`, payload);
+  scoreShareAt.set("ranked:" + id, now);
+  return reply({ ok: true, url: `https://discord.com/channels/${env.DISCORD_GUILD_ID}/${channelId}/${posted.id}`, picture: !!bytes });
+}
+
+rkEnsureRewardItems();
+
+async function rankedRoutes(request, env, path) {
+  const who = await signedIn(request, env);
+  const b = await bodyOf(request, 2_600_000); // a ranked play's replay comes with it
+  const id = who.playerId, now = Date.now(), what = path.slice("/play/ranked/".length);
+  let mode = rkMode(b.mode); // the ladder: 4 (the main one) or 7 (it can change below: a match's own, an invite's)
+  await freshModeration(env);
+  if (moderation.bans[id]) fail(403, "This account is banned.");
+  const season = rkSeason(now), seasonOut = { n: season.n, ends: season.ends }, staff = id === OWNER || isOfficial(id);
+  let rec = await rkLoadM(mode, env, id);
+  const name = await rkName(env, id);
+  const platform = String(b.platform || "").replace(/[^A-Za-z0-9 ]/g, "").slice(0, 16);
+  const openMatch = async (mid) => {
+    if (!/^[a-f0-9]{20}$/.test(String(mid || ""))) fail(400, "That match can't be found.");
+    const m = await r2json(env, rkMatchKey(mid), null);
+    if (!m) fail(404, "That match can't be found.");
+    const me = m.players[0] && m.players[0].id === id ? 0 : m.players[1] && m.players[1].id === id ? 1 : -1;
+    if (me < 0) fail(403, "That isn't your match.");
+    return { m, me };
+  };
+  const clearActive = (mid) => rkChangeM(mode, env, id, (d) => { if (d.active !== mid) return false; d.active = null; });
+  // the player's open match, moved on (it may have ended meanwhile)
+  const activeMatch = async () => {
+    if (!rec.active) return null;
+    let found;
+    try { found = await openMatch(rec.active); }
+    catch (e) { if (e.status >= 400 && e.status < 500) { await clearActive(rec.active); rec.active = null; return null; } throw e; }
+    const m = await rkUpdateMatch(env, found.m.id, async (x) => { await rkAdvance(env, x, now); });
+    await rkLiveIndex(env, m);
+    const over = m.state === "done" || m.state === "cancelled";
+    if (over) { await clearActive(m.id); rec.active = null; }
+    return { m, me: found.me, over };
+  };
+
+  // ---- live matches: the list, and watching one player's play (anyone signed in)
+  if (what === "live/list") {
+    const d = await r2json(env, RK_LIVE, { matches: {} });
+    const top = (x) => Math.max(0, ...(x.players || []).map((p) => p.tier || 0));
+    const list = Object.values(d.matches || {}).filter((x) => now - (x.at || 0) < 20 * 60_000 && !(x.players || []).some((p) => p.id === id))
+      .sort((a, b) => top(b) - top(a) || (b.created || 0) - (a.created || 0)).slice(0, 40);
+    return reply({ matches: list, now });
+  }
+  if (what === "live/watch") {
+    if (!/^[a-f0-9]{20}$/.test(String(b.match || ""))) fail(400, "That match can't be found.");
+    const m = await r2json(env, rkMatchKey(String(b.match)), null);
+    if (!m) fail(404, "That match can't be found.");
+    const w = Number(b.who) === 1 ? 1 : 0, pl = m.players[w];
+    const r = b.round ? m.rounds.find((x) => x.n === Number(b.round)) : [...m.rounds].reverse().find((x) => x.pick !== null);
+    if (!r || r.pick === null) return reply({ chart: null, state: m.state, now });
+    const from = Math.max(0, Math.floor(Number(b.from) || 0));
+    let inputs = [], at = 0, age = 0, ended = false, left = false;
+    if (pl.bot) {
+      // the AI's play on the clock its opponent's would be on (it starts a few seconds after the pick)
+      const chartNow = (now - ((r.playFrom || now) + 9000)) * 1000, all = r.live || [];
+      let t = 0, total = 0;
+      for (let i = 0; i + 2 < all.length; i += 3) total += all[i];
+      for (let i = 0; i + 2 < all.length; i += 3) { t += all[i]; if (t > chartNow) break; inputs.push(t, all[i + 1], all[i + 2]); }
+      inputs = inputs.slice(from * 3); at = Math.max(0, Math.round(chartNow)); ended = chartNow > total + 2_000_000;
+    } else {
+      const d = await r2json(env, rkLiveKey(m.id, r.n, w), null);
+      if (d) { inputs = (d.inputs || []).slice(from * 3); at = d.now || 0; age = d.at ? Math.max(0, now - d.at) : 0; ended = !!d.ended; left = !!d.left; }
+      if (r.results[w] || m.state === "done" || m.state === "cancelled") ended = true;
+    }
+    return reply({ round: r.n, chart: r.charts[r.pick], inputs, now: at, age, ended, left, name: pl.name, state: m.state });
+  }
+  // (staff: the weekly Discord post on or off, its channel, or a look at it in #moderator-only)
+  if (what === "discord") {
+    if (!staff) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+    const cfgD = await r2json(env, RK_DISCORD, { on: false });
+    const action = String(b.action || "status");
+    if (action === "on" || action === "off") {
+      cfgD.on = action === "on";
+      if (b.channel) cfgD.channel = String(b.channel).toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 60) || cfgD.channel;
+      if (cfgD.on && !cfgD.week) cfgD.week = isoWeek(new Date(Date.now())); // (the first post is next Monday's)
+      if (cfgD.on && !cfgD.seasons) cfgD.seasons = Array.from({ length: Math.max(0, season.n) }, (_, k) => k); // (no posts for seasons before it was on)
+      await r2put(env, RK_DISCORD, cfgD);
+    }
+    if (action === "preview") await modPost(env, rkTopEmbed(await rkBoardList(env, season.n), `Preview: Ranked top 10 · Season ${season.n}`, "This is how the weekly post looks (it goes to #" + (cfgD.channel || "octive-scores") + " on Mondays from 18:00 UTC when it's on)."));
+    return reply({ on: !!cfgD.on, channel: cfgD.channel || "octive-scores", week: cfgD.week || null });
+  }
+  // ---- the ranks shown beside names (boards, rooms, chat, pop-ups): this season's division of each placed player
+  if (what === "ranks") {
+    const ids = (Array.isArray(b.ids) ? b.ids : []).map(String).filter((x) => /^[A-Za-z0-9_-]{8,64}$/.test(x)).slice(0, 100);
+    const all = (await r2json(env, RK_BOARD, { players: {} })).players || {}; // (the 4K ladder's: the emblem beside a name)
+    const ranks = {};
+    for (const pid of ids) { const p = all[pid]; if (p && p.season === season.n && !moderation.bans[pid] && !isOfficial(pid)) ranks[pid] = p.tier; }
+    return reply({ ranks });
+  }
+  const invitesOf = async () => Object.entries((await r2json(env, rkInviteKey(id), { invites: {} })).invites || {})
+    .filter(([pid, v]) => now - v.at < RK_INVITE_TTL && !moderation.bans[pid]).map(([from, v]) => ({ from, name: v.name, tier: v.tier || 0, at: v.at, mode: rkMode(v.mode) }));
+  const invitedOut = () => rec.invited && now - rec.invited.at < RK_INVITE_TTL ? rec.invited : null;
+  if ((rec.seasons || []).some((x) => !x.rewarded)) rec = await rkSeasonRewardsM(mode, env, id, rec);
+  const rewardOut = () => rec.reward && !rec.reward.seen ? rec.reward : null;
+  if (what === "season/seen") { await rkChangeM(mode, env, id, (d) => { if (!d.reward || d.reward.seen) return false; d.reward.seen = true; }); return reply({ ok: true }); }
+  // (staff, for testing: this season's rewards now, as if it had just ended; the real end then skips them)
+  if (what === "season/preview") {
+    if (!staff) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+    if (!rec.placed) fail(400, "Get placed first.");
+    rec = await rkChangeM(mode, env, id, (d) => {
+      if (d.seasons.some((x) => x.n === d.season)) return false;
+      d.seasons.push({ n: d.season, tier: d.tier, peak: d.peak || d.tier, wins: d.wins || 0, losses: d.losses || 0, rating: Math.round(d.rating || 0), stats: d.stats || {}, preview: true });
+    });
+    rec = await rkSeasonRewardsM(mode, env, id, rec);
+    return reply({ ok: true, reward: rewardOut() });
+  }
+  if (what === "state") {
+    const a = await activeMatch();
+    const unlock = await rkUnlockedM(mode, env, id, rec);
+    // the ladder: open once there are enough charts; the other ladder: a match going on there, or its season rewards
+    const songs = await rkPoolSongs(env, mode), open = songs >= RK_MIN_SONGS;
+    const other = mode === 7 ? 4 : 7;
+    let orec = await rkLoadM(other, env, id);
+    if ((orec.seasons || []).some((x) => !x.rewarded)) orec = await rkSeasonRewardsM(other, env, id, orec);
+    const oreward = !!(orec.reward && !orec.reward.seen);
+    const ladder = { mode, open, songs, songsNeeded: RK_MIN_SONGS, testing: !open && staff,
+      elsewhere: orec.active || oreward ? { mode: other, match: orec.active || null, reward: oreward } : null };
+    if (a && !a.over) return reply({ ...ladder, season: seasonOut, rank: rkPublic(rec), unlocked: unlock.ok, plays: unlock.plays, needed: RK_UNLOCK_PLAYS, match: rkView(a.m, a.me, now) });
+    if (a) rec = await rkLoadM(mode, env, id); // its result has just moved the rank
+    const pl = rec.placement;
+    return reply({ ...ladder, season: seasonOut, rank: rkPublic(rec, await rkLegendNoM(mode, env, id, rec)), unlocked: unlock.ok, plays: unlock.plays, needed: RK_UNLOCK_PLAYS,
+      placement: rec.placed ? null : { started: !!pl, step: pl ? pl.results.length : 0, total: 3, song: pl ? pl.charts[pl.results.length] || null : null, results: pl ? pl.results : [] },
+      recent: rec.recent.slice(0, 10), ended: a ? rkView(a.m, a.me, now) : null, match: null, invites: await invitesOf(), invited: invitedOut(), reward: rewardOut() });
+  }
+  if (what === "board") {
+    const all = (await r2json(env, rkBoardKey(mode), { players: {} })).players || {};
+    const list = Object.entries(all).filter(([pid, p]) => p.season === season.n && !moderation.bans[pid] && !isOfficial(pid))
+      .sort((x, y) => y[1].tier - x[1].tier || (x[1].tier >= RK_LEGEND ? y[1].rating - x[1].rating : y[1].progress - x[1].progress) || y[1].wins - x[1].wins);
+    const players = list.slice(0, 100).map(([pid, p], i) => ({ id: pid, name: p.name, tier: p.tier, rank: RK_NAMES[p.tier] || "Rookie", progress: p.progress,
+      wins: p.wins || 0, losses: p.losses || 0, platform: p.platform || "", place: i + 1, legend: p.tier >= RK_LEGEND ? i + 1 : null }));
+    const mine = list.findIndex(([pid]) => pid === id);
+    return reply({ season: season.n, ends: season.ends, players, me: mine >= 0 ? mine + 1 : null, total: list.length, mode });
+  }
+  // (staff only, for testing: start Ranked over, unplaced or at a given division)
+  if (what === "reset") {
+    if (!staff) fail(403, "Only Senterra and the official OCTIVE account can do that.");
+    const tier = Number.isInteger(b.tier) && b.tier >= 1 && b.tier <= RK_LEGEND ? b.tier : 0;
+    const fresh = rkFresh(season.n);
+    fresh.unlocked = true;
+    if (tier) Object.assign(fresh, { placed: true, tier, peak: tier, rating: 900 + tier * 60 });
+    await r2put(env, rkPlayerKey(id, mode), fresh);
+    await r2update(env, rkBoardKey(mode), () => ({ players: {} }), (d) => { d.players ||= {}; if (!d.players[id]) return false; delete d.players[id]; }).catch(() => {});
+    await rkBoardSetM(mode, env, id, fresh, name);
+    return reply({ ok: true, rank: rkPublic(fresh) });
+  }
+  const unlock = await rkUnlockedM(mode, env, id, rec);
+  if (!unlock.ok) fail(403, `Ranked opens after ${RK_UNLOCK_PLAYS} played songs (you've played ${unlock.plays}).`);
+  if (!staff && (what === "placement/start" || what === "queue" || what === "friendly/invite")) {
+    const songs = await rkPoolSongs(env, mode);
+    if (songs < RK_MIN_SONGS) fail(403, `${mode}K Ranked opens once the Workshop has ${RK_MIN_SONGS} verified ${mode}K songs (${songs} so far).`);
+  }
+
+  // ---- placement: three solo songs, each shown only when it's up
+  if (what === "placement/start") {
+    if (rec.placed) fail(400, "You've already been placed this season.");
+    if (!rec.placement) {
+      const pool = await rkPoolM(mode, env), rnd = seededRandom(rkSeed()), used = new Set(), charts = [];
+      for (const [lo, hi] of RK_PLACE_BANDS) {
+        const c = rkPick(pool, lo, hi + 0.001, 1, used, rnd)[0];
+        if (!c) fail(503, "There aren't enough verified charts for placement yet.");
+        used.add(c.songId); charts.push(c);
+      }
+      rec = await rkChangeM(mode, env, id, (d) => { if (d.placed || d.placement) return false; d.placement = { charts, results: [], started: now }; });
+    }
+    const pl = rec.placement;
+    if (!pl) fail(400, "You've already been placed this season.");
+    return reply({ step: pl.results.length, total: 3, song: pl.charts[pl.results.length] || null, results: pl.results });
+  }
+  if (what === "placement/submit" || what === "placement/quit") {
+    const pl = rec.placement;
+    if (rec.placed || !pl) fail(400, "There's no placement going on.");
+    const step = pl.results.length, c = pl.charts[step];
+    if (!c) fail(400, "Placement is already done.");
+    let entries;
+    if (what === "placement/quit") {
+      // quitting a placement song fails all three
+      entries = pl.charts.map((x) => ({ stars: x.stars, acc: 0, failed: true, quit: true, level: round2(rkLevel(x.stars, 0, true, false)) }));
+    } else {
+      if (Number(b.step) !== step) fail(409, "That placement song was already sent.");
+      const result = await rkJudge(env, who, b, c, `ranked placement ${step + 1}`);
+      const acc = round2(result.accuracy), failed = b.failed === true;
+      entries = [...pl.results, { stars: c.stars, acc, failed, fc: !!result.fullCombo && !failed, level: round2(rkLevel(c.stars, acc, failed, !!result.fullCombo)) }];
+      if (result.signature) await rememberReplay(env, rkScope(c), id, result.signature);
+    }
+    let done = false;
+    rec = await rkChangeM(mode, env, id, (d) => {
+      if (d.placed || !d.placement || d.placement.results.length !== step) return false;
+      d.placement.results = entries;
+      if (entries.length < 3) return;
+      const level = Math.max(...entries.map((x) => x.level));
+      Object.assign(d, { tier: rkTierOfLevel(level), progress: 0, placed: true });
+      d.peak = Math.max(d.peak || 0, d.tier); d.rating = 900 + d.tier * 60; d.placedWith = { level: round2(level), at: new Date(now).toISOString() };
+      if (platform) d.platform = platform;
+      done = true;
+    });
+    if (done) {
+      await rkBoardSetM(mode, env, id, rec, name);
+      return reply({ done: true, level: rec.placedWith.level, rank: rkPublic(rec), results: rec.placement.results });
+    }
+    const p2 = rec.placement || { results: [], charts: [] };
+    return reply({ done: !!rec.placed, step: p2.results.length, total: 3, song: p2.charts[p2.results.length] || null, results: p2.results, rank: rkPublic(rec) });
+  }
+  // ---- friendly matches: the Ranked format against a player you invite, nothing on the line (no rank, no AI opponents)
+  if (what === "friendly/invite") {
+    const to = String(b.to || "");
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(to) || to === id || moderation.bans[to] || isOfficial(to)) fail(400, "That player can't be invited.");
+    if (rec.invited && rec.invited.to !== to && now - rec.invited.at < 10_000) fail(429, "Wait a moment before inviting someone else.");
+    const toName = await rkName(env, to);
+    await r2update(env, rkInviteKey(to), () => ({ invites: {} }), (d) => {
+      d.invites ||= {};
+      for (const [k, v] of Object.entries(d.invites)) if (now - v.at > RK_INVITE_TTL) delete d.invites[k];
+      d.invites[id] = { name, at: now, tier: rec.placed ? rec.tier : 0, mode };
+    });
+    if (rec.invited && rec.invited.to !== to)
+      await r2update(env, rkInviteKey(rec.invited.to), () => ({ invites: {} }), (d) => { if (!d.invites || !d.invites[id]) return false; delete d.invites[id]; }).catch(() => {});
+    rec = await rkChangeM(mode, env, id, (d) => { d.invited = { to, name: toName, at: now }; });
+    // a pop-up in their game
+    await r2update(env, `chat/pings/${to}.json`, () => ({ items: [] }), (pg) => {
+      pg.items = (pg.items || []).filter((x) => !(x.kind === "friendly" && x.byId === id))
+        .concat([{ id: `friendly-${id}-${now}`, at: now, kind: "friendly", by: name, byId: id, text: `${name} challenged you to a friendly ${mode === 7 ? "7K " : ""}Ranked match. Open Ranked to play.` }]).slice(-20);
+    }).catch((e) => console.log("friendly ping", e && e.message));
+    return reply({ ok: true, invited: invitedOut() });
+  }
+  if (what === "friendly/cancel") {
+    const inv = rec.invited;
+    if (inv) {
+      await r2update(env, rkInviteKey(inv.to), () => ({ invites: {} }), (d) => { if (!d.invites || !d.invites[id]) return false; delete d.invites[id]; }).catch(() => {});
+      await rkChangeM(mode, env, id, (d) => { d.invited = null; });
+    }
+    return reply({ ok: true });
+  }
+  if (what === "friendly/accept" || what === "friendly/decline") {
+    const from = String(b.from || "");
+    let inv = null;
+    await r2update(env, rkInviteKey(id), () => ({ invites: {} }), (d) => { d.invites ||= {}; inv = d.invites[from] || null; if (!inv) return false; delete d.invites[from]; });
+    if (!inv || now - inv.at > RK_INVITE_TTL) fail(404, "That invite has run out.");
+    if (rkMode(inv.mode) !== mode) { mode = rkMode(inv.mode); rec = await rkLoadM(mode, env, id); } // (the invite's ladder)
+    const frec = await rkLoadM(mode, env, from);
+    if (!frec.invited || frec.invited.to !== id) fail(409, "They've invited someone else since.");
+    if (what === "friendly/decline") { await rkChangeM(mode, env, from, (d) => { if (d.invited && d.invited.to === id) d.invited.declined = true; }); return reply({ ok: true }); }
+    if (frec.active) fail(409, "They're in another match right now.");
+    const a = await activeMatch();
+    if (a && !a.over) fail(409, "Finish your match first.");
+    const m = rkNewMatchM(mode, rkNewId(), { id: from, name: inv.name || await rkName(env, from), tier: frec.placed ? frec.tier : 0, rating: Math.round(frec.rating), platform: frec.platform || "" },
+      { id, name, tier: rec.placed ? rec.tier : 0, rating: Math.round(rec.rating), platform: platform || rec.platform || "" }, now, new Set());
+    m.kind = "friendly"; m.accepted = [true, true]; // (both said yes already: straight to the bans)
+    await r2put(env, rkMatchKey(m.id), m);
+    await rkLiveIndex(env, m);
+    await rkChangeM(mode, env, id, (d) => { d.active = m.id; });
+    await rkChangeM(mode, env, from, (d) => { d.active = m.id; d.invited = null; });
+    return reply({ match: rkView(m, 1, now) });
+  }
+  if (!rec.placed && what === "queue") fail(400, "Play your placement songs first."); // (friendly matches don't need it)
+
+  // ---- the queue: a real opponent near your rank, or an AI one after a random 7-11 seconds (drawn when the search starts)
+  if (what === "queue") {
+    const action = String(b.action || "poll");
+    const a = action === "leave" ? null : await activeMatch();
+    if (a && !a.over) return reply({ match: rkView(a.m, a.me, now) });
+    const newId = rkNewId();
+    let pair = null, joined = null, bot = false, since = now;
+    await r2update(env, rkQueueKey(mode), () => ({ players: {} }), (q) => {
+      pair = null; joined = null; bot = false;
+      q.players ||= {};
+      // (the game asks twice a second while searching: the list is only written when something changed, or every 4 s to
+      // say the player is still there)
+      let changed = false;
+      for (const [pid, e] of Object.entries(q.players)) if (now - e.seen > RK_QUEUE_STALE || (e.match && now - e.matchAt > RK_RESERVE)) { delete q.players[pid]; changed = true; }
+      if (action === "leave") { if (!q.players[id]) return changed ? undefined : false; delete q.players[id]; return; }
+      let mine = q.players[id];
+      if (mine && mine.match) { joined = mine.match; if (now - mine.seen > 4000) { mine.seen = now; return; } return changed ? undefined : false; }
+      if (!mine) { mine = q.players[id] = { since: now, botAfter: RK_BOT_MIN + Math.floor(Math.random() * (RK_BOT_MAX - RK_BOT_MIN + 1)) }; changed = true; }
+      if (mine.tier !== rec.tier || mine.name !== name) { mine.tier = rec.tier; mine.name = name; changed = true; }
+      if (!(now - mine.seen <= 4000)) { mine.seen = now; changed = true; }
+      since = mine.since;
+      const other = Object.entries(q.players).filter(([pid, e]) => pid !== id && !e.match && Math.abs(e.tier - rec.tier) <= 4)
+        .sort((x, y) => Math.abs(x[1].tier - rec.tier) - Math.abs(y[1].tier - rec.tier) || x[1].since - y[1].since)[0];
+      if (other) { other[1].match = newId; other[1].matchAt = now; pair = other[0]; delete q.players[id]; return; }
+      // nobody near your rank: an AI opponent once this search's wait is up (never at Champion or Legend)
+      if (now - mine.since >= (mine.botAfter || RK_BOT_MAX) && rec.tier <= RK_BOT_MAX_TIER) { bot = true; delete q.players[id]; return; }
+      if (!changed) return false;
+    });
+    if (action === "leave") return reply({ left: true });
+    if (pair || bot) {
+      const taken = bot ? new Set(Object.values((await r2json(env, rkBoardKey(mode), { players: {} })).players || {}).map((p) => String(p.name || "").toLowerCase())) : new Set();
+      const orec = pair ? await rkLoadM(mode, env, pair) : null;
+      const mine = { id, name, tier: rec.tier, rating: Math.round(rec.rating), platform: platform || rec.platform || "" };
+      const them = pair ? { id: pair, name: await rkName(env, pair), tier: orec.tier, rating: Math.round(orec.rating), platform: orec.platform || "" } : null;
+      const m = rkNewMatchM(mode, newId, mine, them, now, taken);
+      await r2put(env, rkMatchKey(m.id), m);
+      await rkLiveIndex(env, m);
+      await rkChangeM(mode, env, id, (d) => { d.active = m.id; if (platform) d.platform = platform; });
+      if (pair) await rkChangeM(mode, env, pair, (d) => { d.active = m.id; });
+      return reply({ match: rkView(m, 0, now) });
+    }
+    if (joined) {
+      const m = await r2json(env, rkMatchKey(joined), null);
+      if (!m) return reply({ waiting: true, since, now, found: true }); // the other player's request is still making it
+      await r2update(env, rkQueueKey(mode), () => ({ players: {} }), (q) => { if (!q.players || !q.players[id]) return false; delete q.players[id]; });
+      await rkChangeM(mode, env, id, (d) => { d.active = m.id; if (platform) d.platform = platform; });
+      return reply({ match: rkView(m, m.players[0].id === id ? 0 : 1, now) });
+    }
+    return reply({ waiting: true, since, now }); // (never says whether an AI opponent may come: they stay hidden)
+  }
+
+  // ---- the play of a round as it's played (for anyone watching): every second or two, the new inputs and where the song is
+  if (what === "live/push") {
+    const { m, me } = await openMatch(b.match);
+    const r = m.rounds[m.rounds.length - 1];
+    if (m.state !== "play" || !r || r.pick === null || r.n !== Number(b.round)) return reply({ ok: false });
+    const from = Math.max(0, Math.floor(Number(b.from) || 0));
+    const add = (Array.isArray(b.inputs) ? b.inputs : []).slice(0, 9000).map((x) => Math.round(Number(x) || 0));
+    let need = null;
+    await r2update(env, rkLiveKey(m.id, r.n, me), () => ({ inputs: [], now: 0, at: 0 }), (d) => {
+      d.inputs ||= [];
+      need = null;
+      const have = Math.floor(d.inputs.length / 3);
+      if (from > have) { need = have; return false; } // a gap: send from there
+      const fresh = add.slice((have - from) * 3);
+      if (d.inputs.length + fresh.length > 120_000) return false;
+      d.inputs = d.inputs.concat(fresh);
+      d.now = Math.round(Number(b.now) || 0); d.at = now; d.ended = b.ended === true; d.left = b.left === true;
+    });
+    return reply(need !== null ? { need } : { ok: true });
+  }
+
+  // ---- a finished match's details, its plays and reporting the opponent
+  if (what === "history") {
+    const { m, me } = await openMatch(b.match);
+    return reply({ match: rkSummary(m, me) });
+  }
+  if (what === "replay") {
+    const { m, me } = await openMatch(b.match);
+    const r = m.rounds.find((x) => x.n === Number(b.round));
+    if (!r || r.pick === null) fail(404, "That round can't be found.");
+    const idx = b.who === "opp" ? 1 - me : me;
+    if (idx !== me && r.winner === null) fail(409, "Their play shows once the round is over.");
+    const p = m.players[idx];
+    let bytes = null;
+    if (p.bot) bytes = r.live ? await rkBotReplay(m, r, p) : null;
+    else { const o = await env.RELEASES.get(rkReplayKey(m.id, r.n, idx)); if (o) bytes = new Uint8Array(await o.arrayBuffer()); }
+    if (!bytes) fail(404, "That play wasn't kept.");
+    return reply({ replay: rkB64(bytes), name: p.name });
+  }
+  if (what === "report") {
+    const { m, me } = await openMatch(b.match);
+    const opp = m.players[1 - me];
+    if (!opp || opp.bot) return reply({ ok: true }); // (an AI opponent: nothing to send; they stay hidden)
+    await fileReport(env, who, opp.id, b.reason, b.details, `Ranked match ${m.id}`);
+    return reply({ ok: true });
+  }
+
+  // ---- a match: accept, bans, rounds, leaving
+  if (["match", "accept", "ban", "round", "forfeit"].includes(what)) {
+    const { m: peek, me } = await openMatch(b.match);
+    mode = rkMode(peek.mode); // (the match's ladder: whose records it clears)
+    let judged = null;
+    if (what === "round") {
+      // judged before the match is changed (judging takes a moment, and both players can send at once)
+      await rkAdvance(env, peek, now);
+      const r = peek.rounds[peek.rounds.length - 1];
+      if (peek.state !== "play" || !r || r.pick === null || r.n !== Number(b.round)) fail(409, "This round isn't being played any more.");
+      if (!r.results[me]) {
+        const c = r.charts[r.pick];
+        if (c.len > 0 && now - r.playFrom < c.len * 1000 * 0.6) fail(409, "That play finished too quickly.");
+        const result = await rkJudge(env, who, b, c, `ranked match ${peek.id} round ${r.n}`);
+        judged = { n: r.n, acc: round2(result.accuracy), score: result.score, maxCombo: result.maxCombo, fullCombo: !!result.fullCombo, failed: b.failed === true, at: now, sig: result.signature, scope: rkScope(c) };
+        // the play itself is kept for the match's history (watch it, or both side by side)
+        const rep = replayBytes(b.replay);
+        if (rep) { try { await env.RELEASES.put(rkReplayKey(peek.id, r.n, me), rep, { httpMetadata: { contentType: "application/gzip" } }); judged.kept = true; } catch (e) { console.log("ranked replay", e && e.message); } }
+        // the server times every round: a play sent back far later than the song is long may come from a slowed-down game
+        if (c.len > 0 && now - r.playFrom > c.len * 1000 * 1.6 + 120_000)
+          await flagPlayer(env, id, `ranked round took ${Math.round((now - r.playFrom) / 1000)} s for a ${c.len} s song (a slowed-down game?)`);
+      }
+    }
+    let counted = false;
+    const m = await rkUpdateMatch(env, peek.id, async (x) => {
+      counted = false;
+      await rkAdvance(env, x, now);
+      const r = x.rounds[x.rounds.length - 1];
+      if (what === "accept") { if (x.state !== "accept") return; x.accepted[me] = true; await rkAdvance(env, x, now); }
+      else if (what === "ban") {
+        const i = Number(b.index);
+        if (x.state !== "bans" || !r || now < r.opens || r.bans[me] !== null || !Number.isInteger(i) || i < 0 || i >= r.charts.length) return;
+        r.bans[me] = i; await rkAdvance(env, x, now);
+      } else if (what === "round") {
+        if (!judged || x.state !== "play" || !r || r.n !== judged.n || r.results[me]) return;
+        r.results[me] = { acc: judged.acc, score: judged.score, maxCombo: judged.maxCombo, fullCombo: judged.fullCombo, failed: judged.failed, at: judged.at };
+        if (judged.kept) { r.replays ||= [false, false]; r.replays[me] = true; }
+        counted = true;
+        await rkAdvance(env, x, now);
+      } else if (what === "forfeit") {
+        if (x.state === "done" || x.state === "cancelled") return;
+        if (x.state === "accept") { x.state = "cancelled"; x.why = "The match was declined."; x.declined = [me === 0, me === 1]; return; }
+        rkEnd(x, 1 - me, now, me);
+      }
+    });
+    if (counted && judged.sig) await rememberReplay(env, judged.scope, id, judged.sig);
+    await rkLiveIndex(env, m);
+    if (m.state === "done" || m.state === "cancelled") await clearActive(m.id);
+    return reply({ match: rkView(m, me, now, b.live === true) });
+  }
+  fail(404, "Not found.");
+}
+
+// ---------------------------------------------------------------- missions, events and season collections (2.0)
+// Weekly missions: four a week (Monday 00:00 UTC to the next), the same for everyone, picked from the week's number.
+// They only count what the server judges itself: board plays on verified charts (with their replays), daily charts and
+// Ranked rounds. A finished mission's points go straight into the wallet, and finishing all four adds a bonus.
+// Events (run by Senterra or the official account): a name, a colour, some days and a pack of verified Workshop songs;
+// their missions give points and the event's title, icon colour and animated frame (shop items nobody can buy).
+// Season collections: four new shop items every Ranked season, for sale only while that season runs.
+const WEEK_MS = 7 * 86_400_000, MISSION_BONUS = 400;
+/** The week (Monday 00:00 UTC): its key ("YYYY-MM-DD"), when it ends and its number. */
+function weekOf(now = Date.now()) {
+  const d = new Date(now), back = (d.getUTCDay() + 6) % 7;
+  const start = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - back);
+  return { key: new Date(start).toISOString().slice(0, 10), start, ends: start + WEEK_MS, n: Math.round(start / WEEK_MS) };
+}
+const MISSION_KINDS = {
+  plays: { title: (n) => `Play ${n} verified charts`, desc: "Any verified chart or OCTIVE song counts once it's on its leaderboard (its replay is judged).", targets: [15, 20, 25], points: [150, 200, 250] },
+  acc95: { title: (n) => `Get 95%+ on ${n} different verified charts`, desc: "Accuracy as the server judges it from the play's replay.", targets: [3, 5, 6], points: [200, 250, 300] },
+  fc: { title: (n) => `Full combo ${n} different verified charts`, desc: "No misses from the first note to the last.", targets: [2, 3, 4], points: [200, 250, 300] },
+  fresh: { title: (n) => `Play ${n} verified charts that are new to you`, desc: "Charts you have no leaderboard score on yet.", targets: [3, 5, 6], points: [150, 200, 250] },
+  daily: { title: (n) => `Play a daily chart on ${n} days`, desc: "Any of the day's daily charts counts for its day.", targets: [3, 4, 5], points: [200, 250, 300] },
+  ranked: { title: (n) => `Win ${n} Ranked rounds`, desc: "Rounds of Ranked matches (friendly matches don't count).", targets: [3, 5, 6], points: [250, 300, 350] },
+};
+const MISSION_SLOTS = [["plays"], ["acc95", "fc"], ["daily", "fresh"], ["ranked", "fresh", "fc"]];
+/** The week's missions: one from each slot (no kind twice), with the week's target and points. */
+function weekMissions(wk = weekOf()) {
+  const rnd = seededRandom(Math.imul(wk.n, 2654435761) >>> 0), used = new Set(), out = [];
+  for (const slot of MISSION_SLOTS) {
+    const left = slot.filter((k) => !used.has(k));
+    if (!left.length) continue;
+    const kind = left[Math.floor(rnd() * left.length) % left.length];
+    used.add(kind);
+    const def = MISSION_KINDS[kind], v = Math.floor(rnd() * def.targets.length) % def.targets.length;
+    out.push({ id: `${wk.key}:${kind}`, kind, target: def.targets[v], points: def.points[v], title: def.title(def.targets[v]), desc: def.desc });
+  }
+  return out;
+}
+
+const EVENT_KEY = "events/current.json", EVENT_ITEMS_KEY = "events/items.json";
+const EVENT_COLORS = [["#8FE8FF", "#FFFFFF"], ["#FF6A3D", "#FFC94D"], ["#FF4FA3", "#8A5CFF"], ["#39FFB0", "#3FA9FF"], ["#FFC94D", "#FF4FA3"], ["#A77BFF", "#3FE0C5"]];
+let eventCache = null, eventCacheAt = 0, eventItemsAt = 0;
+const eventLive = (ec, now = Date.now()) => !!ec && now >= Date.parse(ec.starts) && now < Date.parse(ec.ends);
+/** The event record (its charts' board keys and its songs worked out), live or not; null when there's none. */
+async function eventRecord(env, fresh = false) {
+  if (!fresh && eventCacheAt && Date.now() - eventCacheAt < 60_000) return eventCache;
+  const ec = await r2json(env, EVENT_KEY, null);
+  let out = null;
+  if (ec && ec.id) {
+    const db = await judgeDb(env), keys = new Set(), songs = [];
+    for (const itemId of ec.items || []) {
+      const it = (db.items || []).find((x) => x.id === itemId);
+      if (!it || it.removed || !it.meta) continue;
+      for (const sg of it.meta.songs || []) {
+        if (!sg || !sg.songId) continue;
+        const set = Math.round(Number(sg.osuSet) || 0), board = set > 0 ? "osu-" + set : sg.songId;
+        const charts = (sg.charts || []).filter((c) => (set > 0 && c.osuMd5) || c.chartId);
+        for (const c of charts) keys.add(`${board}/${set > 0 && c.osuMd5 ? c.osuMd5 : c.chartId}`);
+        const stars = charts.map((c) => Number(c.stars) || 0).filter((x) => x > 0);
+        songs.push({ itemId: it.id, board, title: sg.title || it.title || "", artist: sg.artist || "", creator: it.creator || "", verified: !!it.verified, osuSet: set || undefined,
+          charts: charts.length, starsLo: stars.length ? Math.min(...stars) : 0, starsHi: stars.length ? Math.max(...stars) : 0, keys: [...new Set(charts.map((c) => Number(c.keys) || 0))].filter((k) => k > 0) });
+      }
+    }
+    out = { ...ec, keys: [...keys], songs };
+  }
+  eventCache = out; eventCacheAt = Date.now();
+  return out;
+}
+async function eventNow(env) { const ec = await eventRecord(env); return eventLive(ec) ? ec : null; }
+
+/** The event's rewards: shop items nobody can buy (kept in events/items.json, so players keep them after it). */
+function eventRewardItems(ec) {
+  const r = { price: 0, reward: true, minVersion: "2.0.0", note: `From the ${ec.name} event` };
+  const year = new Date(Date.parse(ec.starts) || Date.now()).getUTCFullYear();
+  return [
+    { ...r, id: `title-ev-${ec.id}`, kind: "title", name: /\b\d{4}\b/.test(ec.name) ? ec.name : `${ec.name} ${year}` },
+    { ...r, id: `iconcolor-ev-${ec.id}`, kind: "iconcolor", name: `${ec.name} icon colour`, color: ec.color },
+    { ...r, id: `frame-ev-${ec.id}`, kind: "frame", name: `${ec.name} frame (animated)`, color: ec.color, color2: ec.color2, anim: "duo" },
+  ];
+}
+/** Every event's reward items in the shop's list (read again every few minutes). */
+async function ensureEventItems(env) {
+  if (Date.now() - eventItemsAt < 300_000) return;
+  eventItemsAt = Date.now();
+  const d = await r2json(env, EVENT_ITEMS_KEY, { items: [] }).catch(() => ({ items: [] }));
+  const have = new Set(SHOP.map((x) => x.id));
+  for (const x of d.items || []) if (x && x.id && !have.has(x.id)) SHOP.push(x);
+}
+/** The event's missions: plays, 95%s and a full combo on its charts, and every one of its songs (2 or more). */
+function eventMissions(ec) {
+  const charts = ec.keys.length, songs = new Set(ec.songs.map((s) => s.board)).size;
+  if (!charts) return [];
+  const a = Math.min(3, charts), b = Math.min(2, charts);
+  const out = [
+    { kind: "evplay", target: a, points: 300, title: `Play ${a} different event charts`, reward: null },
+    { kind: "ev95", target: b, points: 200, title: `Get 95%+ on ${b} event charts`, reward: `title-ev-${ec.id}` },
+    { kind: "evfc", target: 1, points: 200, title: "Full combo an event chart", reward: `iconcolor-ev-${ec.id}` },
+  ];
+  if (songs >= 2) out.push({ kind: "evall", target: songs, points: 300, title: `Play every event song (${songs})`, reward: `frame-ev-${ec.id}` });
+  return out.map((m) => ({ ...m, id: `${ec.id}:${m.kind}` }));
+}
+
+/**
+ * Something that counts for missions: a judged board play {kind:"board", chart:"song/chart", acc, fc, fresh}, a daily
+ * chart {kind:"daily", day} or a Ranked match {kind:"ranked", roundsWon}. Moves the week's (and the event's) missions;
+ * finished ones pay out at once. Gives what was finished (for the game to show).
+ */
+async function missionEvent(env, id, ev) {
+  if (!okPlayerId(id) || isOfficial(id)) return [];
+  const wk = weekOf(), list = weekMissions(wk);
+  const ec = ev.kind === "board" ? await eventNow(env).catch(() => null) : null;
+  const evList = ec && ec.keys.includes(ev.chart) ? eventMissions(ec) : [];
+  const free = infinitePoints(id), finished = [];
+  await walletUpdate(env, id, (w) => {
+    finished.length = 0;
+    let changed = false;
+    const once = (st, kind, key) => { st.seen[kind] ||= []; if (st.seen[kind].includes(key)) return 0; st.seen[kind] = [...st.seen[kind], key].slice(-80); return 1; };
+    const pay = (title, points, item) => {
+      if (!free) { w.balance = (w.balance || 0) + points; w.earned = (w.earned || 0) + points; }
+      if (item && !w.owned.includes(item)) w.owned.push(item);
+      remember(w, { kind: "mission", title, points, item: item || undefined });
+      finished.push({ title, points, item: item || undefined });
+    };
+    if (!w.weekly || w.weekly.week !== wk.key) w.weekly = { week: wk.key, p: {}, seen: {}, done: [], bonus: false };
+    const st = w.weekly;
+    for (const m of list) {
+      if (st.done.includes(m.kind)) continue;
+      let add = 0;
+      if (ev.kind === "board") {
+        if (m.kind === "plays") add = 1;
+        else if (m.kind === "acc95" && ev.acc >= 95) add = once(st, m.kind, ev.chart);
+        else if (m.kind === "fc" && ev.fc) add = once(st, m.kind, ev.chart);
+        else if (m.kind === "fresh" && ev.fresh) add = once(st, m.kind, ev.chart);
+      } else if (ev.kind === "daily" && m.kind === "daily") add = once(st, m.kind, ev.day);
+      else if (ev.kind === "ranked" && m.kind === "ranked") add = Math.max(0, Math.min(3, ev.roundsWon || 0));
+      if (!add) continue;
+      st.p[m.kind] = Math.min(m.target, (st.p[m.kind] || 0) + add);
+      changed = true;
+      if (st.p[m.kind] >= m.target) { st.done.push(m.kind); pay(m.title, m.points); }
+    }
+    if (!st.bonus && list.length && list.every((m) => st.done.includes(m.kind))) { st.bonus = true; changed = true; pay("Every mission this week", MISSION_BONUS); }
+    if (evList.length) {
+      if (!w.event || w.event.id !== ec.id) w.event = { id: ec.id, p: {}, seen: {}, done: [] };
+      const es = w.event, song = String(ev.chart).split("/")[0];
+      for (const m of evList) {
+        if (es.done.includes(m.kind)) continue;
+        let add = 0;
+        if (m.kind === "evplay") add = once(es, m.kind, ev.chart);
+        else if (m.kind === "ev95" && ev.acc >= 95) add = once(es, m.kind, ev.chart);
+        else if (m.kind === "evfc" && ev.fc) add = once(es, m.kind, ev.chart);
+        else if (m.kind === "evall") add = once(es, m.kind, song);
+        if (!add) continue;
+        es.p[m.kind] = Math.min(m.target, (es.p[m.kind] || 0) + add);
+        changed = true;
+        if (es.p[m.kind] >= m.target) { es.done.push(m.kind); pay(m.title, m.points, m.reward); }
+      }
+    }
+    if (!changed) return false;
+  });
+  if (finished.some((f) => f.item)) await writeCosmetics(env, id, await walletOf(env, id)).catch(() => {});
+  return finished;
+}
+
+/** Four new shop items every Ranked season, for sale only while it runs (owners keep them). */
+const SEASON_THEMES = [
+  ["Borealis", "Chaser", "#3FE0C5", "#8A5CFF"], ["Cinder", "Heart", "#FF6A3D", "#FFC94D"], ["Tidal", "Rider", "#2E7BFF", "#3FE0C5"],
+  ["Bloom", "Dancer", "#FF8AD8", "#FFF06B"], ["Storm", "Caller", "#8FA8FF", "#FFFFFF"], ["Venom", "Fang", "#7CFF3D", "#1B1F5E"],
+  ["Dusk", "Walker", "#FF4FA3", "#2F5BFF"], ["Glacier", "Soul", "#B9F2FF", "#3FA9FF"], ["Solar", "Flare", "#FFC94D", "#FF2E00"],
+  ["Nebula", "Drifter", "#A77BFF", "#FF6FB5"], ["Jade", "Spirit", "#1FCB76", "#FFF8E7"], ["Scarlet", "Tide", "#E0193A", "#FFB38A"],
+];
+function seasonCollection(n) {
+  const [theme, noun, c1, c2] = SEASON_THEMES[n % SEASON_THEMES.length];
+  const m = RK_SEASON0_MONTH + n;
+  const from = new Date(Date.UTC(Math.floor(m / 12), m % 12, 1)).toISOString(), to = new Date(Date.UTC(Math.floor(m / 12), m % 12 + 1, 1)).toISOString();
+  const base = { from, to, collection: n, minVersion: "2.0.0", note: `Season ${n} collection: only in the shop until the season ends` };
+  return [
+    { ...base, id: `frame-sc${n}-duo`, kind: "frame", name: `${theme} frame (animated)`, color: c1, color2: c2, anim: "duo", price: 3500 },
+    { ...base, id: `frame-sc${n}`, kind: "frame", name: `${theme} frame`, color: c1, price: 900 },
+    { ...base, id: `iconcolor-sc${n}`, kind: "iconcolor", name: `${theme} icon colour`, color: c1, price: 300 },
+    { ...base, id: `title-sc${n}`, kind: "title", name: `${theme} ${noun}`, price: 600 },
+  ];
+}
+let seasonColUpTo = -1;
+function ensureSeasonCollections() {
+  const want = rkSeason().n;
+  if (seasonColUpTo >= want) return;
+  const have = new Set(SHOP.map((x) => x.id));
+  for (let n = 0; n <= want; n++) for (const x of seasonCollection(n)) if (!have.has(x.id)) SHOP.push(x);
+  seasonColUpTo = want;
+}
+
+/** The Missions page: this week's missions, the event (if one is on) and the season's new shop items. */
+async function missionsView(env, who) {
+  const wk = weekOf(), list = weekMissions(wk);
+  const w = who ? await walletOf(env, who.playerId) : null;
+  const st = w && w.weekly && w.weekly.week === wk.key ? w.weekly : { p: {}, done: [], bonus: false };
+  const ec = await eventNow(env).catch(() => null);
+  const es = ec && w && w.event && w.event.id === ec.id ? w.event : { p: {}, done: [] };
+  ensureSeasonCollections();
+  const sn = rkSeason();
+  return {
+    week: wk.key, ends: new Date(wk.ends).toISOString(),
+    missions: list.map((m) => ({ id: m.id, kind: m.kind, title: m.title, desc: m.desc, target: m.target, progress: Math.min(m.target, st.p[m.kind] || 0), points: m.points, done: st.done.includes(m.kind) })),
+    bonus: { points: MISSION_BONUS, done: !!st.bonus },
+    event: ec ? {
+      id: ec.id, name: ec.name, color: ec.color, color2: ec.color2, starts: ec.starts, ends: ec.ends, songs: ec.songs,
+      missions: eventMissions(ec).map((m) => ({ id: m.id, kind: m.kind, title: m.title, target: m.target, progress: Math.min(m.target, es.p[m.kind] || 0), points: m.points, reward: m.reward, done: es.done.includes(m.kind) })),
+      rewards: eventRewardItems(ec),
+    } : null,
+    collection: { season: sn.n, ends: new Date(sn.ends).toISOString(), items: seasonCollection(sn.n) },
+  };
+}
+
+/** Staff: an event's start, songs, end and announcement (Senterra and the official account; the command bar's /event). */
+async function eventAdmin(env, who, b) {
+  if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account can run events.");
+  const action = String(b.action || "status"), now = Date.now();
+  let ec = await r2json(env, EVENT_KEY, null);
+  const save = async () => { await r2put(env, EVENT_KEY, ec); eventCacheAt = 0; };
+  const itemIdOf = (v) => { const m = /([a-z0-9]{16,40})\s*$/i.exec(String(v || "").trim()); return m ? m[1].toLowerCase() : ""; };
+  const describe = async () => {
+    const r = await eventRecord(env, true);
+    if (!r) return "No event.";
+    const live = eventLive(r), when = live ? `ends ${r.ends.slice(0, 10)}` : now < Date.parse(r.starts) ? `starts ${r.starts.slice(0, 10)}` : `ended ${r.ends.slice(0, 10)}`;
+    return `${r.name} (${when}): ${r.songs.length} songs, ${r.keys.length} charts.` + (r.songs.some((s) => !s.verified) ? " Some songs aren't verified: their plays aren't judged, so they don't count." : "");
+  };
+  if (action === "start") {
+    const name = cleanText(b.name, 40);
+    if (name.length < 3) fail(400, "Give the event a name (3 to 40 letters).");
+    const days = Math.round(Number(b.days) || 0);
+    if (!(days >= 1 && days <= 60)) fail(400, "An event runs 1 to 60 days.");
+    if (eventLive(ec, now)) fail(409, `${ec.name} is still on: end it first (/event end).`);
+    const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "event";
+    const pick = EVENT_COLORS[[...slug].reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) >>> 0, 7) % EVENT_COLORS.length];
+    const color = /^#[0-9A-Fa-f]{6}$/.test(String(b.color || "")) ? String(b.color).toUpperCase() : pick[0];
+    ec = { id: `${slug}-${new Date(now).toISOString().slice(0, 10).replace(/-/g, "")}`, name, color, color2: color === pick[0] ? pick[1] : "#FFFFFF",
+      starts: new Date(now).toISOString(), ends: new Date(now + days * 86_400_000).toISOString(), items: [], by: who.playerId, at: new Date(now).toISOString() };
+    await save();
+    await r2update(env, EVENT_ITEMS_KEY, () => ({ items: [] }), (d) => { d.items ||= []; const have = new Set(d.items.map((x) => x.id)); for (const x of eventRewardItems(ec)) if (!have.has(x.id)) d.items.push(x); });
+    eventItemsAt = 0;
+    return { ok: true, text: `${name} started: ${days} days. Add its songs with /event add <Workshop link or id>, then /event announce.` };
+  }
+  if (!ec) fail(404, "There's no event. Start one: /event start <days> <name>");
+  if (action === "add" || action === "remove") {
+    const id = itemIdOf(b.item);
+    if (!id) fail(400, "Give a Workshop link or item id.");
+    if (action === "add") {
+      const it = ((await judgeDb(env)).items || []).find((x) => x.id === id);
+      if (!it || it.removed || it.type !== "charts") fail(404, "That Workshop chart can't be found.");
+      if (!it.verified) fail(400, `"${it.title}" isn't verified: only verified songs' plays are judged, so verify it first.`);
+      ec.items = [...new Set([...(ec.items || []), id])].slice(0, 30);
+    } else ec.items = (ec.items || []).filter((x) => x !== id);
+    await save();
+    return { ok: true, text: await describe() };
+  }
+  if (action === "end") { ec.ends = new Date(now).toISOString(); await save(); return { ok: true, text: `${ec.name} ended.` }; }
+  if (action === "announce") {
+    const r = await eventRecord(env, true);
+    if (!eventLive(r)) fail(400, "The event isn't on.");
+    if (!r.songs.length) fail(400, "Add its songs first (/event add).");
+    const item = { id: crypto.randomUUID().replace(/-/g, "").slice(0, 16), at: new Date(now).toISOString(), kind: "custom", title: `${r.name} has started`,
+      message: `A new event until ${new Date(Date.parse(r.ends)).toUTCString().slice(5, 16)}: play its ${r.songs.length} songs for points, a title, an icon colour and an animated frame. Open Daily & Shop → Missions.`,
+      fromId: who.playerId, fromName: isOfficial(who.playerId) ? "OCTIVE" : await displayName(env, who.playerId) };
+    await r2update(env, "notices/everyone.json", () => ({ items: [] }), (d) => { d.items = [item, ...(d.items || [])].slice(0, 50); });
+    return { ok: true, text: "Everyone was told (News)." };
+  }
+  return { ok: true, text: await describe() };
+}
+
+// ---------------------------------------------------------------- crews (2.0)
+// Small teams of up to 12: a name, a 2-4 letter tag shown beside members' names, a colour. The owner invites players
+// (they accept from their notifications), can remove members and edit the crew; anyone can leave. A crew's score is the
+// sum of its 5 best members' PR (the server's ranking PR), so bigger isn't better past five. R2: crews/<id>.json, and
+// crews/index.json for the crew board and name / tag checks; a player's crew is on their wallet (w.crew: id, tag, colour),
+// so it goes out with their cosmetics like a title.
+const CREW_MAX = 12, CREW_INDEX = "crews/index.json";
+const crewKey = (id) => `crews/${id}.json`;
+const CREW_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 _.'-]{1,22}[A-Za-z0-9.']$/, CREW_TAG_RE = /^[A-Z0-9]{2,4}$/;
+const CREW_TAG_RESERVED = ["DEV", "MOD", "OCT", "GM", "ADMN", "STAF", "OCTV", "BOT", "AI"];
+function crewCheck(name, tag, staff) {
+  if (!CREW_NAME_RE.test(name)) fail(400, "A crew name is 3 to 24 letters, numbers, spaces and - _ . '");
+  if (!CREW_TAG_RE.test(tag)) fail(400, "A tag is 2 to 4 capital letters or numbers.");
+  if (!staff && (/octive|official|moderat|admin|developer/i.test(name) || CREW_TAG_RESERVED.includes(tag))) fail(400, "That name or tag is kept for OCTIVE.");
+}
+const crewColor = (c) => (/^#[0-9A-Fa-f]{6}$/.test(String(c || "")) ? String(c).toUpperCase() : "#3FD8FF");
+/** What a member's cosmetics carry: the crew's id, tag and colour. */
+const crewBadge = (c) => ({ id: c.id, tag: c.tag, color: c.color });
+
+/** The sum of the 5 best members' PR (from their ranking records). */
+async function crewScore(env, c) {
+  const pps = await Promise.all((c.members || []).map(async (m) => { const r = await r2json(env, `rank/players/${m.id}.json`, null); return r && Number(r.pp) > 0 ? round2(Number(r.pp)) : 0; }));
+  (c.members || []).forEach((m, i) => { m.pp = pps[i]; });
+  return round2([...pps].sort((a, b) => b - a).slice(0, 5).reduce((s, x) => s + x, 0));
+}
+/** Writes the crew's line on the crew board (or takes it off when it's gone). */
+async function crewIndexSet(env, c) {
+  await r2update(env, CREW_INDEX, () => ({ crews: {} }), (d) => {
+    d.crews ||= {};
+    if (!c || c.gone) { if (c) delete d.crews[c.id]; return; }
+    d.crews[c.id] = { name: c.name, tag: c.tag, color: c.color, members: (c.members || []).length, score: c.score || 0, updated: new Date(Date.now()).toISOString() };
+  });
+}
+/** Puts a player's crew on their wallet and cosmetics (null: none). */
+async function crewSetMember(env, playerId, c) {
+  const w = await walletUpdate(env, playerId, (w) => { if (c) w.crew = crewBadge(c); else { if (!w.crew) return false; delete w.crew; } });
+  if (w) await writeCosmetics(env, playerId, w);
+}
+async function crewOfPlayer(env, playerId) { const w = await walletOf(env, playerId); return w.crew && w.crew.id ? await r2json(env, crewKey(w.crew.id), null) : null; }
+function crewPublic(c, me) {
+  return { id: c.id, name: c.name, tag: c.tag, color: c.color, desc: c.desc || "", owner: c.owner, created: c.created, score: c.score || 0,
+    members: (c.members || []).map((m) => ({ id: m.id, name: m.name, role: m.id === c.owner ? "owner" : "member", joined: m.joined, pp: m.pp || 0 })).sort((a, b) => (b.role === "owner") - (a.role === "owner") || b.pp - a.pp),
+    invites: me && me === c.owner ? (c.invites || []).map((x) => ({ id: x.id, name: x.name, at: x.at })) : undefined,
+    invited: me ? (c.invites || []).some((x) => x.id === me) : undefined, max: CREW_MAX, wars: c.wars || { wins: 0, podiums: 0 } };
+}
+/** Keeps a member's PR on their crew current (from the ranking sync): only when it moved. */
+async function crewTouch(env, playerId, pp) {
+  const w = await walletOf(env, playerId);
+  if (!w.crew || !w.crew.id) return;
+  const cur = await r2json(env, crewKey(w.crew.id), null);
+  if (!cur || cur.gone) return;
+  const m = (cur.members || []).find((x) => x.id === playerId);
+  if (!m || Math.abs((m.pp || 0) - pp) < 0.5) return;
+  let out = null;
+  await r2update(env, crewKey(cur.id), () => null, (c) => {
+    if (!c || c.gone) return false;
+    const mm = (c.members || []).find((x) => x.id === playerId);
+    if (!mm) return false;
+    mm.pp = round2(pp);
+    c.score = round2((c.members || []).map((x) => x.pp || 0).sort((a, b) => b - a).slice(0, 5).reduce((s, x) => s + x, 0));
+    out = c;
+  });
+  if (out) await crewIndexSet(env, out);
+}
+
+// =====================================================================================================
+// Crew wars (2.0): every week, five verified 4K charts (one per difficulty band, the same for everyone). A crew's war
+// score is the sum, over the five, of its best member's PR on each (judged leaderboard plays during that week).
+// When the week ends the top three crews win: every member gets points, the crew keeps the trophy count.
+//   crews/war/<week>.json  { week, ends, charts: [...], crews: { crewId: { name, tag, color, best: { chartKey: { pp, by, name } }, total } }, settled }
+// =====================================================================================================
+const warKey = (wk) => `crews/war/${wk}.json`;
+const WAR_BANDS = [[1.5, 2.5], [2.5, 3.5], [3.5, 4.5], [4.5, 5.5], [5.5, 99]];
+const WAR_PRIZES = [500, 300, 150];
+
+/** The week's five charts: verified 4K difficulties, one per band, picked by the week (so everyone gets the same). */
+async function warCharts(env, wk) {
+  const db = await r2json(env, WS_DB, { items: [] });
+  const pool = [];
+  for (const it of db.items || []) {
+    if (it.removed || it.type !== "charts" || !it.verified) continue;
+    for (const c of wsChartsOf(it)) {
+      const st = Number(c.stars) || 0, keys = Number(c.keys) || 4;
+      if (keys !== 4 || st < 1) continue;
+      const key = wsChartKey(c);
+      pool.push({ key, songId: c.songId, chartId: c.chartId, osuMd5: c.osuMd5 || undefined, osuSet: Number(c.osuSet) || undefined, itemId: it.id,
+        title: String(it.title || "").slice(0, 80), difficulty: String(c.difficulty || c.name || "").slice(0, 60), stars: round2(st), keys });
+    }
+  }
+  const rnd = seededRandom(((wk.n * 2654435761) >>> 0) || 1);
+  const picked = [], used = new Set();
+  for (const [lo, hi] of WAR_BANDS) {
+    const band = pool.filter((c) => c.stars >= lo && c.stars < hi && !used.has(c.itemId));
+    const from = band.length ? band : pool.filter((c) => !used.has(c.itemId));
+    if (!from.length) continue;
+    const c = from[Math.floor(rnd() * from.length) % from.length];
+    picked.push(c);
+    used.add(c.itemId);
+  }
+  return picked.sort((a, b) => a.stars - b.stars);
+}
+
+/** This week's war (made on first use). */
+async function warNow(env, wk = weekOf()) {
+  let w = await r2json(env, warKey(wk.key), null);
+  if (!w) {
+    const fresh = { week: wk.key, ends: new Date(wk.ends).toISOString(), charts: await warCharts(env, wk), crews: {} };
+    // another request may have made it meanwhile: theirs stays
+    w = await r2update(env, warKey(wk.key), () => fresh, (cur) => { if (cur !== fresh) return false; });
+  }
+  return w;
+}
+
+/** A judged leaderboard play: when its chart is in this week's war and the player is in a crew, it may raise the crew's best. */
+async function warPlay(env, playerId, board, chartId, pp) {
+  if (!(pp > 0)) return;
+  const wk = weekOf();
+  const w = await warNow(env, wk);
+  const key = `${board}/${chartId}`;
+  const ch = (w.charts || []).find((c) => c.key === key);
+  if (!ch) return;
+  const crew = await crewOfPlayer(env, playerId);
+  if (!crew || crew.gone) return;
+  const name = await rkName(env, playerId).catch(() => "");
+  await r2update(env, warKey(wk.key), () => w, (d) => {
+    d.crews ||= {};
+    const c = d.crews[crew.id] ||= { name: crew.name, tag: crew.tag, color: crew.color, best: {}, total: 0 };
+    Object.assign(c, { name: crew.name, tag: crew.tag, color: crew.color });
+    const cur = c.best[key];
+    if (cur && cur.pp >= pp) return false;
+    c.best[key] = { pp: round2(pp), by: playerId, name };
+    c.total = round2(Object.values(c.best).reduce((s2, x) => s2 + (x.pp || 0), 0));
+  });
+}
+
+function warStandings(w) {
+  return Object.entries(w.crews || {}).map(([id, c]) => ({ id, ...c })).sort((a, b) => b.total - a.total || a.name.localeCompare(b.name)).map((c, i) => ({ ...c, rank: i + 1 }));
+}
+
+/** A finished week: the top three crews' members get points and a notice; the crew keeps a trophy. Once. */
+async function warSettle(env, wkKey) {
+  let w = null;
+  await r2update(env, warKey(wkKey), () => null, (d) => { if (!d || d.settled) return false; d.settled = new Date(Date.now()).toISOString(); w = d; });
+  if (!w) return;
+  const top = warStandings(w).filter((c) => c.total > 0).slice(0, WAR_PRIZES.length);
+  for (const [i, c] of top.entries()) {
+    const crew = await r2json(env, crewKey(c.id), null);
+    if (!crew || crew.gone) continue;
+    await r2update(env, crewKey(c.id), () => null, (x) => { if (!x || x.gone) return false; x.wars ||= { wins: 0, podiums: 0 }; x.wars.podiums++; if (i === 0) x.wars.wins++; });
+    const prize = WAR_PRIZES[i];
+    for (const m of crew.members || []) {
+      await walletUpdate(env, m.id, (wl) => { wl.balance += prize; wl.earned = (wl.earned || 0) + prize; remember(wl, { kind: "crew-war", place: i + 1, points: prize, week: wkKey }); }).catch(() => {});
+      await addNotice(env, m.id, { kind: "crew", what: "war", place: i + 1, points: prize, crewId: c.id, tag: crew.tag, crewName: crew.name, week: wkKey }).catch(() => {});
+    }
+  }
+}
+
+/** The hourly check: last week's war is settled once it's over. */
+async function warTick(env) {
+  const last = weekOf(Date.now() - 7 * 86_400_000);
+  const w = await r2json(env, warKey(last.key), null);
+  if (w && !w.settled) await warSettle(env, last.key);
+}
+
+async function warView(env, me, which) {
+  const wk = which === "last" ? weekOf(Date.now() - 7 * 86_400_000) : weekOf();
+  const w = which === "last" ? await r2json(env, warKey(wk.key), null) : await warNow(env, wk);
+  if (!w) return { week: wk.key, charts: [], standings: [], mine: null };
+  const all = warStandings(w);
+  let mine = null;
+  if (me) {
+    const crew = await crewOfPlayer(env, me).catch(() => null);
+    if (crew && !crew.gone) mine = all.find((c) => c.id === crew.id) || { id: crew.id, name: crew.name, tag: crew.tag, color: crew.color, best: {}, total: 0, rank: null };
+  }
+  return { week: w.week, ends: w.ends, settled: w.settled || null, charts: w.charts || [], standings: all.slice(0, 50), total: all.length, mine, prizes: WAR_PRIZES };
+}
+
+async function crewRoutes(request, env, url, path) {
+  if (path === "/play/crews/war" && request.method === "GET") {
+    let me = null;
+    if (request.headers.get("Authorization")) me = (await signedIn(request, env).catch(() => null))?.playerId || null;
+    if (url.searchParams.get("week") !== "last") await warTick(env).catch(() => {});
+    return reply(await warView(env, me, url.searchParams.get("week")));
+  }
+  if (path === "/play/crews" && request.method === "GET") {
+    const d = await r2json(env, CREW_INDEX, { crews: {} });
+    const list = Object.entries(d.crews || {}).map(([id, c]) => ({ id, ...c })).sort((a, b) => b.score - a.score || a.name.localeCompare(b.name)).slice(0, 100);
+    return reply({ crews: list.map((c, i) => ({ ...c, rank: i + 1 })), total: Object.keys(d.crews || {}).length });
+  }
+  if (path === "/play/crews/of" && request.method === "GET") {
+    const id = String(url.searchParams.get("id") || "");
+    let me = null;
+    if (request.headers.get("Authorization")) me = (await signedIn(request, env).catch(() => null))?.playerId || null;
+    const c = /^[a-z0-9]{10,24}$/.test(id) ? await r2json(env, crewKey(id), null) : me ? await crewOfPlayer(env, me) : null;
+    if (!c || c.gone) return reply({ crew: null });
+    const idx = await r2json(env, CREW_INDEX, { crews: {} });
+    const rank = Object.values(idx.crews || {}).filter((x) => x.score > (c.score || 0)).length + 1;
+    return reply({ crew: { ...crewPublic(c, me), rank } });
+  }
+  if (request.method !== "POST") fail(404, "Not found.");
+  const who = await signedIn(request, env), me = who.playerId;
+  const b = await bodyOf(request, 4_000);
+  const staff = me === OWNER || isOfficial(me);
+  if (moderation.bans[me]) fail(403, "This account is banned.");
+  const myName = await displayName(env, me);
+  if (path === "/play/crews/create") {
+    if ((await walletOf(env, me)).crew) fail(409, "You're in a crew already: leave it first.");
+    const name = cleanText(b.name, 24), tag = String(b.tag || "").trim().toUpperCase();
+    crewCheck(name, tag, staff);
+    const idx = await r2json(env, CREW_INDEX, { crews: {} });
+    for (const x of Object.values(idx.crews || {})) {
+      if (x.tag === tag) fail(409, `The tag ${tag} is taken.`);
+      if (String(x.name).toLowerCase() === name.toLowerCase()) fail(409, "A crew has that name already.");
+    }
+    const c = { id: rkNewId().slice(0, 16), name, tag, color: crewColor(b.color), desc: cleanText(b.desc, 120), owner: me, created: new Date(Date.now()).toISOString(),
+      members: [{ id: me, name: myName, joined: new Date(Date.now()).toISOString() }], invites: [] };
+    c.score = await crewScore(env, c);
+    await r2put(env, crewKey(c.id), c);
+    await crewIndexSet(env, c);
+    await crewSetMember(env, me, c);
+    return reply({ ok: true, crew: crewPublic(c, me) });
+  }
+  if (path === "/play/crews/accept" || path === "/play/crews/decline") {
+    const id = String(b.crew || "");
+    const accept = path.endsWith("accept");
+    if (accept && (await walletOf(env, me)).crew) fail(409, "You're in a crew already: leave it first.");
+    let why = null, out = null;
+    await r2update(env, crewKey(id), () => null, (c) => {
+      if (!c || c.gone) { why = "That crew isn't there any more."; return false; }
+      if (!(c.invites || []).some((x) => x.id === me)) { why = accept ? "That invite was taken back (or it's too old)." : null; return false; }
+      c.invites = c.invites.filter((x) => x.id !== me);
+      if (accept) {
+        if ((c.members || []).length >= CREW_MAX) { why = `That crew is full (${CREW_MAX} members).`; return false; }
+        c.members.push({ id: me, name: myName, joined: new Date(Date.now()).toISOString() });
+      }
+      out = c;
+    });
+    if (why) fail(409, why);
+    if (accept && out) {
+      out.score = await crewScore(env, out);
+      await r2put(env, crewKey(out.id), out);
+      await crewIndexSet(env, out);
+      await crewSetMember(env, me, out);
+      await addNotice(env, out.owner, { kind: "crew", what: "joined", crewId: out.id, crewName: out.name, tag: out.tag, byId: me, byName: myName }).catch(() => {});
+    }
+    return reply({ ok: true, crew: out ? crewPublic(out, me) : null });
+  }
+  // the rest: your crew
+  const mine = await crewOfPlayer(env, me);
+  if (!mine || mine.gone) fail(404, "You're not in a crew.");
+  const owner = mine.owner === me;
+  if (path === "/play/crews/invite") {
+    if (!owner) fail(403, "Only the crew's owner can invite.");
+    const to = String(b.player || "");
+    if (!okPlayerId(to) || to === me || isOfficial(to)) fail(400, "You can't invite that player.");
+    if (moderation.bans[to]) fail(403, "That player is banned.");
+    if ((await walletOf(env, to)).crew) fail(409, "They're in a crew already.");
+    const toName = await displayName(env, to);
+    let why = null;
+    await r2update(env, crewKey(mine.id), () => null, (c) => {
+      if (!c || c.gone) { why = "Your crew isn't there any more."; return false; }
+      if ((c.members || []).length + (c.invites || []).length >= CREW_MAX + 8) { why = "Too many invites waiting: wait for some answers first."; return false; }
+      if ((c.members || []).length >= CREW_MAX) { why = `Your crew is full (${CREW_MAX} members).`; return false; }
+      if ((c.invites || []).some((x) => x.id === to)) { why = "They're invited already."; return false; }
+      c.invites = [...(c.invites || []), { id: to, name: toName, by: me, at: new Date(Date.now()).toISOString() }].slice(-20);
+    });
+    if (why) fail(409, why);
+    await addNotice(env, to, { kind: "crew", what: "invite", crewId: mine.id, crewName: mine.name, tag: mine.tag, byId: me, byName: myName });
+    return reply({ ok: true, text: `${toName} was invited to ${mine.name}.` });
+  }
+  if (path === "/play/crews/uninvite") {
+    if (!owner) fail(403, "Only the crew's owner can do that.");
+    const to = String(b.player || "");
+    await r2update(env, crewKey(mine.id), () => null, (c) => { if (!c) return false; c.invites = (c.invites || []).filter((x) => x.id !== to); });
+    return reply({ ok: true });
+  }
+  if (path === "/play/crews/leave" || path === "/play/crews/kick") {
+    const kick = path.endsWith("kick");
+    const out = kick ? String(b.player || "") : me;
+    if (kick && !owner) fail(403, "Only the crew's owner can remove members.");
+    if (kick && out === me) fail(400, "Leave the crew instead.");
+    let next = null;
+    await r2update(env, crewKey(mine.id), () => null, (c) => {
+      if (!c || c.gone) return false;
+      if (!(c.members || []).some((x) => x.id === out)) return false;
+      c.members = c.members.filter((x) => x.id !== out);
+      // the owner left: the member who joined first takes over; nobody left: the crew is gone
+      if (c.owner === out) { if (c.members.length) c.owner = [...c.members].sort((x, y) => Date.parse(x.joined) - Date.parse(y.joined))[0].id; else c.gone = true; }
+      next = c;
+    });
+    await crewSetMember(env, out, null);
+    if (next) {
+      if (!next.gone) next.score = await crewScore(env, next);
+      await r2put(env, crewKey(next.id), next);
+      await crewIndexSet(env, next);
+      if (kick) await addNotice(env, out, { kind: "crew", what: "removed", crewId: next.id, crewName: next.name, tag: next.tag, byId: me, byName: myName }).catch(() => {});
+    }
+    return reply({ ok: true, gone: !!(next && next.gone) });
+  }
+  if (path === "/play/crews/edit") {
+    if (!owner) fail(403, "Only the crew's owner can edit it.");
+    const name = b.name !== undefined ? cleanText(b.name, 24) : mine.name, tag = b.tag !== undefined ? String(b.tag || "").trim().toUpperCase() : mine.tag;
+    crewCheck(name, tag, staff);
+    const idx = await r2json(env, CREW_INDEX, { crews: {} });
+    for (const [id, x] of Object.entries(idx.crews || {})) {
+      if (id === mine.id) continue;
+      if (x.tag === tag) fail(409, `The tag ${tag} is taken.`);
+      if (String(x.name).toLowerCase() === name.toLowerCase()) fail(409, "A crew has that name already.");
+    }
+    let out = null;
+    await r2update(env, crewKey(mine.id), () => null, (c) => {
+      if (!c || c.gone) return false;
+      c.name = name; c.tag = tag; if (b.color !== undefined) c.color = crewColor(b.color); if (b.desc !== undefined) c.desc = cleanText(b.desc, 120);
+      out = c;
+    });
+    if (!out) fail(404, "Your crew isn't there any more.");
+    await crewIndexSet(env, out);
+    // every member's tag changes with it
+    for (const m of out.members || []) await crewSetMember(env, m.id, out).catch(() => {});
+    return reply({ ok: true, crew: crewPublic(out, me) });
+  }
+  fail(404, "Not found.");
+}
+
+// ---------------------------------------------------------------- chart requests (2.0)
+// Players ask for a song to be charted (a title, an artist, a link to the music, the key count they'd like, a note);
+// others say "me too"; anyone who charts claims one (3 at a time), and when they upload it to the Workshop they mark it
+// done with that upload: the player who asked, and everyone who wanted it, are told. R2: requests/charts.json.
+const REQ_KEY = "requests/charts.json", REQ_OPEN_MAX = 3, REQ_CLAIM_MAX = 3, REQ_TOTAL_MAX = 400;
+const REQ_LINK_HOSTS = ["osu.ppy.sh", "youtube.com", "youtu.be", "soundcloud.com", "open.spotify.com", "spotify.com", "bandcamp.com", "nicovideo.jp", "music.apple.com"];
+/** A link to the music, only to well-known music sites (https). */
+function reqLink(v) {
+  try {
+    const u = new URL(String(v || "").trim());
+    const h = u.hostname.toLowerCase();
+    if (u.protocol !== "https:" || !REQ_LINK_HOSTS.some((x) => h === x || h.endsWith("." + x))) return "";
+    return u.toString().slice(0, 200);
+  } catch { return ""; }
+}
+function reqPublic(r, me) {
+  return { id: r.id, title: r.title, artist: r.artist, link: r.link || undefined, keys: r.keys || 0, note: r.note || "", by: r.by, byName: r.byName, at: r.at,
+    votes: (r.votes || []).length, voted: me ? (r.votes || []).includes(me) : undefined,
+    claimedBy: r.claimedBy || undefined, claimedName: r.claimedName || undefined, claimedAt: r.claimedAt || undefined,
+    filled: r.filled ? { itemId: r.filled.itemId, title: r.filled.title, at: r.filled.at, by: r.filled.by, byName: r.filled.byName } : undefined };
+}
+async function requestRoutes(request, env, url, path) {
+  if (path === "/play/requests" && request.method === "GET") {
+    let me = null;
+    if (request.headers.get("Authorization")) me = (await signedIn(request, env).catch(() => null))?.playerId || null;
+    const d = await r2json(env, REQ_KEY, { items: [] }), now = Date.now();
+    const live = (d.items || []).filter((r) => !r.removed && !moderation.bans[r.by]);
+    // still wanted (the most wanted first), then the last 30 days' charted ones
+    const open = live.filter((r) => !r.filled).sort((a, b) => (b.votes || []).length - (a.votes || []).length || Date.parse(b.at) - Date.parse(a.at));
+    const done = live.filter((r) => r.filled && now - Date.parse(r.filled.at) < 30 * 86_400_000).sort((a, b) => Date.parse(b.filled.at) - Date.parse(a.filled.at)).slice(0, 40);
+    return reply({ items: [...open, ...done].map((r) => reqPublic(r, me)), openMax: REQ_OPEN_MAX, claimMax: REQ_CLAIM_MAX });
+  }
+  if (request.method !== "POST") fail(404, "Not found.");
+  const who = await signedIn(request, env), me = who.playerId;
+  if (moderation.bans[me]) fail(403, "This account is banned.");
+  const b = await bodyOf(request, 4_000);
+  const id = String(b.id || "");
+  const myName = await displayName(env, me);
+  const now = new Date(Date.now()).toISOString();
+  const tell = async (to, n) => { if (to && to !== me) await addNotice(env, to, { kind: "request", ...n }).catch(() => {}); };
+  if (path === "/play/requests/new") {
+    const title = cleanText(b.title, 80), artist = cleanText(b.artist, 60), note = cleanText(b.note, 200), link = reqLink(b.link);
+    const keys = [4, 5, 6, 7, 8, 9, 10].includes(Number(b.keys)) ? Number(b.keys) : 0;
+    if (title.length < 2) fail(400, "Give the song's title.");
+    if (b.link && !link) fail(400, "Links can only go to osu!, YouTube, SoundCloud, Spotify, Bandcamp, Niconico or Apple Music (https).");
+    let out = null, why = null;
+    await r2update(env, REQ_KEY, () => ({ items: [] }), (d) => {
+      d.items ||= [];
+      const open = d.items.filter((r) => !r.removed && !r.filled);
+      if (open.filter((r) => r.by === me).length >= REQ_OPEN_MAX) { why = `You have ${REQ_OPEN_MAX} requests waiting: wait for one to be charted (or take one back).`; return false; }
+      // the same song asked again: a "me too" on it instead
+      const same = open.find((r) => r.title.toLowerCase() === title.toLowerCase() && (r.artist || "").toLowerCase() === artist.toLowerCase());
+      if (same) { if (same.by !== me && !(same.votes || []).includes(me)) same.votes = [...(same.votes || []), me]; out = same; return; }
+      if (open.length >= REQ_TOTAL_MAX) { why = "There are a lot of requests waiting: try again once some are charted."; return false; }
+      out = { id: rkNewId().slice(0, 14), title, artist, note, link, keys, by: me, byName: myName, at: now, votes: [] };
+      d.items.push(out);
+      // charted ones over 60 days old and removed ones leave the file
+      d.items = d.items.filter((r) => !(r.removed || (r.filled && Date.now() - Date.parse(r.filled.at) > 60 * 86_400_000)) || r === out);
+    });
+    if (why) fail(409, why);
+    return reply({ ok: true, request: reqPublic(out, me), merged: out.by !== me });
+  }
+  let r0 = null, why = null, changed = null;
+  const update = (fn) => r2update(env, REQ_KEY, () => ({ items: [] }), (d) => {
+    const r = (d.items || []).find((x) => x.id === id && !x.removed);
+    if (!r) { why = "That request isn't there any more."; return false; }
+    r0 = { ...r };
+    const res = fn(r, d);
+    if (res === false) return false;
+    changed = r;
+  });
+  if (path === "/play/requests/vote") {
+    await update((r) => { if (r.by === me || r.filled) return false; r.votes = (r.votes || []).includes(me) ? r.votes.filter((x) => x !== me) : [...(r.votes || []), me]; });
+    if (why) fail(404, why);
+    return reply({ ok: true, request: changed ? reqPublic(changed, me) : null });
+  }
+  if (path === "/play/requests/claim") {
+    await update((r, d) => {
+      if (r.filled) { why = "It's charted already."; return false; }
+      if (r.claimedBy && r.claimedBy !== me) { why = `${r.claimedName || "Someone"} is charting it.`; return false; }
+      if ((d.items || []).filter((x) => !x.removed && !x.filled && x.claimedBy === me).length >= REQ_CLAIM_MAX) { why = `You're charting ${REQ_CLAIM_MAX} requests already: finish one first.`; return false; }
+      r.claimedBy = me; r.claimedName = myName; r.claimedAt = now;
+    });
+    if (why) fail(409, why);
+    if (changed) await tell(changed.by, { what: "claimed", requestId: id, title: changed.title, byId: me, byName: myName });
+    return reply({ ok: true, request: changed ? reqPublic(changed, me) : null });
+  }
+  if (path === "/play/requests/unclaim") {
+    const staff = me === OWNER || isOfficial(me);
+    await update((r) => { if (r.filled || (r.claimedBy !== me && !staff)) { why = "You're not charting it."; return false; } delete r.claimedBy; delete r.claimedName; delete r.claimedAt; });
+    if (why) fail(409, why);
+    return reply({ ok: true, request: changed ? reqPublic(changed, me) : null });
+  }
+  if (path === "/play/requests/fill") {
+    const itemId = String(b.item || "").trim().toLowerCase();
+    const it = ((await r2json(env, WS_DB, { items: [] })).items || []).find((x) => x.id === itemId && !x.removed);
+    if (!it || it.type !== "charts") fail(404, "Pick one of your chart uploads in the Workshop.");
+    const staff = me === OWNER || isOfficial(me);
+    if (it.creatorId !== me && !staff) fail(403, "That upload isn't yours.");
+    await update((r) => {
+      if (r.filled) { why = "It's charted already."; return false; }
+      if (r.claimedBy && r.claimedBy !== me && !staff) { why = `${r.claimedName || "Someone"} is charting it: they mark it done.`; return false; }
+      r.filled = { itemId: it.id, title: String(it.title || "").slice(0, 80), at: now, by: me, byName: myName };
+      r.claimedBy ||= me; r.claimedName ||= myName;
+    });
+    if (why) fail(409, why);
+    if (changed) for (const to of [changed.by, ...(changed.votes || [])]) await tell(to, { what: "filled", requestId: id, title: changed.title, itemId: it.id, byId: me, byName: myName });
+    return reply({ ok: true, request: changed ? reqPublic(changed, me) : null });
+  }
+  if (path === "/play/requests/remove") {
+    let mod = false;
+    try { await modGate(env, who, null); mod = true; } catch { /* not a moderator */ }
+    await update((r) => { if (r.by !== me && !mod) { why = "Only the player who asked (or a moderator) can take it back."; return false; } r.removed = true; });
+    if (why) fail(403, why);
+    return reply({ ok: true });
+  }
+  fail(404, "Not found.");
+}
+
+// ---------------------------------------------------------------- tournaments (2.0)
+// Official only: Senterra or the official account starts one (the game's command bar /tournament, or the Discord bot's
+// /tournament): a name, a star range, a size (4 to 32), how long sign-ups stay open, a prize title and the channel the
+// bot posts in. Players sign up in the game (Play → Tournaments, shown only while one is on). When sign-ups close the
+// server seeds a bracket by Ranked rating (the top seeds get byes). Every match is the friendly Ranked format on the
+// tournament's stars: both players press Ready on the tournament screen and the match starts for both; the winner moves
+// on. A round lasts a day at most: a player who was ready wins a match the other missed (neither: the higher seed goes
+// through). The bot posts the start and the results; the champion and the runner-up get titles. R2: tournaments/current.json.
+const TOUR_KEY = "tournaments/current.json", TOUR_ROUND_MS = 24 * 3_600_000, TOUR_READY_MS = 10 * 60_000;
+/** Bracket places for n seeds (a power of 2): the best seeds meet as late as they can. */
+function tourSeedOrder(n) {
+  let order = [1];
+  while (order.length < n) { const m = order.length * 2 + 1; order = order.flatMap((s) => [s, m - s]); }
+  return order;
+}
+const tourName = (t, id) => (t.players.find((p) => p.id === id) || {}).name || "Player";
+/** The undecided match a player is in (this round), or null. */
+function tourMatchOf(t, id) {
+  const r = (t.rounds || [])[(t.rounds || []).length - 1] || [];
+  return r.find((m) => !m.winner && (m.a === id || m.b === id)) || null;
+}
+function tourRewardItems(t) {
+  const r = { price: 0, reward: true, minVersion: "2.0.0" };
+  return [
+    { ...r, id: `title-tour-${t.id}-1`, kind: "title", name: t.prize || `${t.name} Champion`, note: `Won the ${t.name} tournament` },
+    { ...r, id: `title-tour-${t.id}-2`, kind: "title", name: `${t.name} Finalist`, note: `Made the final of the ${t.name} tournament` },
+  ];
+}
+let tourChannel = { name: null, id: null, at: 0 };
+async function channelByName(env, name) {
+  if (tourChannel.name === name && Date.now() - tourChannel.at < 600_000) return tourChannel.id;
+  const list = await discordApi(env, "GET", `/guilds/${env.DISCORD_GUILD_ID}/channels`);
+  const c = (list || []).find((x) => x.name === name && (x.type === 0 || x.type === 5));
+  tourChannel = { name, id: c ? c.id : null, at: Date.now() };
+  return tourChannel.id;
+}
+async function tourPost(env, t, embed) {
+  try {
+    if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID) return;
+    const ch = await channelByName(env, t.channel || "octive-scores");
+    if (!ch) { console.log("tournament post: #" + (t.channel || "octive-scores") + " not found"); return; }
+    await discordApi(env, "POST", `/channels/${ch}/messages`, { embeds: [embed], allowed_mentions: { parse: [] } });
+  } catch (e) { console.log("tournament post", e && e.message); }
+}
+
+/** Moves a tournament along: sign-ups closing, missed matches, the next round, the end. True when it changed. */
+async function tourTick(env, t, now = Date.now()) {
+  if (!t) return false;
+  let changed = false;
+  if (t.state === "signup" && now >= Date.parse(t.signupEnds)) { tourStart(t, now); changed = true; }
+  if (t.state === "running") {
+    const r = t.rounds[t.rounds.length - 1];
+    if (now >= (t.roundEnds[t.rounds.length - 1] || 0)) {
+      for (const m of r) {
+        if (m.winner) continue;
+        if (m.match) { // a match still being played gets an hour more
+          const live = await r2json(env, rkMatchKey(m.match), null);
+          if (live && live.state !== "done" && live.state !== "cancelled" && now < (t.roundEnds[t.rounds.length - 1] || 0) + 3_600_000) continue;
+        }
+        const ra = m.ready && m.ready[m.a], rb = m.ready && m.ready[m.b];
+        m.winner = ra && !rb ? m.a : rb && !ra ? m.b : t.seeds.indexOf(m.a) <= t.seeds.indexOf(m.b) ? m.a : m.b;
+        m.walkover = true;
+        changed = true;
+      }
+    }
+    if (tourNextRound(t, now)) changed = true;
+  }
+  if (t.state === "done" && !t.rewarded) { await tourFinish(env, t); changed = true; }
+  return changed;
+}
+function tourStart(t, now) {
+  const ps = [...t.players].sort((x, y) => (y.rating || 0) - (x.rating || 0)).slice(0, t.size);
+  if (ps.length < 2) { t.state = "cancelled"; t.why = "Not enough players signed up."; return; }
+  let n = 2; while (n < ps.length) n *= 2;
+  const slots = tourSeedOrder(n).map((s) => (ps[s - 1] ? ps[s - 1].id : null));
+  const round = [];
+  for (let i = 0; i < n; i += 2) {
+    const m = { a: slots[i], b: slots[i + 1], winner: null, match: null, ready: {} };
+    if (!m.b) { m.winner = m.a; m.bye = true; } else if (!m.a) { m.winner = m.b; m.bye = true; }
+    round.push(m);
+  }
+  t.seeds = ps.map((p) => p.id);
+  t.rounds = [round]; t.roundEnds = [now + TOUR_ROUND_MS]; t.state = "running";
+  tourNextRound(t, now);
+}
+/** The round is decided: the next one (or the end). */
+function tourNextRound(t, now) {
+  let changed = false;
+  for (;;) {
+    const r = t.rounds[t.rounds.length - 1];
+    if (r.some((m) => !m.winner)) return changed;
+    if (r.length === 1) {
+      const f = r[0];
+      t.champion = f.winner; t.runnerUp = f.a === f.winner ? f.b : f.a; t.state = "done"; t.ended = new Date(now).toISOString();
+      return true;
+    }
+    const next = [];
+    for (let i = 0; i < r.length; i += 2) next.push({ a: r[i].winner, b: r[i + 1].winner, winner: null, match: null, ready: {} });
+    t.rounds.push(next); t.roundEnds.push(now + TOUR_ROUND_MS);
+    changed = true;
+  }
+}
+async function tourFinish(env, t) {
+  t.rewarded = true;
+  const items = tourRewardItems(t);
+  for (const [who, item] of [[t.champion, items[0]], [t.runnerUp, items[1]]]) {
+    if (!who) continue;
+    const w = await walletUpdate(env, who, (w) => { if (w.owned.includes(item.id)) return false; w.owned.push(item.id); remember(w, { kind: "tournament", item: item.id, title: t.name }); });
+    if (w) await writeCosmetics(env, who, w).catch(() => {});
+    await addNotice(env, who, { kind: "tournament", what: who === t.champion ? "won" : "final", name: t.name, item: item.id }).catch(() => {});
+  }
+  await tourPost(env, t, { color: 0xffc94d, title: `🏆 ${modText(t.name, 60)} is over!`,
+    description: `**Champion:** ${modText(tourName(t, t.champion), 40)}\n**Runner-up:** ${modText(tourName(t, t.runnerUp), 40)}\n${t.players.length} players · ★${t.lo}–${t.hi}` });
+}
+
+function tourPublic(t, me) {
+  if (!t) return null;
+  const nm = (id) => (id ? tourName(t, id) : null);
+  const mine = me ? tourMatchOf(t, me) : null;
+  return {
+    id: t.id, name: t.name, lo: t.lo, hi: t.hi, size: t.size, prize: t.prize || `${t.name} Champion`, signupEnds: t.signupEnds, state: t.state, created: t.created, why: t.why,
+    players: t.players.map((p) => ({ id: p.id, name: p.name, tier: p.tier || 0 })), joined: !!(me && t.players.some((p) => p.id === me)),
+    rounds: (t.rounds || []).map((r) => r.map((m) => ({ a: m.a, b: m.b, aName: nm(m.a), bName: nm(m.b), winner: m.winner, bye: !!m.bye, walkover: !!m.walkover, match: m.match || null,
+      readyA: !!(m.ready && m.ready[m.a]), readyB: !!(m.ready && m.ready[m.b]) }))),
+    roundEnds: (t.roundEnds || []).map((x) => new Date(x).toISOString()),
+    champion: t.champion || null, championName: nm(t.champion), runnerUp: t.runnerUp || null, runnerUpName: nm(t.runnerUp),
+    mine: mine ? { a: mine.a, b: mine.b, opponent: mine.a === me ? mine.b : mine.a, opponentName: nm(mine.a === me ? mine.b : mine.a), match: mine.match || null,
+      ready: !!(mine.ready && mine.ready[me]), theyReady: !!(mine.ready && mine.ready[mine.a === me ? mine.b : mine.a]) } : null,
+    rewards: tourRewardItems(t),
+  };
+}
+
+/** Staff: create, start (close sign-ups now), cancel, win (a player wins their match) or status. */
+async function tourAdmin(env, who, b) {
+  if (who.playerId !== OWNER && !isOfficial(who.playerId)) fail(403, "Only Senterra and the official OCTIVE account run tournaments.");
+  const action = String(b.action || "status"), now = Date.now();
+  let t = await r2json(env, TOUR_KEY, null);
+  const live = t && (t.state === "signup" || t.state === "running");
+  if (action === "create") {
+    if (live) fail(409, `${t.name} is still on: cancel it first.`);
+    const name = cleanText(b.name, 40);
+    if (name.length < 3) fail(400, "Give the tournament a name (3 to 40 letters).");
+    const size = [4, 8, 16, 32].includes(Number(b.size)) ? Number(b.size) : 0;
+    if (!size) fail(400, "The size is 4, 8, 16 or 32 players.");
+    const minutes = Math.round(Number(b.minutes) || 0);
+    if (!(minutes >= 5 && minutes <= 7 * 24 * 60)) fail(400, "Sign-ups stay open 5 minutes to 7 days.");
+    const lo = round2(Number(b.lo)), hi = round2(Number(b.hi));
+    if (!(lo >= 1 && hi <= 12 && hi - lo >= 0.5)) fail(400, "The star range is like 4-5.5 (at least half a star wide).");
+    t = { id: rkNewId().slice(0, 12), name, size, lo, hi, prize: cleanText(b.prize, 40) || `${name} Champion`, channel: /^[a-z0-9-]{2,60}$/.test(String(b.channel || "")) ? String(b.channel) : "octive-scores",
+      signupEnds: new Date(now + minutes * 60_000).toISOString(), state: "signup", created: new Date(now).toISOString(), by: who.playerId, players: [] };
+    await r2put(env, TOUR_KEY, t);
+    await r2update(env, EVENT_ITEMS_KEY, () => ({ items: [] }), (d) => { d.items ||= []; const have = new Set(d.items.map((x) => x.id)); for (const x of tourRewardItems(t)) if (!have.has(x.id)) d.items.push(x); });
+    eventItemsAt = 0;
+    await tourPost(env, t, { color: 0xffc94d, title: `🏆 ${modText(name, 60)}`,
+      description: `A **${size}-player** OCTIVE tournament, the Ranked format on **★${lo}–${hi}** charts.\nSign up in the game: **Play → Tournaments**. Sign-ups close <t:${Math.floor((now + minutes * 60_000) / 1000)}:R>.\nPrize: the **${modText(t.prize, 40)}** title.` });
+    return { ok: true, text: `${name} is open for sign-ups for ${minutes} minutes (posted in #${t.channel}).`, tournament: tourPublic(t, who.playerId) };
+  }
+  if (!t) fail(404, "There's no tournament. Make one: /tournament create <size> <minutes> <lo>-<hi> <name>");
+  if (action === "start") {
+    if (t.state !== "signup") fail(409, "Sign-ups are closed already.");
+    t.signupEnds = new Date(now).toISOString();
+    await tourTick(env, t, now);
+    await r2put(env, TOUR_KEY, t);
+    return { ok: true, text: t.state === "cancelled" ? "Not enough players: it's cancelled." : `Sign-ups closed: ${t.players.length} players, round 1 is on.` };
+  }
+  if (action === "cancel") {
+    if (!live) fail(409, "It's over already.");
+    t.state = "cancelled"; t.why = "Cancelled by OCTIVE.";
+    await r2put(env, TOUR_KEY, t);
+    return { ok: true, text: `${t.name} is cancelled.` };
+  }
+  if (action === "win") {
+    if (t.state !== "running") fail(409, "It isn't running.");
+    const q = String(b.player || "").trim().toLowerCase();
+    const p = t.players.find((x) => x.id === b.player || x.name.toLowerCase() === q);
+    if (!p) fail(404, "That player isn't in it.");
+    const m = tourMatchOf(t, p.id);
+    if (!m) fail(409, `${p.name} has no match to win right now.`);
+    m.winner = p.id; m.byStaff = true;
+    await tourTick(env, t, now);
+    await r2put(env, TOUR_KEY, t);
+    return { ok: true, text: `${p.name} goes through.` + (t.state === "done" ? ` ${tourName(t, t.champion)} won the tournament!` : "") };
+  }
+  if (await tourTick(env, t, now)) await r2put(env, TOUR_KEY, t);
+  const r = t.rounds ? t.rounds.length : 0;
+  return { ok: true, text: `${t.name}: ${t.state}${t.state === "signup" ? `, ${t.players.length}/${t.size} signed up, closes ${t.signupEnds.slice(11, 16)} UTC` : t.state === "running" ? `, round ${r}` : t.state === "done" ? `, won by ${tourName(t, t.champion)}` : ""}.` };
+}
+
+async function tourRoutes(request, env, url, path) {
+  const now = Date.now();
+  if (path === "/play/tournament" && request.method === "GET") {
+    let me = null;
+    if (request.headers.get("Authorization")) me = (await signedIn(request, env).catch(() => null))?.playerId || null;
+    const t = await r2json(env, TOUR_KEY, null);
+    if (t && await tourTick(env, t, now)) await r2put(env, TOUR_KEY, t);
+    // a finished or cancelled one shows for 3 days
+    const shown = t && (t.state === "signup" || t.state === "running" || now - Date.parse(t.ended || t.signupEnds) < 3 * 86_400_000) ? t : null;
+    return reply({ tournament: tourPublic(shown, me) });
+  }
+  if (request.method !== "POST") fail(404, "Not found.");
+  const who = await signedIn(request, env), me = who.playerId;
+  const b = await bodyOf(request, 4_000);
+  if (path === "/play/tournament/admin") return reply(await tourAdmin(env, who, b));
+  if (moderation.bans[me]) fail(403, "This account is banned.");
+  let out = null, why = null, readyBoth = null;
+  const rec = await rkLoad(env, me);
+  const myName = await rkName(env, me);
+  await r2update(env, TOUR_KEY, () => null, (t) => {
+    why = null; readyBoth = null;
+    if (!t) { why = "There's no tournament right now."; return false; }
+    if (path === "/play/tournament/join") {
+      if (t.state !== "signup") { why = "Sign-ups are closed."; return false; }
+      if (t.players.some((p) => p.id === me)) { out = t; return false; }
+      if (t.players.length >= t.size * 2) { why = "It's full."; return false; }
+      t.players.push({ id: me, name: myName, tier: rec.placed ? rec.tier : 0, rating: Math.round(rec.rating || 0), at: new Date(now).toISOString() });
+    } else if (path === "/play/tournament/leave") {
+      if (t.state !== "signup") { why = "It has started: you can't leave now (a missed match goes to your opponent)."; return false; }
+      t.players = t.players.filter((p) => p.id !== me);
+    } else if (path === "/play/tournament/ready") {
+      if (t.state !== "running") { why = "It isn't running."; return false; }
+      const m = tourMatchOf(t, me);
+      if (!m) { why = "You have no match right now."; return false; }
+      if (m.match) { readyBoth = { m, existing: true }; out = t; return false; }
+      m.ready ||= {};
+      m.ready[me] = now;
+      const other = m.a === me ? m.b : m.a;
+      if (m.ready[other] && now - m.ready[other] < TOUR_READY_MS) readyBoth = { m, other };
+    } else { why = "Not found."; return false; }
+    out = t;
+  });
+  if (why) fail(409, why);
+  if (path === "/play/tournament/ready" && readyBoth && !readyBoth.existing) {
+    // both ready: the match starts for both (the Ranked screen picks it up)
+    const m = readyBoth.m, other = readyBoth.other;
+    const orec = await rkLoad(env, other);
+    for (const [pid, r] of [[me, rec], [other, orec]]) {
+      if (r.active) { const live = await r2json(env, rkMatchKey(r.active), null); if (live && live.state !== "done" && live.state !== "cancelled") fail(409, pid === me ? "Finish your other match first." : "Your opponent is in another match right now."); }
+    }
+    const t = out;
+    const pa = { id: m.a, name: tourName(t, m.a), tier: (m.a === me ? rec : orec).placed ? (m.a === me ? rec : orec).tier : 0, rating: Math.round((m.a === me ? rec : orec).rating || 0), platform: (m.a === me ? rec : orec).platform || "" };
+    const pb = { id: m.b, name: tourName(t, m.b), tier: (m.b === me ? rec : orec).placed ? (m.b === me ? rec : orec).tier : 0, rating: Math.round((m.b === me ? rec : orec).rating || 0), platform: (m.b === me ? rec : orec).platform || "" };
+    const match = rkNewMatch(rkNewId(), pa, pb, now, new Set());
+    match.kind = "tournament"; match.accepted = [true, true]; match.stars = [t.lo, t.hi]; match.tournament = t.id; match.tournamentName = t.name;
+    await r2put(env, rkMatchKey(match.id), match);
+    await rkLiveIndex(env, match);
+    await rkChange(env, m.a, (d) => { d.active = match.id; });
+    await rkChange(env, m.b, (d) => { d.active = match.id; });
+    out = await r2update(env, TOUR_KEY, () => null, (tt) => { const mm = tt && tourMatchOf(tt, me); if (!mm || mm.match) return false; mm.match = match.id; }) || out;
+    return reply({ ok: true, started: true, match: match.id, tournament: tourPublic(out, me) });
+  }
+  if (path === "/play/tournament/ready" && !readyBoth) {
+    const t = out, m = tourMatchOf(t, me), other = m ? (m.a === me ? m.b : m.a) : null;
+    if (other) await addNotice(env, other, { kind: "tournament", what: "ready", name: t.name, byId: me, byName: myName }).catch(() => {});
+  }
+  return reply({ ok: true, started: !!(readyBoth && readyBoth.existing), match: readyBoth && readyBoth.existing ? readyBoth.m.match : undefined, tournament: tourPublic(out, me) });
+}
+
+/** A tournament match is over: its winner goes through. */
+async function tourMatchDone(env, m) {
+  if (!m.tournament || m.state !== "done" || m.winner === null || m.winner === undefined) return;
+  const winner = m.players[m.winner] && m.players[m.winner].id;
+  let t = null;
+  await r2update(env, TOUR_KEY, () => null, (tt) => {
+    if (!tt || tt.id !== m.tournament || tt.state !== "running") return false;
+    const bm = (tt.rounds[tt.rounds.length - 1] || []).find((x) => x.match === m.id && !x.winner);
+    if (!bm) return false;
+    bm.winner = winner;
+    tourNextRound(tt, Date.now());
+    t = tt;
+  });
+  if (t && t.state === "done" && !t.rewarded) { await tourFinish(env, t); await r2put(env, TOUR_KEY, t); }
+}
+
+/** Moderators: a crew renamed (to its tag) or disbanded. */
+async function crewMod(env, who, b) {
+  await modGate(env, who, null);
+  const c = await r2json(env, crewKey(String(b.crew || "")), null);
+  if (!c || c.gone) fail(404, "That crew can't be found.");
+  if (b.action === "disband") {
+    c.gone = true;
+    await r2put(env, crewKey(c.id), c);
+    await crewIndexSet(env, c);
+    for (const m of c.members || []) await crewSetMember(env, m.id, null).catch(() => {});
+    return { ok: true, text: `${c.name} was disbanded.` };
+  }
+  if (b.action === "rename") {
+    c.name = `Crew ${c.id.slice(0, 6)}`; c.tag = "CRW" + c.id.slice(0, 1).toUpperCase().replace(/[^A-Z0-9]/, "X"); c.desc = "";
+    await r2put(env, crewKey(c.id), c);
+    await crewIndexSet(env, c);
+    for (const m of c.members || []) await crewSetMember(env, m.id, c).catch(() => {});
+    return { ok: true, text: `Renamed to ${c.name} [${c.tag}].` };
+  }
+  fail(400, "Rename or disband.");
+}
+
 async function playRoutes(request, env, url) {
   const path = url.pathname;
+  // the shop's earned and seasonal items, before anything looks an item up
+  await ensureEventItems(env).catch(() => {});
+  rkEnsureRewardItems(); ensureSeasonCollections();
   const optionalWho = async () => (request.headers.get("Authorization") ? await signedIn(request, env).catch(() => null) : null);
+
+  // ---- Ranked (2.0): see rankedRoutes (the board for the website: GET, no sign-in; sharing a rank card: multipart)
+  if (path === "/play/ranked/public-board" && request.method === "GET") return rankedPublicBoard(env, url.searchParams.get("mode"));
+  if (path === "/play/ranked/share" && request.method === "POST") return rankedShare(request, env);
+  if (path.startsWith("/play/ranked/") && request.method === "POST") return rankedRoutes(request, env, path);
 
   // ---- thanks for a gift: the giver gets a notice (once per gift, only for a gift that really came from them)
   //   { to, kind: "shop", at }  a points-shop gift (its time in your wallet's history)
@@ -4942,8 +7898,9 @@ async function playRoutes(request, env, url) {
       ch.scores = (ch.scores || []).filter((s) => s.id !== who.playerId);
       ch.scores.push({ id: who.playerId, name, acc: Math.round(acc * 100) / 100, points, at: new Date().toISOString() });
     });
+    const missions = await missionEvent(env, who.playerId, { kind: "daily", day: date }).catch((e) => { console.log("missions", e && e.message); return []; });
     // "points": what went into the wallet (older games show this); the board keeps basePoints
-    return reply({ ok: true, tier: t.tier, points: earned, basePoints: points, multiplier: mult, accuracy: Math.round(acc * 100) / 100, balance: w.balance, streak: w.streak,
+    return reply({ ok: true, tier: t.tier, points: earned, basePoints: points, multiplier: mult, accuracy: Math.round(acc * 100) / 100, balance: w.balance, streak: w.streak, missions: missions.length ? missions : undefined,
       judged: { score: result.score, counts: result.counts, maxCombo: result.maxCombo, fullCombo: result.fullCombo, grade: result.grade } });
   }
 
@@ -4969,6 +7926,7 @@ async function playRoutes(request, env, url) {
     const b = await bodyOf(request, 2_000);
     const item = shopItem(String(b.id || ""));
     if (!item) fail(404, "That isn't in the shop.");
+    if (item.reward) fail(400, "That's a Ranked season reward: it can't be bought or gifted.");
     if (item.minVersion && !versionAtLeast(b.v, item.minVersion)) fail(400, `That needs OCTIVE ${item.minVersion} or newer: update the game first.`);
     const giftTo = b.giftTo ? String(b.giftTo) : null;
     if (giftTo && (!okPlayerId(giftTo) || giftTo === who.playerId)) fail(400, "Pick someone else to gift it to.");
@@ -5062,6 +8020,25 @@ async function playRoutes(request, env, url) {
     const owned = (w.owned || []).filter((x) => SHOP.some((y) => y.id === x && OWNABLE.includes(y.kind)));
     const eq = w.equipped || {};
     return reply({ owned, equipped: { title: eq.title || null, frame: eq.frame || null, icon: eq.icon || null, iconColor: eq.iconColor || null, titleColor: eq.titleColor || null } });
+  }
+  // ---- missions (2.0): the week's, the event's, and the season's new shop items
+  if (path === "/play/missions" && request.method === "GET") return reply(await missionsView(env, await optionalWho()));
+  // ---- the friends feed (2.0)
+  if (path === "/play/feed" && request.method === "GET") return reply(await feedFor(env, (await signedIn(request, env)).playerId));
+  // ---- crews (2.0)
+  if (path === "/play/crews/mod" && request.method === "POST") return reply(await crewMod(env, await signedIn(request, env), await bodyOf(request, 2_000)));
+  if (path === "/play/crews" || path.startsWith("/play/crews/")) return crewRoutes(request, env, url, path);
+  // ---- chart requests (2.0)
+  if (path === "/play/requests" || path.startsWith("/play/requests/")) return requestRoutes(request, env, url, path);
+  // ---- tournaments (2.0)
+  if (path === "/play/tournament" || path.startsWith("/play/tournament/")) return tourRoutes(request, env, url, path);
+  if (path === "/play/event" && request.method === "POST") return reply(await eventAdmin(env, await signedIn(request, env), await bodyOf(request, 4_000)));
+  // ---- a player's progress (2.0): PR, accuracy and rank over time, and their skill radar
+  if (path === "/play/progress" && request.method === "GET") {
+    const id = String(url.searchParams.get("player") || "");
+    if (!okPlayerId(id)) fail(400, "That player can't be found.");
+    if (isOfficial(id)) return reply({ days: [], built: [], skills: { overall: 0, plays: 0, axes: [] }, official: true });
+    return reply(await progressOf(env, id));
   }
   // ---- a player's cleared dans (their profile's View Dans)
   if (path === "/play/dans/of" && request.method === "GET") {
@@ -5191,6 +8168,7 @@ const wsPublic = (it) => ({
   verified: !!it.verified, builtin: !!it.builtin, originalId: it.originalId || null, customizable: it.type === "themes" ? true : it.type === "skins" || it.type === "styles" ? !(it.meta && it.meta.locked) : undefined,
   songIds: it.songIds || [], songs: it.meta && it.meta.songs ? it.meta.songs : undefined,
   tags: Array.isArray(it.tags) ? it.tags : [],
+  likes: it.likes || 0, reviews: it.reviews || 0,
   verifyRequested: it.verifyRequest && !it.verified ? it.verifyRequest.at : undefined,
   verifyDenied: it.verifyDenied && !it.verified ? { reason: it.verifyDenied.reason, byName: it.verifyDenied.byName, at: it.verifyDenied.at } : undefined,
   dans: Array.isArray(it.dans) && it.dans.length ? it.dans.map((d) => ({ songId: d.songId, difficulty: d.difficulty, level: d.level })) : undefined,
@@ -5243,9 +8221,193 @@ async function officialImporter(request, env) {
   return { playerId: OFFICIAL_ID, username: "Octive", until: Date.now() + 60_000 };
 }
 
+// =====================================================================================================
+// Workshop likes, reviews, charter pages, For you and More like this (2.0)
+//   workshop/reviews/<itemId>.json  { likes: [playerIds], notified: [playerIds], reviews: [{ id, by, name, text, rating, at }] }
+//   items keep a "likes" and "reviews" count (sorting, cards)
+// =====================================================================================================
+const wsReviewKey = (id) => `workshop/reviews/${id}.json`;
+const WS_REVIEW_MAX = 300;
+const wsChartsOf = (it) => ((it.meta && it.meta.songs) || []).flatMap((sg) => (sg.charts || []).map((c) => ({ ...c, songId: sg.songId, osuSet: sg.osuSet })));
+const wsChartKey = (c) => { const set = Math.round(Number(c.osuSet) || 0); return set > 0 && c.osuMd5 ? `osu-${set}/${c.osuMd5}` : `${c.songId}/${c.chartId}`; };
+
+function wsReviewText(s) {
+  const t = String(s || "").replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, WS_REVIEW_MAX);
+  if (/https?:\/\/|www\.|discord\.gg|\.com\b/i.test(t)) fail(400, "Reviews can't have links.");
+  if (/@(everyone|here)\b/i.test(t)) fail(400, "Reviews can't mention everyone.");
+  return t;
+}
+
+/** What a card needs, plus the chart that made it a pick (For you / More like this). */
+function wsBrief(it, c) {
+  const charts = wsChartsOf(it);
+  return {
+    id: it.id, type: it.type, title: it.title, creator: it.creator, creatorId: it.creatorId, verified: !!it.verified, downloads: it.downloads || 0,
+    likes: it.likes || 0, reviews: it.reviews || 0, at: it.at, version: it.version || 1, size: it.size, fileName: it.fileName,
+    preview: it.preview ? `${WORKER_BASE}/api/preview/${it.id}` : null,
+    keys: [...new Set(charts.map((x) => x.keys))].filter(Boolean).sort((a, b) => a - b),
+    topStars: charts.length ? Math.max(...charts.map((x) => Number(x.stars) || 0)) : undefined,
+    pick: c ? { songId: c.songId, chartId: c.chartId, difficulty: c.difficulty || c.name || null, stars: Number(c.stars) || 0, keys: c.keys || 0, tags: (c.autoTags || []).slice(0, 4) } : undefined,
+  };
+}
+
+/** Charts near one chart: the same key count, stars within ±0.6, sharing its patterns. Best chart per upload. */
+function wsSimilar(db, it, chartId) {
+  const own = wsChartsOf(it);
+  if (!own.length) return [];
+  const ref = (chartId && own.find((c) => c.chartId === chartId)) || own.slice().sort((a, b) => (Number(b.stars) || 0) - (Number(a.stars) || 0))[Math.floor(own.length / 2)];
+  const rs = Number(ref.stars) || 0, rk = Number(ref.keys) || 4, rt = new Set((ref.autoTags || []).map(String));
+  const best = new Map();
+  for (const x of db.items || []) {
+    if (x.removed || x.type !== "charts" || x.id === it.id) continue;
+    for (const c of wsChartsOf(x)) {
+      const st = Number(c.stars) || 0;
+      if (!st || (Number(c.keys) || 4) !== rk || Math.abs(st - rs) > 0.6) continue;
+      const overlap = (c.autoTags || []).filter((t) => rt.has(String(t))).length;
+      const score = -Math.abs(st - rs) + 0.25 * overlap + (x.verified ? 0.15 : 0) + Math.min(0.2, (x.likes || 0) * 0.02);
+      const cur = best.get(x.id);
+      if (!cur || score > cur.score) best.set(x.id, { it: x, c, score });
+    }
+  }
+  return [...best.values()].sort((a, b) => b.score - a.score).slice(0, 12).map((b) => ({ it: b.it, c: b.c }));
+}
+
+/** For you: charts at the player's level (their skill radar's overall), in the key counts they play, not played yet. */
+async function wsForYou(env, playerId) {
+  const [db, judged, idx] = await Promise.all([r2json(env, WS_DB, { items: [] }), r2json(env, judgedKey(playerId), null), chartShapeIndex(env)]);
+  const plays = Object.entries((judged && judged.charts) || {}).filter(([, p]) => p && isNum(p.pp, 0, V.maxTotalPR) && p.pp > 0 && isNum(p.acc, 0, 100));
+  const played = new Set(plays.map(([k]) => k));
+  const skills = skillsFrom(plays, idx);
+  // the level to aim at: the radar's overall, a little above it (something to grow into)
+  let target = skills.overall;
+  if (!(target > 0)) target = 2;
+  target += 0.25;
+  const keyCount = new Map();
+  for (const [k] of plays) { const sh = idx.get(k); if (sh && sh.keys) keyCount.set(sh.keys, (keyCount.get(sh.keys) || 0) + 1); }
+  const topKeys = [...keyCount.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => k);
+  const favKeys = new Set(topKeys.length ? topKeys.slice(0, 2) : [4]);
+  // their weakest pattern with some plays: something to practise
+  const weak = skills.axes.filter((a) => a.plays > 0).sort((a, b) => a.level - b.level)[0];
+  const weakTags = weak ? new Set((SKILL_AXES.find((x) => x[0] === weak.key) || [, , []])[2]) : new Set();
+  const best = new Map();
+  for (const it of db.items || []) {
+    if (it.removed || it.type !== "charts") continue;
+    for (const c of wsChartsOf(it)) {
+      const st = Number(c.stars) || 0;
+      if (!st || played.has(wsChartKey(c))) continue;
+      if (!favKeys.has(Number(c.keys) || 4)) continue;
+      const tags = (c.autoTags || []).map(String);
+      const score = -Math.abs(st - target) + (tags.some((t) => weakTags.has(t)) ? 0.35 : 0) + (it.verified ? 0.3 : 0) + Math.min(0.25, (it.likes || 0) * 0.025) + Math.min(0.15, (it.downloads || 0) / 400);
+      if (Math.abs(st - target) > 1.5) continue;
+      const cur = best.get(it.id);
+      if (!cur || score > cur.score) best.set(it.id, { it, c, score });
+    }
+  }
+  return { target: round2(target), weak: weak ? weak.name : null, keys: [...favKeys], items: [...best.values()].sort((a, b) => b.score - a.score).slice(0, 24).map((b) => wsBrief(b.it, b.c)) };
+}
+
+/** The players following an uploader hear about it (a notice; at most 500 of them). */
+async function wsNotifyFollowers(env, creatorId, item) {
+  const fr = await r2json(env, `followers/${creatorId}.json`, { followers: [] });
+  const name = await rkName(env, creatorId).catch(() => item.creator || "");
+  for (const f of (fr.followers || []).slice(0, 500))
+    if (f !== creatorId) await addNotice(env, f, { kind: "upload", itemId: item.id, title: String(item.title || "").slice(0, 80), type: item.type, from: creatorId, fromName: name }).catch(() => {});
+}
+
+async function wsSocialRoutes(request, env, url, ctx) {
+  const path = url.pathname;
+  const m = path.match(/^\/api\/items\/([a-z0-9]{16,40})\/(like|reviews|review|unreview|similar)$/);
+  if (m) {
+    const id = m[1], what = m[2];
+    const db = await r2json(env, WS_DB, { items: [] });
+    const it = (db.items || []).find((x) => x.id === id && !x.removed);
+    if (!it) fail(404, "That item isn't in the Workshop any more.");
+    if (what === "similar") return reply({ items: wsSimilar(db, it, url.searchParams.get("chart")).map(({ it: x, c }) => wsBrief(x, c)) });
+    if (what === "reviews") {
+      const r = await r2json(env, wsReviewKey(id), { likes: [], reviews: [] });
+      let me = null;
+      try { me = (await signedIn(request, env)).playerId; } catch { /* a guest */ }
+      const list = (r.reviews || []).slice().sort((a, b) => b.at - a.at);
+      return reply({ likes: (r.likes || []).length, liked: !!me && (r.likes || []).includes(me), reviews: list.slice(0, 100), count: list.length, mine: me ? list.find((x) => x.by === me) || null : null });
+    }
+    if (request.method !== "POST") fail(405, "Use POST.");
+    const who = await signedIn(request, env);
+    const b = await bodyOf(request);
+    const setCount = (field, n) => r2update(env, WS_DB, () => ({ items: [] }), (d) => { const x = (d.items || []).find((y) => y.id === id); if (x) x[field] = n; });
+    if (what === "like") {
+      const like = b.like !== false;
+      let first = false, count = 0;
+      await r2update(env, wsReviewKey(id), () => ({ likes: [], reviews: [], notified: [] }), (r) => {
+        r.likes = (r.likes || []).filter((x) => x !== who.playerId);
+        if (like) r.likes.push(who.playerId);
+        r.notified = r.notified || [];
+        if (like && !r.notified.includes(who.playerId)) { r.notified.push(who.playerId); first = true; if (r.notified.length > 5000) r.notified = r.notified.slice(-5000); }
+        count = r.likes.length;
+      });
+      await setCount("likes", count);
+      if (first && it.creatorId && it.creatorId !== who.playerId)
+        await addNotice(env, it.creatorId, { kind: "like", itemId: id, title: String(it.title || "").slice(0, 80), from: who.playerId, fromName: await rkName(env, who.playerId) }).catch(() => {});
+      return reply({ likes: count, liked: like });
+    }
+    if (what === "review") {
+      const text = wsReviewText(b.text);
+      if (!text) fail(400, "Write something first.");
+      const rating = Number(b.rating) >= 1 && Number(b.rating) <= 5 ? Math.round(Number(b.rating)) : undefined;
+      const name = await rkName(env, who.playerId);
+      let isNew = false, count = 0, review = null;
+      await r2update(env, wsReviewKey(id), () => ({ likes: [], reviews: [] }), (r) => {
+        r.reviews = r.reviews || [];
+        const old = r.reviews.find((x) => x.by === who.playerId);
+        isNew = !old;
+        review = { id: old ? old.id : "r" + crypto.randomUUID().replace(/-/g, "").slice(0, 12), by: who.playerId, name, text, rating, at: Date.now(), edited: old ? true : undefined };
+        r.reviews = r.reviews.filter((x) => x.by !== who.playerId);
+        r.reviews.push(review);
+        if (r.reviews.length > 2000) r.reviews = r.reviews.slice(-2000);
+        count = r.reviews.length;
+      });
+      await setCount("reviews", count);
+      if (isNew && it.creatorId && it.creatorId !== who.playerId)
+        await addNotice(env, it.creatorId, { kind: "review", itemId: id, title: String(it.title || "").slice(0, 80), from: who.playerId, fromName: name, text: text.slice(0, 120) }).catch(() => {});
+      return reply({ ok: true, review, reviews: count });
+    }
+    if (what === "unreview") {
+      const target = String(b.by || who.playerId);
+      if (target !== who.playerId) await modGate(env, who, target);
+      let count = 0;
+      await r2update(env, wsReviewKey(id), () => ({ likes: [], reviews: [] }), (r) => { r.reviews = (r.reviews || []).filter((x) => x.by !== target); count = r.reviews.length; });
+      await setCount("reviews", count);
+      return reply({ ok: true, reviews: count });
+    }
+  }
+  // a charter's page: their uploads, their numbers and whether you follow them
+  const cm = path.match(/^\/api\/creators\/([A-Za-z0-9_-]{8,64})$/);
+  if (cm && request.method === "GET") {
+    const id = cm[1];
+    const db = await r2json(env, WS_DB, { items: [] });
+    const mine = (db.items || []).filter((x) => !x.removed && x.creatorId === id).sort((a, b) => b.at - a.at);
+    const charts = mine.filter((x) => x.type === "charts");
+    let youFollow = false;
+    try { const who = await signedIn(request, env); youFollow = ((await r2json(env, `follows/${who.playerId}.json`, { following: [] })).following || []).includes(id); } catch { /* a guest */ }
+    return reply({
+      id, name: mine.length ? mine[0].creator : await rkName(env, id).catch(() => ""),
+      uploads: mine.length, charts: charts.length, verified: charts.filter((x) => x.verified).length,
+      difficulties: charts.reduce((s, x) => s + wsChartsOf(x).length, 0),
+      downloads: mine.reduce((s, x) => s + (x.downloads || 0), 0), likes: mine.reduce((s, x) => s + (x.likes || 0), 0), reviews: mine.reduce((s, x) => s + (x.reviews || 0), 0),
+      followers: await followerCount(env, id).catch(() => 0), youFollow,
+      latest: mine.slice(0, 12).map((x) => wsBrief(x)),
+    });
+  }
+  if (path === "/api/foryou" && request.method === "GET") {
+    const who = await signedIn(request, env);
+    return reply(await wsForYou(env, who.playerId));
+  }
+  return null;
+}
+
 async function workshopRoutes(request, env, url, ctx) {
   const path = url.pathname;
   if (request.method === "OPTIONS") return cors(new Response(null, { status: 204 }));
+  { const r = await wsSocialRoutes(request, env, url, ctx); if (r) return r; }
 
   // ---- list
   if (path === "/api/items" && request.method === "GET") {
@@ -5255,7 +8417,9 @@ async function workshopRoutes(request, env, url, ctx) {
     const db = await r2json(env, WS_DB, { items: [] });
     // ?creator=<playerId>: only that player's uploads (their profile and their Workshop page)
     const creator = String(url.searchParams.get("creator") || "").trim();
-    let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type) && (!creator || it.creatorId === creator));
+    // ?ids=a,b: those uploads (the game opening one from a link or a notification)
+    const ids = String(url.searchParams.get("ids") || "").split(",").map((x) => x.trim()).filter((x) => /^[a-z0-9]{16,40}$/.test(x)).slice(0, 50);
+    let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type) && (!creator || it.creatorId === creator) && (!ids.length || ids.includes(it.id)));
     if (q) items = items.filter((it) => `${it.title} ${it.creator} ${it.description}`.toLowerCase().includes(q));
     const sp = url.searchParams;
     // ?verified=1 / 0, ?customizable=1 (skins and styles anyone may change), ?builtin=1 (OCTIVE's own content)
@@ -5289,13 +8453,16 @@ async function workshopRoutes(request, env, url, ctx) {
     }
     // ?tags=sv,ln: every one of them
     const wantTags = wsTags(sp.get("tags"));
-    if (wantTags.length) items = items.filter((it) => wantTags.every((t) => (it.tags || []).includes(t)));
+    // the uploader's tags, or the tags worked out from its charts' notes (chart shapes)
+    const autoTagsOf = (it) => ((it.meta && it.meta.songs) || []).flatMap((sg) => (sg.charts || []).flatMap((c) => c.autoTags || []));
+    if (wantTags.length) items = items.filter((it) => { const auto = autoTagsOf(it); return wantTags.every((t) => (it.tags || []).includes(t) || auto.includes(t)); });
     // ?requested=1: songs waiting for a verification check (Senterra and Octive)
     if (sp.get("requested") === "1") items = items.filter((it) => it.verifyRequest && !it.verified);
     if (sp.get("dan") === "1") items = items.filter((it) => Array.isArray(it.dans) && it.dans.length > 0);
     const topStars = (it) => Math.max(0, ...((it.meta && it.meta.songs) || []).flatMap((sg) => (sg.charts || []).map((c) => c.stars || 0)));
     items.sort(
       sort === "popular" ? (a, b) => (b.downloads || 0) - (a.downloads || 0) || b.at - a.at
+      : sort === "liked" ? (a, b) => (b.likes || 0) - (a.likes || 0) || (b.downloads || 0) - (a.downloads || 0) || b.at - a.at
       : sort === "title" ? (a, b) => String(a.title || "").localeCompare(String(b.title || ""), "en", { sensitivity: "base" })
       : sort === "hardest" ? (a, b) => topStars(b) - topStars(a) || b.at - a.at
       : sort === "easiest" ? (a, b) => (topStars(a) || 1e9) - (topStars(b) || 1e9) || b.at - a.at
@@ -5932,6 +9099,10 @@ async function workshopRoutes(request, env, url, ctx) {
     for (const x of replaced) { if (x.messageId) { try { await discordApi(env, "DELETE", `/channels/${x.channelId}/messages/${x.messageId}`); } catch { /* gone */ } } await wsDeleteFiles(env, x); wsUrls.delete(x.id); }
     rate.n += 1;
     await r2put(env, rateKey, rate);
+    // friends see the upload
+    if (!importer) await addFeed(env, who.playerId, { kind: "upload", itemId: item.id, title: String(item.title || "").slice(0, 80), type }).catch((e) => console.log("feed", e && e.message));
+    // followers get a notice (in the background: there can be many)
+    if (!importer) { const p = wsNotifyFollowers(env, who.playerId, item).catch((e) => console.log("followers", e && e.message)); if (ctx && ctx.waitUntil) ctx.waitUntil(p); else await p; }
     return reply({ ok: true, item: wsPublic(item) });
   }
 
@@ -6018,7 +9189,16 @@ async function workshopRoutes(request, env, url, ctx) {
       const b = new Uint8Array(await file.arrayBuffer());
       const im = chatImageInfo(b);
       if (!im || (im.type !== "jpeg" && im.type !== "png") || im.w !== 1920 || im.h !== 1080) fail(400, "That picture isn't one OCTIVE drew, so the score wasn't shared.");
-      const check = await sharePictureCheck(env, b, { name, score, acc, title });
+      const pc = await sharePictureCheck(env, b, { name, score, acc, title });
+      const check = pc.check;
+      // the last checks, to look into pictures that were left out:
+      // npx wrangler r2 object get octive-releases/scores/picture-checks.json --remote --pipe
+      try {
+        const log = await r2json(env, "scores/picture-checks.json", []);
+        const list = Array.isArray(log) ? log : [];
+        list.unshift({ at: new Date().toISOString(), player: who.playerId, play: `${songId}/${chartId}`, check, why: pc.why, read: pc.read, want: { name, score, acc, title } });
+        await r2put(env, "scores/picture-checks.json", list.slice(0, 40));
+      } catch { /* only a log */ }
       if (check === "fake") {
         await flagPlayer(env, who.playerId, `score share refused (the picture isn't a results screen) on ${songId}/${chartId}`).catch(() => {});
         fail(400, "That picture isn't a results screen from OCTIVE, so the score wasn't shared.");
@@ -6538,8 +9718,22 @@ export default {
   async scheduled(event, env, ctx) {
     // 21:00 UTC: streak reminders (3 hours before the daily charts change)
     if (event.cron === "0 21 * * *") { ctx.waitUntil(streakReminders(env).catch((e) => console.log("streak reminders", e && e.message))); return; }
+    // :15 every hour: the 2.0 ranking move, a few ranking entries at a time (does nothing once it's through), and more
+    // chart shapes (Ranked's ban screen shows them; verified uploads go first; nothing to do once they're all in)
+    if (event.cron === "15 * * * *") {
+      ctx.waitUntil(Promise.all([recomputeRanking(env, 6).catch((e) => console.log("ranking recompute", e && e.message)),
+        fillChartShapes(env, 20).catch((e) => console.log("chart shapes", e && e.message)),
+        rkDiscordTick(env).catch((e) => console.log("ranked discord", e && e.message)),
+        // a tournament moves on even when nobody looks (sign-ups closing, missed matches, the end)
+        r2json(env, TOUR_KEY, null).then(async (t) => { if (t && await tourTick(env, t)) await r2put(env, TOUR_KEY, t); }).catch((e) => console.log("tournament", e && e.message)),
+        // crew wars: last week's is settled (prizes, trophies)
+        warTick(env).catch((e) => console.log("crew war", e && e.message))]));
+      return;
+    }
     ctx.waitUntil(Promise.all([refreshBoosters(env).catch((e) => console.log("boosters", e && e.message)), cleanDmFiles(env).catch((e) => console.log("dm files", e && e.message)),
-      r2json(env, WS_DB, { items: [] }).then((db) => wsBackfillSome(env, (db.items || []).filter((it) => !it.removed && !it.meta && it.type !== "themes").slice(0, 25))).catch((e) => console.log("workshop details", e && e.message))]));
+      r2json(env, WS_DB, { items: [] }).then((db) => wsBackfillSome(env, (db.items || []).filter((it) => !it.removed && !it.meta && it.type !== "themes").slice(0, 25))).catch((e) => console.log("workshop details", e && e.message)),
+      // older uploads' chart shapes (length, long notes, patterns), a batch each time
+      fillChartShapes(env, 20).catch((e) => console.log("chart shapes", e && e.message))]));
   },
 
   async fetch(request, env, ctx) {
@@ -6548,6 +9742,13 @@ export default {
     if (url.pathname === "/discord" && request.method === "POST") {
       try { return await discordInteraction(request, env, ctx); }
       catch (e) { return new Response("error: " + e.message, { status: 500 }); }
+    }
+    // playing inside Discord (2.0): the Activity's page (Discord opens the root with ?frame_id=…) and its sign-in
+    if (request.method === "GET" && (url.pathname === "/activity" || url.pathname === "/activity/" || (url.pathname === "/" && url.searchParams.has("frame_id"))))
+      return new Response(ACTIVITY_HTML, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache" } });
+    if (url.pathname === "/activity/token" && request.method === "POST") {
+      try { return await activityToken(request, env); }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (/^\/(support\/|stripe\/webhook$|looks\/|social\/|follow$)/.test(url.pathname)) {
       try { const r = await supportRoutes(request, env, url, ctx); if (r) return r; }

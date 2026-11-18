@@ -87,7 +87,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const when = new Date(data.updated);
       document.getElementById("updated").textContent = "Updated " + when.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
     }
-    if (["home", "rankings", "player"].includes(page())) route();
+    if (["home", "rankings", "player", "ranked"].includes(page())) route();
   }
 
   function clone(id) { return document.getElementById(id).content.cloneNode(true); }
@@ -297,6 +297,167 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     render("");
     app.replaceChildren(view);
     document.title = "OCTIVE Rankings";
+  }
+
+  // ---------------------------------------------------------------- Ranked (2.0): this season's ranked board
+
+  const RK_NAMES = ["Rookie", "Contender I", "Contender II", "Contender III", "Challenger I", "Challenger II", "Challenger III",
+    "Rockstar I", "Rockstar II", "Rockstar III", "Superstar I", "Superstar II", "Superstar III", "Elite I", "Elite II", "Elite III", "Champion", "Legend"];
+  // each rank's colour (the game's): Rookie, Contender … Elite, Champion, Legend
+  const RK_COLORS = ["#99A3B8", "#E08F54", "#CCDBF2", "#FFCC4D", "#54DEF5", "#B880FF", "#FF6180", "#FFE894"];
+  const RK_GROUPS = [["Contender", 1, "2-3★"], ["Challenger", 4, "3-4★"], ["Rockstar", 7, "4-5★"], ["Superstar", 10, "5-5.5★"], ["Elite", 13, "5.5-6★"], ["Champion", 16, "6-6.5★"], ["Legend", 17, "6.5★ and up"]];
+  const rkGroup = (t) => (t <= 0 ? 0 : t <= 15 ? Math.floor((t - 1) / 3) + 1 : t === 16 ? 6 : 7);
+  const mixHex = (a, b, t) => {
+    const rgb = (x) => [1, 3, 5].map((i) => parseInt(x.slice(i, i + 2), 16));
+    const A = rgb(a), Bc = rgb(b);
+    return "#" + A.map((v, i) => Math.round(v + (Bc[i] - v) * t).toString(16).padStart(2, "0")).join("");
+  };
+
+  /**
+   * A rank's emblem, the game's own drawing: a hexagon in the rank's colour with its mark inside (a diamond for Contender
+   * up to an eight-point star for Elite, a crown for Champion, a crowned star for Legend), 1-3 pips for the division, and
+   * more around it the higher the rank (studs, rays, wings). Small ones leave the extras out.
+   */
+  function rankEmblem(tier, size) {
+    const g = rkGroup(tier), col = RK_COLORS[g], detail = size >= 34;
+    const f = (n) => +n.toFixed(3);
+    const pts = (arr) => arr.map(([x, y]) => `${f(x)},${f(y)}`).join(" ");
+    const hexPts = (rad) => Array.from({ length: 6 }, (_, i) => { const a = Math.PI / 3 * i - Math.PI / 2; return [Math.cos(a) * rad, Math.sin(a) * rad]; });
+    const star = (cx, cy, outer, inner, n) => Array.from({ length: n * 2 }, (_, i) => { const a = Math.PI / n * i - Math.PI / 2, r = i % 2 === 0 ? outer : inner; return [cx + Math.cos(a) * r, cy + Math.sin(a) * r]; });
+    const poly = (arr, fill, extra = "") => `<polygon points="${pts(arr)}" fill="${fill}"${extra}/>`;
+    let s = "";
+    if (g === 0) s = `<circle r="0.78" fill="${col}" fill-opacity="0.15" stroke="${col}" stroke-opacity="0.8" stroke-width="0.14"/>`;
+    else {
+      const hex = detail ? (g >= 5 ? 0.7 : g >= 4 ? 0.8 : 0.88) : 0.94;
+      if (detail) {
+        s += `<circle r="0.99" fill="${col}" fill-opacity="${f(0.05 + 0.025 * g)}"/><circle r="${f(hex * 1.02)}" fill="${col}" fill-opacity="${f(0.05 + 0.02 * g)}"/>`;
+        if (g >= 4) {
+          const n = g >= 6 ? 12 : 6;
+          for (let i = 0; i < n; i++) {
+            const a = Math.PI * 2 * i / n, w = g >= 6 ? 0.075 : 0.11, len = g >= 6 && i % 2 === 1 ? 0.86 : 0.99;
+            s += poly([[Math.cos(a - w) * hex * 0.8, Math.sin(a - w) * hex * 0.8], [Math.cos(a) * len, Math.sin(a) * len], [Math.cos(a + w) * hex * 0.8, Math.sin(a + w) * hex * 0.8]], col, ' fill-opacity="0.7"');
+          }
+        }
+        if (g >= 5) for (const k of [-1, 1]) s += poly([[k * 0.58, -0.3], [k * 0.99, -0.56], [k * 0.84, -0.22], [k * 1.0, -0.12], [k * 0.82, 0.06], [k * 0.93, 0.2], [k * 0.58, 0.24]], mixHex(col, "#ffffff", 0.15));
+      }
+      s += poly(hexPts(hex), mixHex("#0d0f17", col, 0.22));
+      s += poly(hexPts(hex * 0.79), col, ' fill-opacity="0.16"');
+      if (detail) { const fc = hexPts(hex * 0.79); s += poly([[fc[5][0], 0], fc[5], fc[0], fc[1], [fc[1][0], 0]], "#ffffff", ' fill-opacity="0.06"'); }
+      s += `<polygon points="${pts(hexPts(hex * 0.96))}" fill="none" stroke="${col}" stroke-width="${detail ? 0.13 : 0.15}" stroke-linejoin="round"/>`;
+      if (detail && g >= 2) s += `<polygon points="${pts(hexPts(hex * 0.79))}" fill="none" stroke="${col}" stroke-opacity="${g >= 6 ? 0.6 : 0.35}" stroke-width="0.05" stroke-linejoin="round"/>`;
+      if (detail && g >= 3) for (const [x, y] of hexPts(hex * 0.96)) s += `<circle cx="${f(x)}" cy="${f(y)}" r="0.07" fill="${mixHex(col, "#ffffff", 0.35)}"/>`;
+      const k2 = hex / 0.94, my = tier <= 15 ? -0.1 * k2 : 0.02;
+      if (g === 1) s += poly([[0, my - 0.4 * k2], [0.3 * k2, my], [0, my + 0.4 * k2], [-0.3 * k2, my]], col);
+      else if (g === 2) s += poly(star(0, my, 0.44 * k2, 0.15 * k2, 4), col);
+      else if (g === 3) s += poly(star(0, my + 0.03 * k2, 0.46 * k2, 0.2 * k2, 5), col);
+      else if (g === 4) s += poly(star(0, my, 0.46 * k2, 0.22 * k2, 6), col);
+      else if (g === 5) s += poly(star(0, my, 0.47 * k2, 0.24 * k2, 8), col);
+      else if (g === 6) s += poly([[-0.46 * k2, 0.26 * k2], [-0.46 * k2, -0.16 * k2], [-0.24 * k2, 0.04 * k2], [0, -0.38 * k2], [0.24 * k2, 0.04 * k2], [0.46 * k2, -0.16 * k2], [0.46 * k2, 0.26 * k2]], col)
+        + `<circle cx="0" cy="${f(-0.38 * k2)}" r="${f(0.07 * k2)}" fill="${mixHex(col, "#ffffff", 0.5)}"/>`;
+      else s += poly(star(0, 0.12 * k2, 0.42 * k2, 0.19 * k2, 5), col)
+        + poly([[-0.22 * k2, -0.36 * k2], [-0.22 * k2, -0.56 * k2], [-0.11 * k2, -0.46 * k2], [0, -0.62 * k2], [0.11 * k2, -0.46 * k2], [0.22 * k2, -0.56 * k2], [0.22 * k2, -0.36 * k2]], col);
+      if (tier >= 1 && tier <= 15) {
+        const pips = (tier - 1) % 3 + 1, gap = 0.2 * k2, start = -(pips - 1) * gap / 2;
+        for (let i = 0; i < pips; i++) { const x = start + i * gap; s += poly([[x - 0.07 * k2, 0.5 * k2], [x, 0.42 * k2], [x + 0.07 * k2, 0.5 * k2], [x, 0.58 * k2]], col); }
+      }
+    }
+    const el = document.createElement("span");
+    el.className = "rk-emblem";
+    el.innerHTML = `<svg viewBox="-1 -1 2 2" width="${size}" height="${size}" aria-hidden="true">${s}</svg>`;
+    return el;
+  }
+
+  // the boards of the two ladders, 4K and 7K (a minute's cache each: they change as matches end)
+  let rankedMode = 4;
+  const rankedBoards = { 4: null, 7: null }, rankedBoardsAt = { 4: 0, 7: 0 }, rankedLoads = { 4: null, 7: null };
+  function loadRankedBoard(mode = rankedMode) {
+    if (rankedBoards[mode] && Date.now() - rankedBoardsAt[mode] < 60_000) return Promise.resolve(rankedBoards[mode]);
+    rankedLoads[mode] ??= fetch(`${worker}/play/ranked/public-board${mode === 7 ? "?mode=7" : ""}`, { cache: "no-cache" })
+      .then(async (r) => {
+        const j = await r.json().catch(() => null);
+        if (!r.ok || !j || !j.players) throw new Error((j && j.error) || `the server didn't answer (${r.status})`);
+        rankedBoards[mode] = j; rankedBoardsAt[mode] = Date.now();
+        return j;
+      })
+      .finally(() => { rankedLoads[mode] = null; });
+    return rankedLoads[mode];
+  }
+
+  function rankedPage() {
+    document.title = "OCTIVE Ranked";
+    const stat = (label, attr) => h("div.stat", {}, h("span.stat-label", { text: label }), h("span.stat-value", { [attr]: true, text: "–" }));
+    const col = (text, cls) => h("span" + (cls || ""), { role: "columnheader", text });
+    const view = h("div.ranked-page", {},
+      h("section.hero", {},
+        h("div", {}, h("h1", { text: "Ranked" }),
+          h("p.sub", { text: "1v1 matches in OCTIVE 2.0, best of 3, on a 4K and a 7K ladder: climb from Contender to Legend. Everyone placed this season, best first." })),
+        h("div.hero-side", {}, stat("Season", "data-rk-season"), stat("Placed", "data-rk-count"), stat("Season ends", "data-rk-ends"))),
+      h("div.rk-modes", {}, ...[4, 7].map((m) => h("button.chip" + (m === rankedMode ? ".on" : ""), { type: "button", onclick: () => { if (rankedMode !== m) { rankedMode = m; rankedPage(); } } }, `${m}K ladder`))),
+      h("div.rk-ranks", {}, ...RK_GROUPS.map(([name, t, stars]) =>
+        h("div.rk-rank", { title: `${name}: charts around ${stars}` }, rankEmblem(t >= 16 ? t : t + 2, 36), h("span", { text: name, style: `color:${RK_COLORS[rkGroup(t)]}` })))),
+      h("div.notice", { "data-rk-error": true, hidden: true }),
+      h("div.table.ranked-table", { role: "table", "aria-label": "Ranked board" },
+        h("div.thead", { role: "row" }, col("Rank"), col("Player"), col("Division", ".num"), col("Matches", ".num.hide-sm"), col("Win rate", ".num.hide-sm"), col("Progress", ".num")),
+        h("div", { "data-rows": true }, h("p.empty", { text: "Loading the ranked board…" }))));
+    app.replaceChildren(view);
+    const mode = rankedMode;
+    loadRankedBoard(mode).then((b) => { if (page() === "ranked" && view.isConnected && mode === rankedMode) fillRanked(view, b); }).catch((e) => {
+      if (page() !== "ranked" || !view.isConnected) return;
+      const n = view.querySelector("[data-rk-error]");
+      n.textContent = "The ranked board couldn't be loaded right now: " + (e.message || e);
+      n.hidden = false;
+      view.querySelector("[data-rows]").replaceChildren();
+    });
+  }
+
+  function fillRanked(view, b) {
+    const list = b.players || [];
+    view.querySelector("[data-rk-season]").textContent = String(b.season ?? "–");
+    view.querySelector("[data-rk-count]").textContent = fmt0.format(b.total ?? list.length);
+    const left = (b.ends || 0) - Date.now();
+    view.querySelector("[data-rk-ends]").textContent = !b.ends ? "–" : left <= 0 ? "now" : left >= 2 * 86400e3 ? `in ${Math.floor(left / 86400e3)} days` : left >= 3600e3 ? `in ${Math.floor(left / 3600e3)} h` : "soon";
+    const rows = view.querySelector("[data-rows]");
+    rows.replaceChildren();
+    if (!list.length) { rows.append(h("p.empty", { text: "Nobody is placed this season yet: play your three placement songs in OCTIVE 2.0 to be the first." })); return; }
+    // the same rows as the global ranking: picture, name, badges, supporter look
+    const byId = new Map(((data && data.players) || []).map((p) => [p.id, p]));
+    for (const x of list) {
+      const known = byId.get(x.id);
+      const p = known || { id: x.id, name: x.name };
+      const r = clone("tpl-row").firstElementChild;
+      r.href = "#/u/" + encodeURIComponent(x.id);
+      r.dataset.place = String(x.place);
+      r.querySelector(".rank").textContent = "#" + fmt0.format(x.place);
+      nameInto(r.querySelector(".name"), p);
+      addLbIcon(r.querySelector(".name"), x.id);
+      setAvatar(r.querySelector(".avatar"), p);
+      setRole(r, r.querySelector(".badge"), p);
+      if (isSupporter(p)) { r.classList.add("supporter"); const pill = supporterPill(p); pill.classList.add("rank"); r.querySelector(".player").append(pill); }
+      {
+        const player = r.querySelector(".player"), nameEl = r.querySelector(".name");
+        const who = h("span.who"), tags = h("span.tags");
+        nameEl.replaceWith(who);
+        who.append(nameEl, tags);
+        for (const el of [...player.children]) if (el.matches(".badge, .sup-pill")) tags.append(el);
+        const gp = gifterPill(p);
+        if (gp) tags.append(gp);
+        if (![...tags.children].some((el) => !el.hidden)) tags.remove();
+      }
+      const color = RK_COLORS[rkGroup(x.tier)];
+      const div = r.querySelector(".acc");
+      div.classList.add("rk-cell");
+      div.style.color = color;
+      div.replaceChildren(rankEmblem(x.tier, 28), h("span.rk-name", { text: (x.rank || RK_NAMES[x.tier] || "") + (x.legend ? " #" + x.legend : "") }));
+      const games = (x.wins || 0) + (x.losses || 0);
+      r.querySelector(".lvl").textContent = `${fmt0.format(x.wins || 0)}W ${fmt0.format(x.losses || 0)}L`;
+      r.querySelector(".plays").textContent = games ? Math.round(100 * (x.wins || 0) / games) + "%" : "–";
+      const pr = r.querySelector(".pp");
+      const pct = Math.max(0, Math.min(100, x.progress || 0));
+      pr.replaceChildren(x.tier >= 17 ? h("span.rk-legend", { text: "rating" + (x.legend ? " #" + x.legend : "") })
+        : h("span.rk-prog", {}, h("span.rk-prog-bar", {}, h("span.rk-prog-fill", { style: `width:${pct}%;background:${color}` })), h("span", { text: pct + "%" })));
+      pr.title = x.tier >= 17 ? "Legends are ordered by their rating" : `${pct}% of the way to ${RK_NAMES[x.tier + 1] || "the next rank"}`;
+      rows.append(r);
+    }
   }
 
   // ---- the points shop's looks: titles and showcases (the same list the game uses)
@@ -886,7 +1047,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("h3", {}, h("a", { href: "#/workshop/" + it.id, text: it.title, title: it.title })),
         h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
         it.type === "charts" ? h("p.ws-facts", {},
-          it.topPR > 0 ? h("b", { text: `${fmt0.format(Math.round(it.verified ? it.topPR : it.topPR / 3))} PR`, title: it.verified ? "The most PR its hardest difficulty gives" : "Not verified: a third of the PR a verified song gives" }) : null,
+          it.topPR > 0 ? h("b", { text: `${fmt0.format(Math.round(it.topPR))} PR`, title: it.verified ? "The most PR its hardest difficulty gives" : "The most PR its hardest difficulty gives. Not verified yet, so it doesn't count toward totals or the global ranking." }) : null,
           (it.keys || []).length ? h("span", { text: (it.topPR > 0 ? " · " : "") + it.keys.map((k) => k + "K").join(" ") }) : null) : null,
         (it.tags || []).length ? h("div.ws-tags", {}, it.tags.slice(0, 4).map((t) => h("span.ws-tag", { text: wsTagName(t) }))) : null,
         h("p.ws-desc", { text: it.description || "", title: it.description || undefined }),
@@ -1649,6 +1810,18 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     if (style) renderBio(el, style); else el.textContent = p.name || "Player";
     el.querySelector(".check")?.remove();
     const c = checkEl(p); if (c) el.append(c);
+    // their country (2.0): the server works it out from their connection
+    el.querySelector(".flag")?.remove();
+    const f = flagEl(p.country); if (f) el.prepend(f);
+  }
+
+  /** A country's flag (emoji from its 2-letter code), with its name on hover. */
+  function flagEl(code) {
+    if (!/^[A-Z]{2}$/.test(code || "")) return null;
+    const emoji = String.fromCodePoint(...[...code].map((ch) => 0x1f1e6 + ch.charCodeAt(0) - 65));
+    let title = code;
+    try { title = new Intl.DisplayNames(["en"], { type: "region" }).of(code) || code; } catch { /* the code */ }
+    return h("span.flag", { text: emoji, title, "aria-label": title });
   }
 
   /** The animated GIF picture of a supporter, else their normal picture. */
@@ -2585,9 +2758,10 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const mine = pg === "player" && me && decodeURIComponent(location.hash.slice(4)) === me.playerId;
     const navKey = pg === "player" ? (mine ? "me" : "rankings") : pg === "account" ? "settings" : pg;
     for (const a of document.querySelectorAll("[data-nav]")) a.classList.toggle("active", a.dataset.nav === navKey || (navKey === "settings" && a.dataset.nav === "account"));
-    if ((pg === "rankings" || pg === "player") && !data) { app.replaceChildren(h("p.empty", { text: "Loading the ranking…" })); return; }
+    if ((pg === "rankings" || pg === "player" || pg === "ranked") && !data) { app.replaceChildren(h("p.empty", { text: "Loading the ranking…" })); return; }
     if (pg === "player") player(decodeURIComponent(location.hash.slice(4)));
     else if (pg === "rankings") rankings();
+    else if (pg === "ranked") rankedPage();
     else if (pg === "download") download();
     else if (pg === "account") account();
     else if (pg === "reset") resetPage();
@@ -2624,5 +2798,5 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   setInterval(pingSeen, 120_000);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) pingSeen(); });
   // keep online status fresh while the page is open
-  setInterval(() => { const q = document.querySelector("[data-search]"); if (!document.hidden && !(q && q.value) && window.scrollY < 200 && ["home", "rankings", "player"].includes(page())) load(); }, 90_000);
+  setInterval(() => { const q = document.querySelector("[data-search]"); if (!document.hidden && !(q && q.value) && window.scrollY < 200 && ["home", "rankings", "player", "ranked"].includes(page())) load(); }, 90_000);
 })();

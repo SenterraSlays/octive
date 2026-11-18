@@ -155,6 +155,24 @@ main { width: 100%; max-width: 1100px; margin: 0 auto; padding: 28px 16px 40px; 
 
 .foot { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 18px max(16px, calc((100vw - 1100px) / 2)); color: var(--faint); font-size: 12px; border-top: 1px solid var(--line); }
 
+/* ---------------------------------------------------------------- Ranked (2.0): the season's board */
+.ranked-table .thead, .ranked-table .row { grid-template-columns: 72px minmax(0, 1fr) 200px 100px 84px 120px; }
+.rk-emblem { display: inline-flex; flex-shrink: 0; }
+.rk-emblem svg { display: block; overflow: visible; }
+.rk-cell { display: flex; align-items: center; justify-content: flex-end; gap: 8px; font-weight: 800; white-space: nowrap; min-width: 0; }
+.rk-cell .rk-name { overflow: hidden; text-overflow: ellipsis; }
+.rk-prog { display: flex; align-items: center; justify-content: flex-end; gap: 8px; font-weight: 700; }
+.rk-prog-bar { width: 56px; height: 6px; border-radius: 3px; background: #ffffff14; overflow: hidden; }
+.rk-prog-fill { display: block; height: 100%; border-radius: 3px; }
+.rk-legend { color: #FFE894; font-weight: 800; }
+.rk-ranks { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+.rk-rank { display: flex; align-items: center; gap: 8px; padding: 5px 14px 5px 8px; border-radius: 12px; background: var(--surface); border: 1px solid var(--line); font-weight: 700; font-size: 13px; }
+/* (between phones and wide screens: no win rate column, so the player's name keeps its room) */
+@media (min-width: 721px) and (max-width: 1180px) {
+  .ranked-table .thead, .ranked-table .row { grid-template-columns: 56px minmax(0, 1fr) 150px 84px 104px; }
+  .ranked-table .plays, .ranked-table .thead > :nth-child(5) { display: none; }
+}
+
 /* ---------------------------------------------------------------- small screens */
 @media (max-width: 720px) {
   .thead, .row { grid-template-columns: 44px minmax(0, 1fr) 72px 88px; padding: 0 12px; gap: 8px; }
@@ -168,6 +186,10 @@ main { width: 100%; max-width: 1100px; margin: 0 auto; padding: 28px 16px 40px; 
   .pp { font-size: 14px; }
   .pp-old-tag { font-size: 8px; letter-spacing: 0.04em; }
   .hide-sm { display: none; }
+  .ranked-table .thead, .ranked-table .row { grid-template-columns: 44px minmax(0, 1fr) 116px 52px; }
+  .rk-prog-bar { display: none; }
+  .rk-cell { gap: 6px; font-size: 12px; }
+  .rk-rank { font-size: 12px; padding: 4px 10px 4px 6px; }
   .thead { font-size: 10px; letter-spacing: 0.06em; }
   .hero-side { width: 100%; justify-content: space-between; }
   .search { min-width: 0; flex: 1; }
@@ -510,6 +532,7 @@ textarea { resize: vertical; min-height: 120px; line-height: 1.5; }
 .quick-months { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
 .chip { padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); background: var(--row); color: var(--dim); font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
 .chip.on { border-color: var(--pink); color: var(--text); background: #ff6fae1a; }
+.rk-modes { display: flex; gap: 8px; margin: 4px 0 14px; }
 .price-box { display: flex; align-items: center; gap: 16px; margin: 14px 0; padding: 14px 18px; border-radius: 14px; background: var(--row); border: 1px solid var(--line); }
 .price-total { font-size: 38px; font-weight: 800; }
 .price-box div { display: flex; flex-direction: column; }
@@ -956,6 +979,8 @@ main { max-width: 1160px; padding-left: 28px; padding-right: 28px; }
 .check { display: inline-block; width: 1em; height: 1em; vertical-align: -0.12em; margin-left: 0.3em; flex-shrink: 0; background: center / contain no-repeat; }
 .check.verified { background-image: url(verified.png); }
 .check.official { background-image: url(official.png); }
+/* 2.0: country flag before a name (from where the player connects) */
+.flag { display: inline-block; margin-right: 0.35em; font-size: 0.95em; line-height: 1; vertical-align: -0.05em; cursor: default; font-family: "Twemoji Country Flags", "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", sans-serif; }
 /* 1.5: every Workshop card the same size (fixed picture, one-line title, two-line description, buttons at the bottom) */
 .ws-card { height: 100%; min-height: 392px; }
 .ws-card .ws-pic { height: 168px; flex-shrink: 0; }

@@ -50,7 +50,7 @@ const checkTime = (t, what) => { if (!(Math.abs(t) <= TIME_LIMIT)) bad(`${what} 
 // ---------------------------------------------------------------- hit windows, mods, scoring rules
 
 /** JudgementWindows.Default: milliseconds either side of a note. */
-export const defaultWindows = () => ({ marvelous: 30, perfect: 55, great: 85, good: 120, bad: 150, miss: 170, releaseScale: 1.5, nearest: true });
+export const defaultWindows = () => ({ marvelous: 30, perfect: 55, great: 85, good: 120, bad: 150, miss: 170, releaseScale: 1.5, nearest: true, earlyMiss: false });
 
 /** JudgementWindows.Sanitized: every window positive and not smaller than the one before. */
 export function sanitizeWindows(w) {
@@ -64,6 +64,7 @@ export function sanitizeWindows(w) {
   o.miss = fix(o.miss, o.bad, 164);
   o.releaseScale = typeof o.releaseScale !== "number" || Number.isNaN(o.releaseScale) || o.releaseScale < 1 ? 1 : Math.min(4, o.releaseScale);
   o.nearest = o.nearest !== false;
+  o.earlyMiss = o.earlyMiss === true;
   return o;
 }
 
@@ -444,6 +445,68 @@ export function compileChart(chart) {
   return c;
 }
 
+// ---------------------------------------------------------------- a chart's shape (Workshop details, Ranked's ban screen)
+
+/**
+ * A compiled chart's shape: how long it runs (to its last note, seconds), how much of it is long notes (0-1), how dense
+ * it is (notes a second while it plays) and tags for its main patterns. The tags are a rough read for filters and
+ * Ranked's ban screen: "ln" / "hybrid" (long notes), "chordjack", "jacks", "handstream", "jumpstream", "stream" (any key
+ * count, read like 4K), "speed" (very dense) and "stamina" (long and dense).
+ */
+export function chartStats(c) {
+  const n = c.time.length;
+  let last = 0, heads = 0;
+  const presses = [];
+  for (let i = 0; i < n; i++) {
+    if (c.time[i] > last) last = c.time[i];
+    const k = c.kind[i];
+    if (k === TAP || k === HOLD_HEAD) { presses.push(i); if (k === HOLD_HEAD) heads++; }
+  }
+  const len = Math.round(last / 1e5) / 10;
+  const notes = presses.length;
+  if (!notes) return { len, ln: 0, nps: 0, tags: [] };
+  presses.sort((a, b) => c.time[a] - c.time[b] || c.lane[a] - c.lane[b]);
+  const span = Math.max(1, (c.time[presses[notes - 1]] - c.time[presses[0]]) / 1e6);
+  // rows: presses within 3 ms of each other are one row (a chord)
+  const rows = [];
+  for (const i of presses) {
+    const t = c.time[i], r = rows[rows.length - 1];
+    if (r && t - r.t <= 3000) r.lanes.push(c.lane[i]); else rows.push({ t, lanes: [c.lane[i]] });
+  }
+  // only rows in runs of notes count (closer than 180 ms to the row before)
+  let dense = 0, streamRows = 0, jumps = 0, hands = 0, chords = 0, jackRows = 0, chordJacks = 0;
+  for (let r = 1; r < rows.length; r++) {
+    const a = rows[r - 1], b = rows[r], gap = b.t - a.t;
+    if (gap > 180_000) continue;
+    dense++;
+    const size = b.lanes.length;
+    if (size >= 2) chords++;
+    if (size === 2) jumps++; else if (size >= 3) hands++;
+    const again = b.lanes.some((l) => a.lanes.includes(l)); // a lane hit again straight away: a jack
+    if (again) { jackRows++; if (size >= 2 && a.lanes.length >= 2) chordJacks++; }
+    else if (size === 1 && a.lanes.length === 1 && gap <= 150_000) streamRows++;
+  }
+  const sh = (x) => (dense ? x / dense : 0);
+  const ln = heads / notes, nps = notes / span;
+  const tags = [];
+  if (ln >= 0.4) tags.push("ln"); else if (ln >= 0.15) tags.push("hybrid");
+  const patterns = [
+    ["chordjack", sh(chordJacks) >= 0.25 && sh(chords) >= 0.4 ? sh(chordJacks) + sh(chords) : 0],
+    ["jacks", sh(jackRows) >= 0.3 ? sh(jackRows) : 0],
+    ["handstream", sh(hands) >= 0.12 && sh(jackRows) < 0.3 ? sh(hands) * 2 : 0],
+    ["jumpstream", sh(jumps) >= 0.2 && sh(hands) < 0.12 && sh(jackRows) < 0.3 ? sh(jumps) * 1.5 : 0],
+    ["stream", sh(streamRows) >= 0.45 && sh(chords) < 0.2 ? sh(streamRows) : 0],
+  ].filter((p) => p[1] > 0).sort((p, q) => q[1] - p[1]);
+  for (const [name] of patterns) {
+    if (tags.length >= 3) break;
+    if (name === "jacks" && tags.includes("chordjack")) continue;
+    tags.push(name);
+  }
+  if (nps >= 16) tags.push("speed");
+  if (span >= 180 && nps >= 8) tags.push("stamina");
+  return { len, ln: Math.round(ln * 100) / 100, nps: Math.round(nps * 10) / 10, tags: tags.slice(0, 4) };
+}
+
 /** A compiled chart as compact JSON (kept by the server so a chart is read and compiled once). */
 export function packCompiled(c) {
   const dt = new Array(c.time.length);
@@ -544,7 +607,8 @@ export class Judge {
       const ti = queue[i];
       if (judged[ti]) continue;
       const dev0 = t - c.time[ti];
-      if (dev0 < -this.windowUs(MISS, c.ws[ti])) break; // this one and the rest: too early (a ghost tap)
+      // this one and the rest: too early (a ghost tap); before 2.0 the Miss window counted, now the Bad window
+      if (dev0 < -this.windowUs(this.w.earlyMiss ? MISS : BAD, c.ws[ti])) break;
       if (!this.w.nearest) { pick = ti; break; }
       const a = Math.abs(dev0);
       if (a < pickAbs) { pick = ti; pickAbs = a; } else break;
@@ -702,7 +766,8 @@ export function simulate(c, inputs, windows) {
 // ---------------------------------------------------------------- replays (.octreplay: gzip JSON)
 
 export const REPLAY_FORMAT = "octive.replay";
-export const REPLAY_VERSION = 2;
+// 3 (2.0): a press earlier than the Bad window is a ghost tap; 2 and older keep early misses (judged as they were played)
+export const REPLAY_VERSION = 3;
 
 /** Replay.GetInputs: [deltaUs, key, down] triples -> inputs in time order (as typed arrays). */
 export function unpackInputs(packed, maxInputs = 2_000_000) {
@@ -788,6 +853,8 @@ export function judgeReplay(c, replay, opts = {}) {
   const mods = parseMods(replay.mods);
   const w = windowsFor(mods);
   if (opts.nearest === false) w.nearest = false; // a replay from before 1.5.2, judged by the rule it was played with
+  // a replay from before 2.0 (version 2 and older) was played with early misses: judged by that rule
+  if (opts.earlyMiss === true || (opts.earlyMiss === undefined && Number(replay.version) < 3)) w.earlyMiss = true;
   const { score } = simulate(c, replay.inputs, w);
   const r = score.result();
   r.mods = mods;
@@ -796,7 +863,48 @@ export function judgeReplay(c, replay, opts = {}) {
   r.meanMs = score.meanDeviationMs;
   r.stdMs = score.deviationStdMs;
   r.signature = timingSignature(score.devs);
+  Object.assign(r, inputSigns(score.devs, replay.inputs));
   return r;
+}
+
+/**
+ * What the anti-cheat reads from a play's input (2.0): the share of hits within 1 ms of their note (exactShare); how
+ * alike the taps' hold lengths are (sameHold: the share in the most common 0.5 ms step, holdMs: that length, over
+ * presses: taps shorter than 150 ms); and how many chords were pressed at the very same instant (sameChord, out of
+ * chords: groups of keys pressed within 15 ms of each other). A person's numbers spread out; a bot's don't.
+ */
+export function inputSigns(devs, inputs) {
+  const out = { exactShare: 0, sameHold: 0, holdMs: 0, presses: 0, sameChord: 0, chords: 0 };
+  if (devs.length) { let e = 0; for (const d of devs) if (Math.abs(d) < 1) e++; out.exactShare = Math.round((e / devs.length) * 1000) / 1000; }
+  if (!inputs || !inputs.time) return out;
+  const n = inputs.time.length, downAt = new Map(), steps = new Map(), downs = [];
+  for (let i = 0; i < n; i++) {
+    const k = inputs.key[i], t = inputs.time[i];
+    if (inputs.down[i]) { downAt.set(k, t); downs.push([t, k]); continue; }
+    const t0 = downAt.get(k);
+    if (t0 === undefined) continue;
+    downAt.delete(k);
+    const held = t - t0;
+    if (held <= 0 || held >= 150_000) continue; // long notes and long presses aren't taps
+    out.presses++;
+    const step = Math.round(held / 500); // half-millisecond steps
+    steps.set(step, (steps.get(step) || 0) + 1);
+  }
+  if (out.presses) {
+    let best = 0, bestStep = 0;
+    for (const [s, c] of steps) if (c > best) { best = c; bestStep = s; }
+    out.sameHold = Math.round((best / out.presses) * 1000) / 1000;
+    out.holdMs = bestStep / 2;
+  }
+  downs.sort((a, b) => a[0] - b[0]);
+  for (let i = 0; i < downs.length;) {
+    let j = i + 1;
+    while (j < downs.length && downs[j][0] - downs[j - 1][0] <= 15_000 && downs[j][1] !== downs[j - 1][1]) j++;
+    if (j - i >= 2) { out.chords++; if (downs[j - 1][0] - downs[i][0] < 50) out.sameChord++; }
+    i = j;
+  }
+  if (out.chords) out.sameChord = Math.round((out.sameChord / out.chords) * 1000) / 1000;
+  return out;
 }
 
 /** The first hits' timing (whole ms), to recognise the same play sent again by someone else. */
@@ -811,4 +919,83 @@ export function signatureMatch(a, b) {
   let same = 0;
   for (let i = 0; i < n; i++) if (Math.abs(x[i] - y[i]) <= 1) same++;
   return same / n;
+}
+
+// ---------------------------------------------------------------- Ranked's AI opponents (2.0)
+
+/** A small seeded random number generator (mulberry32): the same seed always gives the same numbers. */
+export function seededRandom(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** The key that plays a lane at a time: the chart's input maps turned around (the lane itself when it has none). */
+function keyForLane(c, lane, t) {
+  const times = c.imTimes;
+  if (!times || !times.length) return lane;
+  let lo = 0, hi = times.length - 1, found = -1;
+  while (lo <= hi) { const mid = (lo + hi) >> 1; if (times[mid] <= t) { found = mid; lo = mid + 1; } else hi = mid - 1; }
+  if (found < 0) return lane;
+  const k = c.imMaps[found].indexOf(lane);
+  return k >= 0 ? k : lane;
+}
+
+/**
+ * An AI opponent's play of a compiled chart, near a target accuracy and played like a person: every note pressed with a
+ * timing spread around a slight lean early or late, taps held 40-110 ms, long notes held to about their end. The spread is
+ * searched for (a few tries, the same random numbers each time) so the judged accuracy lands close to the target.
+ * Gives the inputs packed like a replay's ([delta us, key, down] from 0) and the judged result. Same seed, same play.
+ */
+export function botPlay(c, targetAcc, seed) {
+  const presses = [];
+  for (let i = 0; i < c.time.length; i++) if (c.kind[i] === TAP || c.kind[i] === HOLD_HEAD) presses.push(i);
+  presses.sort((a, b) => c.time[a] - c.time[b] || c.lane[a] - c.lane[b]);
+  const endOf = new Map(); // a long note's end, by note
+  for (let i = 0; i < c.time.length; i++) if (c.kind[i] === HOLD_TAIL || c.kind[i] === HOLD_END) endOf.set(c.note[i], c.time[i]);
+  const w = windowsFor(0);
+  const make = (spreadMs) => {
+    const rnd = seededRandom(seed);
+    const gauss = () => { let u = 0, v = 0; while (u === 0) u = rnd(); while (v === 0) v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    const lean = (rnd() - 0.5) * 8;
+    const perKey = new Map();
+    for (const i of presses) {
+      const t = c.time[i] + (lean + gauss() * spreadMs) * 1000;
+      const key = keyForLane(c, c.lane[i], c.time[i]);
+      const up = c.kind[i] === HOLD_HEAD && endOf.has(c.note[i]) ? endOf.get(c.note[i]) + (gauss() * spreadMs * 1.2 - 10) * 1000 : t + (40 + rnd() * 70) * 1000;
+      if (!perKey.has(key)) perKey.set(key, []);
+      perKey.get(key).push([t, up]);
+    }
+    // one key: a press only after that key's last release
+    const ev = [];
+    for (const [key, list] of perKey) {
+      list.sort((a, b) => a[0] - b[0]);
+      let prevUp = -Infinity;
+      for (const p of list) {
+        let t = Math.max(0, p[0]), up = p[1];
+        if (t <= prevUp + 1000) t = prevUp + 1000;
+        if (up <= t + 15000) up = t + 15000;
+        ev.push([Math.round(t), key, 1], [Math.round(up), key, 0]);
+        prevUp = up;
+      }
+    }
+    ev.sort((a, b) => a[0] - b[0] || a[2] - b[2]);
+    const inputs = { time: Float64Array.from(ev.map((e) => e[0])), key: Int32Array.from(ev.map((e) => e[1])), down: Uint8Array.from(ev.map((e) => e[2])) };
+    return { ev, r: simulate(c, inputs, w).score.result() };
+  };
+  let lo = 2, hi = 90, best = null;
+  for (let it = 0; it < 8; it++) {
+    const mid = (lo + hi) / 2, p = make(mid);
+    if (!best || Math.abs(p.r.accuracy - targetAcc) < Math.abs(best.r.accuracy - targetAcc)) best = p;
+    if (p.r.accuracy > targetAcc) lo = mid; else hi = mid;
+  }
+  const packed = [];
+  let prev = 0;
+  for (const e of best.ev) { packed.push(e[0] - prev, e[1], e[2]); prev = e[0]; }
+  return { inputs: packed, result: best.r };
 }

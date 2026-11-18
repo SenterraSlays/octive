@@ -13,9 +13,10 @@ preview_urls = false
 binding = "RELEASES"
 bucket_name = "octive-releases"
 
-# Discord server boosters: re-checked every 6 hours (needs DISCORD_GUILD_ID and the DISCORD_BOT_TOKEN secret)
+# Discord server boosters: re-checked every 6 hours (needs DISCORD_GUILD_ID and the DISCORD_BOT_TOKEN secret);
+# 21:00 streak reminders; at :15 every hour the 2.0 ranking move (recomputeRanking: a few entries, until it's done) and more chart shapes
 [triggers]
-crons = ["0 */6 * * *", "0 21 * * *"]
+crons = ["0 */6 * * *", "0 21 * * *", "15 * * * *"]
 
 # the OCTIVE Discord server and its "OCTIVE Supporter" role (the bot token is the secret DISCORD_BOT_TOKEN)
 [vars]
