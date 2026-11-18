@@ -1048,6 +1048,7 @@ main { max-width: 1160px; padding-left: 28px; padding-right: 28px; }
 .ws-facts b { color: var(--accent, #8b7bff); }
 .ws-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
 .ws-tag { font-size: 10px; font-weight: 700; color: #36e0c8; background: rgba(54, 224, 200, 0.12); border-radius: 6px; padding: 2px 6px; }
+.ws-tag.auto { color: #ff8fb8; background: rgba(255, 110, 170, 0.1); box-shadow: inset 0 0 0 1px rgba(255, 110, 170, 0.28); }
 @media (max-width: 640px) { .ws-fline { flex-direction: column; gap: 4px; } .ws-fcap { width: auto; padding-top: 0; } .ws-ftext { width: 100%; } }
 
 /* the points shop's title under a name, and the profile showcase */

@@ -999,3 +999,319 @@ export function botPlay(c, targetAcc, seed) {
   for (const e of best.ev) { packed.push(e[0] - prev, e[1], e[2]); prev = e[0]; }
   return { inputs: packed, result: best.r };
 }
+
+// ---------------------------------------------------------------- star rating and PR (2.0.1)
+// The game's StarRating.Calculate (v3, Engine/Scoring/Performance.cs) and Performance.PlayPP worked out here from the
+// chart itself, with the reading multiplier's pieces (Core/Easing.cs, Core/CurveDef.cs, Core/KeyframeChannel.cs, the
+// playfield and lane channels of Lanes/LaneTimeline.cs, the scroll speeds of Scrolling/SvTimeline.cs). A play on a chart
+// that isn't verified counts from the server's own reading of the chart (its stars) and of the play (its judged hits):
+// never from numbers the game or an uploader sent. Checked against the game's code on whole libraries (star parity).
+
+const EASE_C1 = 1.70158, EASE_C2 = EASE_C1 * 1.525, EASE_C3 = EASE_C1 + 1;
+function easeOutBounce(t) {
+  const n1 = 7.5625, d1 = 2.75;
+  if (t < 1 / d1) return n1 * t * t;
+  if (t < 2 / d1) { t -= 1.5 / d1; return n1 * t * t + 0.75; }
+  if (t < 2.5 / d1) { t -= 2.25 / d1; return n1 * t * t + 0.9375; }
+  t -= 2.625 / d1; return n1 * t * t + 0.984375;
+}
+const EASE_FNS = {
+  linear: (t) => t, step: (t) => (t < 1 ? 0 : 1),
+  inQuad: (t) => t * t, outQuad: (t) => 1 - (1 - t) * (1 - t), inOutQuad: (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2),
+  inCubic: (t) => t * t * t, outCubic: (t) => 1 - Math.pow(1 - t, 3), inOutCubic: (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2),
+  inQuart: (t) => t * t * t * t, outQuart: (t) => 1 - Math.pow(1 - t, 4), inOutQuart: (t) => (t < 0.5 ? 8 * t * t * t * t : 1 - Math.pow(-2 * t + 2, 4) / 2),
+  inSine: (t) => 1 - Math.cos((t * Math.PI) / 2), outSine: (t) => Math.sin((t * Math.PI) / 2), inOutSine: (t) => -(Math.cos(Math.PI * t) - 1) / 2,
+  inExpo: (t) => Math.pow(2, 10 * t - 10), outExpo: (t) => 1 - Math.pow(2, -10 * t),
+  inOutExpo: (t) => (t < 0.5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2),
+  inCirc: (t) => 1 - Math.sqrt(1 - t * t), outCirc: (t) => Math.sqrt(1 - (t - 1) * (t - 1)),
+  inOutCirc: (t) => (t < 0.5 ? (1 - Math.sqrt(1 - 4 * t * t)) / 2 : (Math.sqrt(1 - Math.pow(-2 * t + 2, 2)) + 1) / 2),
+  inBack: (t) => EASE_C3 * t * t * t - EASE_C1 * t * t, outBack: (t) => 1 + EASE_C3 * Math.pow(t - 1, 3) + EASE_C1 * Math.pow(t - 1, 2),
+  inOutBack: (t) => (t < 0.5 ? (Math.pow(2 * t, 2) * ((EASE_C2 + 1) * 2 * t - EASE_C2)) / 2 : (Math.pow(2 * t - 2, 2) * ((EASE_C2 + 1) * (t * 2 - 2) + EASE_C2) + 2) / 2),
+  outBounce: easeOutBounce, outElastic: (t) => Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * ((2 * Math.PI) / 3)) + 1,
+  smoothstep: (t) => t * t * (3 - 2 * t), smootherstep: (t) => t * t * t * (t * (t * 6 - 15) + 10),
+};
+const EASE_BY_NAME = new Map(Object.entries(EASE_FNS).map(([k, f]) => [k.toLowerCase(), f]));
+EASE_BY_NAME.set("easein", EASE_FNS.inQuad); EASE_BY_NAME.set("easeout", EASE_FNS.outQuad); EASE_BY_NAME.set("easeinout", EASE_FNS.inOutQuad);
+
+/** CurveDef: a creator's easing curve (points in 0..1 on x; monotone cubic Hermite, or straight lines). */
+function curveOf(def) {
+  const raw = Array.isArray(def && def.points) ? def.points : [];
+  let pts = raw.filter((p) => p && Number.isFinite(Number(p.x)) && Number.isFinite(Number(p.y))).map((p) => ({ x: Number(p.x), y: Number(p.y) }));
+  pts.sort((a, b) => a.x - b.x);
+  pts = pts.map((p) => ({ x: Math.max(0, Math.min(1, p.x)), y: p.y }));
+  if (!pts.length || pts[0].x > 0) pts.unshift({ x: 0, y: 0 });
+  if (pts[pts.length - 1].x < 1) pts.push({ x: 1, y: 1 });
+  for (let i = pts.length - 2; i >= 0; i--) if (pts[i + 1].x - pts[i].x < 1e-9) pts.splice(i, 1);
+  const n = pts.length, xs = pts.map((p) => p.x), ys = pts.map((p) => p.y), ms = new Array(n).fill(0);
+  const smooth = def && def.smooth === false ? false : true;
+  if (n >= 2) {
+    const d = [];
+    for (let i = 0; i < n - 1; i++) d.push((ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]));
+    ms[0] = d[0]; ms[n - 1] = d[n - 2];
+    for (let i = 1; i < n - 1; i++) ms[i] = d[i - 1] * d[i] <= 0 ? 0 : (d[i - 1] + d[i]) / 2;
+    for (let i = 0; i < n - 1; i++) {
+      if (Math.abs(d[i]) < 1e-12) { ms[i] = 0; ms[i + 1] = 0; continue; }
+      const a = ms[i] / d[i], b = ms[i + 1] / d[i], s = a * a + b * b;
+      if (s > 9) { const t = 3 / Math.sqrt(s); ms[i] = t * a * d[i]; ms[i + 1] = t * b * d[i]; }
+    }
+  }
+  return (x) => {
+    if (n === 1) return ys[0];
+    if (x <= xs[0]) return ys[0];
+    if (x >= xs[n - 1]) return ys[n - 1];
+    let lo = 0, hi = n - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (xs[mid] <= x) lo = mid; else hi = mid; }
+    const h = xs[hi] - xs[lo], t = (x - xs[lo]) / h;
+    if (!smooth) return ys[lo] + (ys[hi] - ys[lo]) * t;
+    const t2 = t * t, t3 = t2 * t;
+    return (2 * t3 - 3 * t2 + 1) * ys[lo] + (t3 - 2 * t2 + t) * h * ms[lo] + (-2 * t3 + 3 * t2) * ys[hi] + (t3 - t2) * h * ms[hi];
+  };
+}
+
+/** Ease.Parse + Ease.Evaluate: a chart's easing name (or "custom:<curve>") as a function of 0..1. */
+function easeOf(name, curves) {
+  if (typeof name !== "string" || !name) return EASE_FNS.linear;
+  if (name.toLowerCase().startsWith("custom:")) {
+    const c = curves && Object.prototype.hasOwnProperty.call(curves, name.slice(7)) ? curves[name.slice(7)] : null;
+    if (!c) return EASE_FNS.linear;
+    const f = curveOf(c);
+    return (t) => (t <= 0 ? f(0) : t >= 1 ? f(1) : f(t));
+  }
+  const f = EASE_BY_NAME.get(name.toLowerCase()) || EASE_FNS.linear;
+  return (t) => (t <= 0 ? 0 : t >= 1 ? 1 : f(t));
+}
+
+/** KeyframeChannel: one value over time (each keyframe eases from the value at its start, or "from", to its target). */
+class KChannel {
+  constructor(def, specs) {
+    this.def = def; this.keys = [];
+    if (!specs || !specs.length) return;
+    const sorted = specs.slice().sort((a, b) => (a.t !== b.t ? a.t - b.t : a.order - b.order));
+    for (const s of sorted) {
+      if (!Number.isFinite(s.value)) continue;
+      const current = this.evalLinear(s.t);
+      const from = s.from != null && Number.isFinite(s.from) ? s.from : current;
+      const to = s.relative ? current + s.value : s.value;
+      this.keys.push({ start: s.t, end: s.t + Math.max(0, s.dur), from, to, ease: s.ease });
+    }
+  }
+  static key(k, t) {
+    if (t >= k.end) return k.to;
+    if (t <= k.start) return k.from;
+    return k.from + (k.to - k.from) * k.ease((t - k.start) / (k.end - k.start));
+  }
+  evalLinear(t) { for (let i = this.keys.length - 1; i >= 0; i--) if (this.keys[i].start <= t) return KChannel.key(this.keys[i], t); return this.def; }
+  valueAt(t) {
+    const k = this.keys;
+    if (!k.length) return this.def;
+    let lo = 0, hi = k.length - 1, found = -1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (k[mid].start <= t) { found = mid; lo = mid + 1; } else hi = mid - 1; }
+    return found < 0 ? this.def : KChannel.key(k[found], t);
+  }
+}
+
+const num = (v, fallback) => (typeof v === "number" && Number.isFinite(v) ? v : fallback);
+const PF_PROPS = { x: "x", y: "y", rotation: "rotation", scale: "scale", spacing: "spacing", mirror: "mirror", tilt: "tilt", alpha: "alpha", opacity: "alpha" };
+const PF_DEFAULT = { x: 0, y: 0, rotation: 0, scale: 1, spacing: 1, mirror: 0, tilt: 0, alpha: 1 };
+
+/** The lane animations the reading multiplier looks at: the playfield's every property, and each lane's x and rotation. */
+function readingLanes(events, k, curves) {
+  const pf = {}, lane = [];
+  for (let l = 0; l < k; l++) lane.push({ x: [], rotation: [] });
+  let order = 0;
+  for (const e of Array.isArray(events) ? events : []) {
+    order++;
+    if (!e || typeof e !== "object" || e.enabled === false) continue;
+    const spec = { t: num(e.timeUs, 0), dur: num(e.durationUs, 0), value: num(e.value, 0), ease: easeOf(e.easing, curves), from: typeof e.from === "number" ? e.from : null, relative: e.relative === true, order };
+    const prop = String(typeof e.property === "string" ? e.property : "x").toLowerCase();
+    const lanes = Array.isArray(e.lanes) ? e.lanes : [];
+    if (!lanes.length) { const p = PF_PROPS[prop]; if (p) (pf[p] ||= []).push(spec); continue; }
+    if (prop !== "x" && prop !== "rotation") continue;
+    for (const l of lanes) if (Number.isInteger(l) && l >= 0 && l < k) lane[l][prop].push(spec);
+  }
+  const pfCh = {};
+  for (const p of Object.keys(PF_DEFAULT)) pfCh[p] = new KChannel(PF_DEFAULT[p], pf[p]);
+  return { pf: pfCh, lane: lane.map((s) => ({ x: new KChannel(0, s.x), rotation: new KChannel(0, s.rotation) })) };
+}
+
+/** SvField / SvTimeline: each lane's scroll speed (the global events, plus a lane's own when it has some). */
+function readingSv(events, k, curves) {
+  const list = (Array.isArray(events) ? events : []);
+  const timeline = (evs) => {
+    const set = [], mul = [];
+    let order = 0;
+    for (const e of evs) {
+      order++;
+      if (!e || typeof e !== "object" || e.enabled === false) continue;
+      const spec = { t: num(e.timeUs, 0), dur: num(e.durationUs, 0), value: num(e.value, 1), ease: easeOf(e.easing, curves), from: null, relative: false, order };
+      const multiply = e.mode === 1 || (typeof e.mode === "string" && e.mode.toLowerCase() === "multiply");
+      (multiply ? mul : set).push(spec);
+    }
+    const s = new KChannel(1, set), m = new KChannel(1, mul);
+    return (t) => s.valueAt(t) * m.valueAt(t);
+  };
+  const isGlobal = (e) => !Array.isArray(e.lanes) || e.lanes.length === 0;
+  const global = timeline(list.filter((e) => e && isGlobal(e)));
+  const per = [];
+  const anyLaneSpecific = list.some((e) => e && !isGlobal(e));
+  for (let l = 0; l < k; l++) {
+    if (!anyLaneSpecific) { per.push(global); continue; }
+    const own = list.filter((e) => e && !isGlobal(e) && e.lanes.indexOf(l) >= 0);
+    per.push(own.length ? timeline(list.filter((e) => e && (isGlobal(e) || e.lanes.indexOf(l) >= 0))) : global);
+  }
+  return per;
+}
+
+/** How much harder a behaviour makes a note to read (StarRating.BehaviorWeight). */
+function behaviorWeight(b) {
+  const p = b.p;
+  const dbl = (k, f) => num(own(p, k), f);
+  switch (b.type) {
+    case "reverse": return 0.9;
+    case "path": return 0.7;
+    case "bezier": case "spline": case "orbit": return 0.6;
+    case "pause": return 0.55;
+    case "laneShift": return 0.5;
+    case "merge": return 0.45;
+    case "split": case "arc": return 0.4;
+    case "fade": {
+      const hides = has(p, "outStartBeats") || has(p, "outStartUs");
+      return hides ? 0.8 * (1 - Math.max(0, Math.min(1, dbl("minAlpha", 0)))) + 0.1 : 0.3;
+    }
+    case "speed": return Math.min(0.6, Math.abs(dbl("factor", 1.5) - 1) * 0.6);
+    case "clone": return 0.3;
+    case "mirrorGhost": return 0.25;
+    case "approachCurve": return 0.25;
+    case "oscillate": return Math.min(0.4, 0.15 + Math.abs(dbl("amplitude", 0.6)) * 0.2);
+    case "bounce": return 0.2;
+    case "repeat": return 0.1;
+    case "grow": return 0.08;
+    case "spin": return 0.05;
+    case "preset": return 0.3;
+    default: return 0.15;
+  }
+}
+
+const roundEven2 = (x) => roundEven(x * 100) / 100;
+const jackFactor = (dt) => (!Number.isFinite(dt) || dt >= 80 ? 1 : dt >= 55 ? 1 - ((80 - dt) / 25) * 0.35 : dt >= 25 ? 0.65 - ((55 - dt) / 30) * 0.5 : 0.15);
+const runFactor = (run) => (run <= 3 ? 1 : Math.max(0.45, 1 - (run - 3) * 0.055));
+const decay = (v, dtMs, perSecond) => (!Number.isFinite(dtMs) ? 0 : v * Math.pow(perSecond, Math.max(0, dtMs) / 1000));
+
+/**
+ * A chart's stars at a song speed, as the game works them out (StarRating.Calculate v3): from the chart file (its JSON
+ * text or object). Throws JudgeDataError for a chart the game can't load.
+ */
+export function starRating(json, rate = 1) {
+  let root = json;
+  if (typeof json === "string") {
+    const text = json.charCodeAt(0) === 0xfeff ? json.slice(1) : json;
+    try { root = JSON.parse(text); } catch { bad("The chart file is not valid JSON."); }
+  }
+  const chart = loadChart(root);
+  const c = compileChart(chart);
+  const k = Math.max(1, c.keyCount);
+  if (!(rate > 0.01)) rate = 1;
+  const n = c.time.length;
+  if (!n) return 0;
+  // each compiled note's own behaviours (the notes in time order, lanes the chart doesn't have left out, as compileChart)
+  const order = chart.notes.map((x, i) => [x, i]).sort((a, b) => cmp(a[0].timeUs, b[0].timeUs) || cmp(a[0].lane, b[0].lane) || a[1] - b[1]).map((x) => x[0]);
+  const behaviorsOf = [];
+  for (const src of order) if (src.lane >= 0 && src.lane < c.keyCount) behaviorsOf.push(src.behaviors || []);
+  const curves = isObj(root.curves) ? root.curves : {};
+  const lanes = readingLanes(root.lanes, k, curves);
+  const sv = readingSv(root.sv, k, curves);
+  const reading = (note, lane, t) => {
+    let behaviors = 0;
+    for (const b of behaviorsOf[note] || []) if (b) behaviors += behaviorWeight(b);
+    behaviors = Math.min(1.5, behaviors);
+    const pf = lanes.pf;
+    let motion = Math.abs(pf.rotation.valueAt(t)) / 25 + Math.abs(pf.tilt.valueAt(t)) / 35 + Math.abs(pf.x.valueAt(t)) * 0.25 + Math.abs(pf.y.valueAt(t)) * 0.2;
+    motion += Math.abs(1 - pf.scale.valueAt(t)) * 0.8 + Math.abs(1 - pf.spacing.valueAt(t)) * 0.8 + Math.max(0, Math.min(1, pf.mirror.valueAt(t))) * 0.5 + (1 - Math.max(0, Math.min(1, pf.alpha.valueAt(t)))) * 0.8;
+    motion += Math.abs(lanes.lane[lane].x.valueAt(t)) * 0.3 + Math.abs(lanes.lane[lane].rotation.valueAt(t)) / 30;
+    motion = Math.min(0.8, motion);
+    const svl = sv[lane];
+    const now = svl(t), before = svl(t - 500_000);
+    let speed = now <= 0.05 ? 0.6 : Math.min(0.6, Math.abs(Math.log(now)) * 0.6);
+    if (now > 0.05 && before > 0.05) speed += Math.min(0.4, Math.abs(Math.log(now / before)) * 0.4);
+    else if ((now > 0.05) !== (before > 0.05)) speed += 0.4;
+    speed = Math.min(0.8, speed);
+    return 1 + 0.5 * behaviors + 0.35 * motion + 0.35 * speed;
+  };
+  // holds: when each starts and ends (in ms at this speed); shorter than 150 ms they play like taps
+  const holdEnd = new Map(), holdStart = new Map();
+  for (let i = 0; i < n; i++) {
+    const kind = c.kind[i], ms = c.time[i] / (1000 * rate), note = c.note[i];
+    if (kind === HOLD_TAIL || kind === HOLD_END) holdEnd.set(note, Math.max(holdEnd.has(note) ? holdEnd.get(note) : 0, ms));
+    else if (kind === HOLD_HEAD) holdStart.set(note, ms);
+  }
+  const realHold = (note) => holdStart.has(note) && holdEnd.has(note) && holdEnd.get(note) - holdStart.get(note) >= 150;
+  // presses and timed releases of real holds, in time order (a release just after a press at the same time)
+  const idx = [];
+  for (let i = 0; i < n; i++) { const kind = c.kind[i]; if (kind === TAP || kind === HOLD_HEAD || (kind === HOLD_TAIL && realHold(c.note[i]))) idx.push(i); }
+  idx.sort((a, b) => cmp(c.time[a], c.time[b]) || (c.kind[a] === HOLD_TAIL ? 1 : 0) - (c.kind[b] === HOLD_TAIL ? 1 : 0) || c.lane[a] - c.lane[b] || a - b);
+  if (!idx.some((i) => c.kind[i] !== HOLD_TAIL)) return 0;
+  const lane = new Array(k).fill(0), laneTime = new Array(k).fill(-Infinity), laneHoldUntil = new Array(k).fill(-Infinity);
+  const laneTimeStrain = new Array(k).fill(-Infinity), laneGap = new Array(k).fill(Infinity), laneRun = new Array(k).fill(0);
+  let overall = 0, overallTime = -Infinity;
+  const peaks = new Map();
+  for (const i of idx) {
+    const ms = c.time[i] / (1000 * rate);
+    const l = Math.max(0, Math.min(k - 1, c.lane[i]));
+    let laneAdd, overallAdd;
+    if (c.kind[i] === HOLD_TAIL) { laneAdd = 0.8; overallAdd = 0.45; }
+    else {
+      let underHold = false;
+      for (let j = 0; j < k; j++) if (j !== l && laneHoldUntil[j] > ms + 1) { underHold = true; break; }
+      const hb = (underHold ? 1.25 : 1.0) * reading(c.note[i], l, c.time[i]);
+      const gap = ms - laneTime[l];
+      if (gap < 130 && Number.isFinite(laneGap[l]) && Math.abs(gap - laneGap[l]) <= 0.15 * gap) laneRun[l]++;
+      else laneRun[l] = 0;
+      laneGap[l] = gap;
+      const jack = jackFactor(gap) * runFactor(laneRun[l]);
+      laneAdd = 2.0 * hb * jack;
+      overallAdd = 1.0 * hb * (0.35 + 0.65 * jack);
+      laneTime[l] = ms;
+      if (c.kind[i] === HOLD_HEAD && realHold(c.note[i])) laneHoldUntil[l] = holdEnd.get(c.note[i]);
+    }
+    lane[l] = decay(lane[l], ms - laneTimeStrain[l], 0.125) + laneAdd;
+    laneTimeStrain[l] = ms;
+    overall = decay(overall, ms - overallTime, 0.30) + overallAdd;
+    overallTime = ms;
+    const strain = lane[l] + overall;
+    const section = Math.floor(ms / 400);
+    if (!peaks.has(section) || strain > peaks.get(section)) peaks.set(section, strain);
+  }
+  let weighted = 0, w = 1;
+  for (const v of [...peaks.values()].sort((a, b) => b - a)) { weighted += v * w; w *= 0.9; }
+  return roundEven2(weighted * 0.0213);
+}
+
+const PP_WEIGHTS = [300, 300, 200, 100, 50, 0];
+const MOD_PP = [[MOD.EZ, 0.5], [MOD.HR, 1.1], [MOD.HD, 1.06], [MOD.FI, 1.06], [MOD.FL, 1.12]];
+
+/** Performance.PPAccuracy: osu!mania accuracy (percent) from the judgement counts, or -1 without any. */
+export function ppAccuracy(counts) {
+  if (!Array.isArray(counts) || counts.length < 6) return -1;
+  let sum = 0, n = 0;
+  for (let i = 0; i < 6; i++) { sum += PP_WEIGHTS[i] * counts[i]; n += counts[i]; }
+  return n <= 0 ? -1 : roundEven(10000 * (100 * sum / (300 * n))) / 10000;
+}
+
+/**
+ * A play's PR from what the server worked out itself (Performance.PlayPP times the mods' multiplier): the chart's stars
+ * at the play's speed, the judged hits, the chart's number of judged moments and whether it was failed.
+ */
+export function playPR(stars, counts, targets, failed, mods) {
+  if (failed || targets <= 0 || !(stars > 0)) return 0;
+  const accPct = ppAccuracy(counts);
+  if (accPct < 0) return 0;
+  const acc = Math.max(0, Math.min(1, accPct / 100));
+  const difficulty = 8.0 * Math.pow(Math.max(stars - 0.15, 0.05), 2.2);
+  const accFactor = Math.max(0, 5 * acc - 4);
+  const length = 1 + 0.1 * Math.min(1.0, targets / 1500.0);
+  // (the game: Math.Round(PlayPP × Mods.PPMultiplier, 2), the multiplier a product in the mods' list order)
+  const m = parseMods(mods);
+  let mult = 1;
+  for (const [mod, x] of MOD_PP) if (m & mod) mult *= x;
+  return roundEven2(roundEven2(difficulty * accFactor * length) * mult);
+}

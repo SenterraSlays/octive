@@ -1009,8 +1009,18 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   const wsF = { builtin: false, by: "", charter: "", keys: new Set(), minStars: "", maxStars: "", tags: new Set() };
   const WS_TAGS = [["stream", "Stream"], ["jumpstream", "Jumpstream"], ["handstream", "Handstream"], ["chordjack", "Chordjack"], ["jacks", "Jacks"], ["speedjack", "Speedjack"],
     ["technical", "Technical"], ["ln", "LN (long notes)"], ["hybrid", "Hybrid"], ["sv", "SV"], ["stamina", "Stamina"], ["speed", "Speed"], ["dump", "Dump"],
-    ["trills", "Trills"], ["vibro", "Vibro"], ["gimmick", "Gimmick"], ["fnf", "FNF"], ["osu", "osu! map"], ["pack", "Pack"], ["easy", "Beginner friendly"], ["marathon", "Marathon"]];
+    ["trills", "Trills"], ["vibro", "Vibro"], ["gimmick", "Gimmick"], ["modchart", "Modchart"], ["fnf", "FNF"], ["osu", "osu! map"], ["pack", "Pack"], ["easy", "Beginner friendly"], ["marathon", "Marathon"]];
   const wsTagName = (t) => (WS_TAGS.find((x) => x[0] === t) || [, t])[1];
+  // (2.0.1) the uploader's tags, then the ones worked out from the charts' notes ("auto"; its uploader can take off wrong ones in the game)
+  function wsTagChips(it) {
+    const own = (it.tags || []).slice(0, 4);
+    const auto = [...new Set((it.songs || []).flatMap((sg) => (sg.charts || []).flatMap((c) => c.autoTags || [])))].filter((t) => !own.includes(t)).slice(0, Math.max(0, 5 - own.length));
+    if (!own.length && !auto.length) return null;
+    return h("div.ws-tags", {}, [
+      ...own.map((t) => h("span.ws-tag", { text: wsTagName(t), title: "Tagged by the uploader" })),
+      ...auto.map((t) => h("span.ws-tag.auto", { text: wsTagName(t), title: "Auto-tag: worked out from the charts' notes" })),
+    ]);
+  }
   function wsQueryString() {
     const q = [`type=${wsType}`, `sort=${wsSort}`];
     if (wsQuery) q.push("q=" + encodeURIComponent(wsQuery));
@@ -1047,9 +1057,9 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("h3", {}, h("a", { href: "#/workshop/" + it.id, text: it.title, title: it.title })),
         h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
         it.type === "charts" ? h("p.ws-facts", {},
-          it.topPR > 0 ? h("b", { text: `${fmt0.format(Math.round(it.topPR))} PR`, title: it.verified ? "The most PR its hardest difficulty gives" : "The most PR its hardest difficulty gives. Not verified yet, so it doesn't count toward totals or the global ranking." }) : null,
+          it.topPR > 0 ? h("b", { text: `${fmt0.format(Math.round(it.topPR))} PR`, title: it.verified ? "The most PR its hardest difficulty gives" : "The most PR its hardest difficulty gives. Not verified yet, so a third of it counts toward totals and the global ranking." }) : null,
           (it.keys || []).length ? h("span", { text: (it.topPR > 0 ? " · " : "") + it.keys.map((k) => k + "K").join(" ") }) : null) : null,
-        (it.tags || []).length ? h("div.ws-tags", {}, it.tags.slice(0, 4).map((t) => h("span.ws-tag", { text: wsTagName(t) }))) : null,
+        wsTagChips(it),
         h("p.ws-desc", { text: it.description || "", title: it.description || undefined }),
         h("span.ws-meta", { text: `${kb.toFixed(kb < 1 ? 2 : 1)} MB · ${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"} · ${new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })}` }),
         h("div.ws-actions", {},

@@ -17,7 +17,7 @@
 // pictures, badges) is read here too, so banned players disappear from the site as well.
 
 // the game's judge, so plays are judged again from their replays (board scores, daily charts, dans): deploy judge.js with this file
-import { JUDGE_VERSION, JudgeDataError, loadChart, compileChart, packCompiled, unpackCompiled, readReplay, judgeReplay, parseMods, rateOf, signatureMatch, REPLAY_VERSION, chartStats, seededRandom, botPlay } from "./judge.js";
+import { JUDGE_VERSION, JudgeDataError, loadChart, compileChart, packCompiled, unpackCompiled, readReplay, judgeReplay, parseMods, rateOf, signatureMatch, REPLAY_VERSION, chartStats, seededRandom, botPlay, starRating, playPR, gradeOf } from "./judge.js";
 /**
  * The oldest replay version whose plays still count (boards, dailies, dans). 3 = 2.0 and newer (no early misses), raised
  * when 2.0 came out (2026-11-17): plays from 1.x get "Update the game and play it again".
@@ -253,15 +253,27 @@ async function rankFromPlays(env, cfg, playerId) {
     if (c.fullCombo === true) fullCombos++;
     if (isInt(c.maxCombo, 0, V.maxCombo)) bestCombo = Math.max(bestCombo, c.maxCombo);
   }
-  // 2.0: PR comes only from plays the server judged from their replays, on verified charts and OCTIVE's own (their
-  // board scores); the numbers the game syncs don't count, and charts the server has no copy of can't be judged
-  // (if they can't be read, this fails: better no update than a ranking of 0)
+  // 2.0: verified charts and OCTIVE's own give their full PR, only from plays the server judged from their replays
+  // (their board scores); the numbers the game syncs don't count for them (if they can't be read, this fails: better
+  // no update than a ranking of 0)
   const judged = await judgedPlays(env, playerId, charts);
   for (const [k, p] of Object.entries(judged.charts || {})) {
     if (!p || !isNum(p.pp, 0, V.maxTotalPR) || !(p.pp > 0) || !isNum(p.acc, 0, 100)) continue;
     if (!(await boardSong(env, k.split("/")[0]).catch(() => false))) continue; // no longer verified
     if (resetAt && !(Date.parse(p.at) > resetAt)) continue; // from before the player's reset
     plays.push({ pp: round2(p.pp), acc: p.acc });
+  }
+  // 2.0.1: every other chart (not verified) gives a third of its PR, only from plays the server judged itself from the
+  // chart and replay the game sent (see unverifiedPlay): the numbers the game syncs never count. Plays from before 2.0.1
+  // that came in during the last day (the game sends earlier bests once) are left out of the day's pace check (pacePP).
+  const nowMs = Date.now(), restoring = new Set();
+  for (const p of Object.values(judged.unverified || {})) {
+    if (!p || !isNum(p.pp, 0, V.maxTotalPR) || !(p.pp > 0) || !isNum(p.acc, 0, 100)) continue;
+    if (resetAt && !(Date.parse(p.at) > resetAt)) continue;
+    if (p.song && (await boardSong(env, p.song).catch(() => false))) continue; // its song got verified: its board play counts
+    const play = { pp: round2(p.pp * UNVERIFIED_SHARE), acc: p.acc };
+    plays.push(play);
+    if (p.old && nowMs < RESTORE_UNTIL && nowMs - Date.parse(p.at) < 86_400_000) restoring.add(play);
   }
   // totals: after a reset the device must have started over; numbers from before don't count
   const fresh = resetAt && oldAfterReset;
@@ -279,24 +291,426 @@ async function rankFromPlays(env, cfg, playerId) {
     ppVersion: isInt(data.ppVersion, 0, 100) && data.ppVersion >= PP_VERSION ? Math.min(data.ppVersion, PP_LATEST) : 2,
     counted: plays.length, problems,
     charts, resetAt,
+    // (2.0.1) the total without earlier plays sent again today (the pace check), and the synced numbers (achievements)
+    pacePP: restoring.size ? totalPR(plays.filter((p) => !restoring.has(p)).map((p) => p.pp)) : undefined,
+    synced: data,
   };
 }
 
 // ---------------------------------------------------------------- the server-made ranking (2.0)
-// Only plays the server judged from their replays count toward PR: board scores on verified charts and OCTIVE's own.
+// Verified charts and OCTIVE's own count toward PR only through plays the server judged from their replays (board
+// scores); other charts a third of the PR of plays the server judged from the chart and replay the game sent.
 // Each player's best judged PR per board is kept in rank/judged/<id>.json: added to with every board score, and built
 // once from the boards for players who had scores before (the charts their game synced say which boards to look at).
 const judgedKey = (id) => `rank/judged/${id}.json`;
 
-/** Keeps a judged board play for the ranking (the best PR per board). */
-async function rememberJudged(env, playerId, songId, chartId, entry) {
-  if (!(entry && isNum(entry.pp, 0, V.maxTotalPR) && entry.pp > 0)) return;
+/** Grades, worst first. */
+const GRADE_ORDER = ["F", "D", "C", "B", "A", "S", "SS"];
+const gradeRank = (g) => Math.max(0, GRADE_ORDER.indexOf(String(g || "")));
+/** Every note Marvelous or Perfect (judgement counts: Marvelous, Perfect, Great, Good, Bad, Miss). */
+const allPerfect = (c) => Array.isArray(c) && c.length >= 6 && c[0] + c[1] > 0 && c[2] + c[3] + c[4] + c[5] === 0;
+const hasMod = (codes, m) => String(codes || "").split(" ").includes(m);
+/** A compiled chart's length (first to last judged moment), in ms. */
+const chartMs = (c) => (c && c.time && c.time.length ? Math.max(0, (c.time[c.time.length - 1] - c.time[0]) / 1000) : 0);
+
+/**
+ * What one judged play says for achievements (2.0.1): a clear of a 5★ chart or harder with Hidden, an S or better with
+ * Hard Rock, a clear of a 5★ chart or harder at 1.5× or faster (stars at the play's speed), and its combo.
+ */
+function playFacts(result, replay, stars) {
+  const failed = replay?.result?.failed === true, cleared = !failed && gradeRank(result.grade) >= 1, mods = replay?.mods || "";
+  return {
+    hd5: cleared && stars >= 5 && hasMod(mods, "HD"),
+    hrS: !failed && gradeRank(result.grade) >= 5 && hasMod(mods, "HR"),
+    rate15: cleared && stars >= 5 && rateOf(mods) >= 1.5,
+    combo: result.maxCombo || 0,
+  };
+}
+function noteFacts(d, f) {
+  if (!f) return;
+  d.facts ||= {};
+  const now = new Date().toISOString();
+  for (const k of ["hd5", "hrS", "rate15"]) if (f[k] && !d.facts[k]) d.facts[k] = now;
+  if (f.combo > (d.facts.combo || 0)) d.facts.combo = f.combo;
+}
+/** A judged play counted toward the totals the server follows (2.0.1: how far the totals achievements can grow). */
+function countPlay(d, result, durationMs) {
+  d.count ||= { plays: 0, timeMs: 0, notes: 0, score: 0, since: new Date().toISOString() };
+  d.count.plays++;
+  d.count.timeMs += Math.max(0, Math.round(Number(durationMs) || 0));
+  d.count.notes += Math.max(0, result.hits || 0);
+  d.count.score += Math.max(0, Math.round(result.score || 0));
+}
+
+/**
+ * One chart's judged record: the best-PR play's numbers (pp, acc, at, mods) and, from every play at normal speed or
+ * faster, the best for achievements (grade, full combo, all perfect, best accuracy, combo); the chart's stars, keys and
+ * difficulty as last known.
+ */
+function mergeJudged(cur, nw, forAch) {
+  const out = cur && typeof cur === "object" ? { ...cur } : { pp: 0, acc: 0, fc: false, combo: 0, at: nw.at };
+  if (!cur || (nw.pp || 0) > (cur.pp || 0)) Object.assign(out, { pp: nw.pp || 0, acc: nw.acc, at: nw.at, m: nw.m || undefined });
+  for (const k of ["st", "k", "d", "song", "title"]) if (nw[k] !== undefined && nw[k] !== null && nw[k] !== "") out[k] = nw[k];
+  if (forAch) {
+    if (nw.fc) out.fc = true;
+    if (nw.pf) out.pf = true;
+    if (gradeRank(nw.g) > gradeRank(out.g)) out.g = nw.g;
+    out.best = Math.max(Number(out.best) || 0, Number(nw.acc) || 0);
+    out.combo = Math.max(out.combo || 0, nw.combo || 0);
+  }
+  return out;
+}
+
+/**
+ * Keeps a judged board play: its PR for the ranking (the best per board), what achievements read from it (see
+ * mergeJudged, playFacts), and the play counted toward the totals the server follows.
+ */
+async function rememberJudged(env, playerId, songId, chartId, entry, extra = {}) {
+  if (!entry) return;
+  const pp = isNum(entry.pp, 0, V.maxTotalPR) ? entry.pp : 0;
   await r2update(env, judgedKey(playerId), () => ({ v: 1, charts: {} }), (d) => {
     d.charts ||= {};
-    const k = `${songId}/${chartId}`, cur = d.charts[k];
-    if (cur && cur.pp >= entry.pp) return false;
-    d.charts[k] = { pp: entry.pp, acc: entry.accuracy, fc: !!entry.fullCombo, combo: entry.maxCombo || 0, at: entry.date || new Date().toISOString() };
+    const k = `${songId}/${chartId}`;
+    d.charts[k] = mergeJudged(d.charts[k], {
+      pp, acc: entry.accuracy, fc: !!entry.fullCombo, combo: entry.maxCombo || 0, g: entry.grade, pf: allPerfect(entry.counts),
+      at: entry.date || new Date().toISOString(), m: entry.mods || undefined, st: extra.stars, k: extra.keys, d: extra.difficulty,
+    }, !(extra.rate < 1));
+    noteFacts(d, extra.facts);
+    if (extra.result) countPlay(d, extra.result, extra.durationMs);
   });
+}
+
+// ---------------------------------------------------------------- achievements (2.0.1)
+// A player's game says which achievements it unlocked; their card only shows the ones the server can see were earned:
+//  - what the server knows itself: supporter time, Discord, Workshop uploads, friends, follows, chats, Ranked, and the
+//    ranking's PR and level (the level from the synced XP, which the day's pace check already holds back);
+//  - plays it judged from their replays (verified boards and unverified plays): stars, full combos, grades, combos, keys,
+//    Hidden / Hard Rock / speed clears, OCTIVE's own charts;
+//  - totals (plays, play time, notes hit, score, charts played): the synced ones as they were the first time it looked
+//    (it can't count plays from before that), then only as far as the plays it judged since add up.
+// Dates must be real (from OCTIVE's first days, never ahead of now). What it accepts is kept in ach/<id>.json and never
+// taken back (a friend removed later doesn't lock "Squad" again; a new computer doesn't lose them). Play achievements a
+// card already showed before the server checked them (rec.prior, kept once) stay when the game's synced bests show them,
+// as the game decided then (plays from back then can't be judged any more); anything newer needs a judged play. An
+// achievement the game adds needs its rule here, or cards leave it out. Cards not checked since (no achV) show only what can be checked on
+// the spot (shownAchievements), and the hourly sweep takes the rest off them.
+const ACH_EPOCH = Date.parse("2026-10-01T00:00:00Z"); // nothing in OCTIVE is older
+const achKey = (id) => `ach/${id}.json`;
+const achTried = new Map(); // player -> { at, keys }: the claims last looked at and not accepted (in this Worker instance)
+const achDateOk = (v) => { const t = Date.parse(v); return Number.isFinite(t) && t >= ACH_EPOCH && t <= Date.now() + 86_400_000; };
+const SUP_DAYS = { "sup-new": 0, "sup-1m": 30, "sup-3m": 91, "sup-6m": 182, "sup-1y": 365, "sup-2y": 730, "sup-3y": 1095 };
+
+/** Each achievement's rule, from what the server knows about the player (x: see achContext). */
+const ACH_RULES = (() => {
+  const r = {};
+  const min = (get, list) => { for (const [id, n] of list) r[id] = (x) => get(x) >= n; };
+  // milestones
+  min((x) => x.tot.plays, [["first-play", 1], ["plays-10", 10], ["plays-100", 100], ["plays-500", 500], ["plays-1000", 1000], ["plays-5000", 5000]]);
+  min((x) => x.tot.timeMs, [["time-1h", 3_600_000], ["time-10h", 36_000_000], ["time-50h", 180_000_000], ["time-100h", 360_000_000]]);
+  min((x) => x.level, [["level-10", 10], ["level-25", 25], ["level-50", 50], ["level-100", 100], ["level-250", 250], ["level-500", 500], ["level-1000", 1000]]);
+  min((x) => x.pp, [["pp-1000", 1000], ["pp-2500", 2500], ["pp-5000", 5000], ["pp-10000", 10000], ["pp-15000", 15000], ["pp-20000", 20000]]);
+  min((x) => x.tot.notes, [["hits-10k", 10_000], ["hits-100k", 100_000], ["hits-500k", 500_000], ["hits-1m", 1_000_000], ["hits-5m", 5_000_000]]);
+  min((x) => x.tot.charts, [["charts-50", 50], ["charts-250", 250]]);
+  min((x) => x.tot.score, [["score-10m", 10_000_000], ["score-100m", 100_000_000], ["score-1b", 1_000_000_000]]);
+  // skill: judged plays
+  min((x) => x.v.fc, [["first-fc", 1], ["fc-10", 10], ["fc-50", 50], ["fc-100", 100]]);
+  min((x) => x.v.s, [["first-s", 1], ["s-25", 25]]);
+  min((x) => x.v.ss, [["first-ss", 1], ["ss-10", 10]]);
+  min((x) => x.v.combo, [["combo-500", 500], ["combo-1000", 1000], ["combo-3000", 3000], ["combo-5000", 5000]]);
+  min((x) => x.v.clear, [["stars-5", 5], ["stars-6", 6], ["stars-7", 7], ["stars-8", 8], ["stars-9", 9], ["stars-10", 10]]);
+  min((x) => x.v.fcStars, [["fc-stars-5", 5], ["fc-stars-7", 7]]);
+  min((x) => x.v.keys, [["keys-7", 7], ["keys-10", 10]]);
+  Object.assign(r, {
+    "pfc": (x) => x.v.pf, "pfc-stars-6": (x) => x.v.pf6, "acc-99": (x) => x.v.acc99,
+    "mod-hd": (x) => x.v.hd5, "mod-hr": (x) => x.v.hrS, "rate-15": (x) => x.v.rate15,
+  });
+  // supporting OCTIVE: the server's own record
+  for (const [id, days] of Object.entries(SUP_DAYS)) r[id] = (x) => (days === 0 ? x.sup.active || x.sup.days > 0 : x.sup.days >= days);
+  // community
+  const chatted = (x) => x.friends >= 1 && x.threads >= 1;
+  Object.assign(r, {
+    "discord-linked": (x) => x.discord, "discord-updates": (x) => x.discordUpdates,
+    "workshop-share": (x) => x.uploads >= 1, "chart-verified": (x) => x.verifiedUploads >= 1,
+    "friend-first": (x) => x.friends >= 1, "friends-10": (x) => x.friends >= 10, "friends-25": (x) => x.friends >= 25,
+    "chat-first": chatted, "replay-send": chatted, "file-send": chatted,
+    "follow-first": (x) => x.following >= 1, "score-share": (x) => x.scoreShared, "official-chat": (x) => x.officialChat,
+    // (nothing on the server says these: the date check only)
+    "global-chat": () => true, "spectate": () => true, "workshop-get": () => true,
+  });
+  // Ranked: the server's own records (4K and 7K)
+  Object.assign(r, {
+    "ranked-placed": (x) => x.rk.placed, "ranked-flawless": (x) => x.rk.placed, "ranked-friendly": (x) => x.rk.any,
+    "ranked-first-win": (x) => x.rk.wins >= 1, "ranked-sweep": (x) => x.rk.wins >= 1, "ranked-comeback": (x) => x.rk.wins >= 1,
+    "ranked-giant": (x) => x.rk.wins >= 1, "ranked-rankup": (x) => x.rk.wins >= 1,
+    "ranked-streak-3": (x) => x.rk.wins >= 3, "ranked-streak-5": (x) => x.rk.wins >= 5,
+    "ranked-rockstar": (x) => x.rk.group >= 3, "ranked-superstar": (x) => x.rk.group >= 4, "ranked-elite": (x) => x.rk.group >= 5,
+    "ranked-champion": (x) => x.rk.group >= 6, "ranked-legend": (x) => x.rk.group >= 7,
+  });
+  // OCTIVE's own charts (judged board plays)
+  const v = (x) => x.v;
+  Object.assign(r, {
+    "remix-first": (x) => v(x).remixCleared >= 1, "remix-10": (x) => v(x).remixCleared >= 10, "remix-all-songs": (x) => v(x).allOfficial,
+    "brain-power": (x) => v(x).clearOn("brain-power"), "brain-overdrive": (x) => v(x).gradeOn("brain-power", "OVERDRIVE", "S"),
+    "idol": (x) => v(x).fcOn("idol"), "fallen": (x) => v(x).clearOn("fallen-symphony"), "fallen-a": (x) => v(x).gradeOn("fallen-symphony", null, "A"),
+    "galaxy": (x) => v(x).clearOn("galaxy-collapse"), "ghost-nova": (x) => v(x).clearOn("ghost", "NOVA"),
+    "ghost-all": (x) => ["PHANTASM", "SPIRIT", "NOVA"].every((d) => v(x).list.some((e) => e.song.startsWith("octive-") && /ghost/i.test(e.title || e.song) && e.d.toUpperCase().includes(d) && gradeRank(e.g) >= 1)),
+    "grimm": (x) => v(x).clearOn("grimm", "Grimmpossible"), "big-black": (x) => v(x).clearOn("the-big-black", "SHD"),
+    "big-black-ss": (x) => v(x).gradeOn("the-big-black", "HD ·", "SS"), "q-shrimp": (x) => v(x).clearOn("q", "Shrimp"),
+    "xronial": (x) => v(x).clearOn("xronial-xero"), "everything-black": (x) => v(x).clearOn("everything-black", "EXTREME"),
+    "kazusa": (x) => v(x).clearOn("kazusa", "Extra"), "dead-end": (x) => v(x).clearOn("dead-end", "Diary"),
+    "bumblebee": (x) => v(x).list.some((e) => e.song.startsWith("octive-sweet-little-bumblebee") && e.d.includes("1.2x") && gradeRank(e.g) >= 1),
+    "r4v3-6k": (x) => v(x).clearOn("r4v3-b0y", "6K"), "navsegda": (x) => v(x).gradeOn("navsegda", "V2", "S"),
+  });
+  return r;
+})();
+
+/**
+ * A card's achievements as shown (2.0.1): a card the server checked (achV) as it is; an older one only with what can be
+ * checked on the spot: achievements that exist, real dates, and supporter time (from the supporter list, once loaded).
+ */
+function shownAchievements(card, id) {
+  const a = cleanAchievements(card && card.achievements);
+  if (isOfficial(id) || (card && card.achV >= 1)) return a;
+  const out = {};
+  for (const [k, at] of Object.entries(a)) {
+    if (!ACH_RULES[k] || !achDateOk(at)) continue;
+    if (SUP_DAYS[k] !== undefined) {
+      const st = supportIndex ? supportIndex[id] : null;
+      if (!st || !(SUP_DAYS[k] === 0 ? st.active || st.days > 0 : st.days >= SUP_DAYS[k])) continue;
+    }
+    out[k] = at;
+  }
+  return out;
+}
+
+/** OCTIVE's own and verified charts by board key: stars, keys, difficulty, song title; and OCTIVE's own song ids. */
+let chartInfoCache = null, chartInfoAt = 0;
+async function boardChartInfo(env) {
+  if (chartInfoCache && Date.now() - chartInfoAt < 120_000) return chartInfoCache;
+  const charts = new Map(), officialSongs = new Set();
+  for (const it of (await judgeDb(env)).items || []) {
+    if (it.type !== "charts" || it.removed || !it.meta || !(it.verified || it.builtin)) continue;
+    for (const sg of it.meta.songs || []) {
+      if (!sg || !sg.songId) continue;
+      if (officialSong(sg.songId)) officialSongs.add(sg.songId);
+      const set = Math.round(Number(sg.osuSet) || 0), board = set > 0 ? "osu-" + set : sg.songId;
+      for (const c of sg.charts || []) {
+        const ch = set > 0 && c.osuMd5 ? c.osuMd5 : c.chartId;
+        if (!ch || charts.has(`${board}/${ch}`)) continue;
+        charts.set(`${board}/${ch}`, { stars: Number(c.stars) || 0, keys: Number(c.keys) || 0, difficulty: String(c.difficulty || ""), title: String(sg.title || "") });
+      }
+    }
+  }
+  chartInfoCache = { charts, officialSongs }; chartInfoAt = Date.now();
+  return chartInfoCache;
+}
+
+/** A player's Ranked over both ladders and every season: placed, matches won, the best rank group reached. */
+async function rankedSummary(env, id) {
+  const out = { any: false, placed: false, wins: 0, peak: 0, group: 0 };
+  for (const mode of [4, 7]) {
+    const rec = await r2json(env, rkPlayerKey(id, mode), null).catch(() => null);
+    if (!rec || typeof rec !== "object") continue;
+    out.any = true;
+    const seasons = Array.isArray(rec.seasons) ? rec.seasons.filter((s) => s && typeof s === "object") : [];
+    if (rec.placed || seasons.length) out.placed = true;
+    out.wins += (Number(rec.wins) || 0) + seasons.reduce((n, s) => n + (Number(s.wins) || 0), 0);
+    out.peak = Math.max(out.peak, Number(rec.peak) || 0, Number(rec.tier) || 0, ...seasons.map((s) => Number(s.peak || s.tier) || 0));
+  }
+  out.group = rkGroupOf(out.peak);
+  return out;
+}
+
+/** The judged record, with the board scores' grades, all-perfect plays and combos read in once (older records lack them). */
+async function achJudged(env, id) {
+  const j = (await r2json(env, judgedKey(id), null)) || { v: 1, charts: {} };
+  if (j.achBuilt) return j;
+  const found = {};
+  let reads = 0;
+  for (const k of Object.keys(j.charts || {})) {
+    if (reads >= 150) break;
+    const i = k.indexOf("/"), sid = k.slice(0, i), cid = k.slice(i + 1);
+    if (i <= 0 || !chartIdOk(cid)) continue;
+    reads++;
+    const e = (await readBoard(env, sid, cid).catch(() => ({ entries: [] }))).entries.find((x) => x.playerId === id);
+    if (e) found[k] = e;
+  }
+  return r2update(env, judgedKey(id), () => ({ v: 1, charts: {} }), (d) => {
+    d.charts ||= {};
+    for (const [k, e] of Object.entries(found))
+      if (d.charts[k]) d.charts[k] = mergeJudged(d.charts[k], { pp: 0, acc: e.accuracy, fc: !!e.fullCombo, combo: e.maxCombo || 0, g: e.grade, pf: allPerfect(e.counts), at: e.date }, rateOf(e.mods || "") >= 1);
+    d.achBuilt = new Date().toISOString();
+  });
+}
+
+/** What the judged plays show for achievements: every chart judged, with its stars, keys, difficulty and best results. */
+async function judgedView(env, j, resetAt) {
+  const info = await boardChartInfo(env);
+  const fresh = (at) => !resetAt || Date.parse(at) > resetAt;
+  const list = [];
+  const add = (e, song, ci) => {
+    if (!e || typeof e !== "object" || !fresh(e.at)) return;
+    const best = Number(e.best ?? e.acc) || 0;
+    list.push({ song: String(song || ""), d: String(e.d || ci?.difficulty || ""), title: String(e.title || ci?.title || ""), st: Number(e.st ?? ci?.stars) || 0,
+      k: Number(e.k || ci?.keys) || 0, g: e.g || gradeOf(best), fc: !!e.fc, pf: !!e.pf, best, combo: Number(e.combo) || 0 });
+  };
+  for (const [k, e] of Object.entries(j.charts || {})) add(e, k.split("/")[0], info.charts.get(k));
+  for (const e of Object.values(j.unverified || {})) add(e, e && e.song, null);
+  const f = j.facts || {};
+  const facts = { combo: Number(f.combo) || 0 };
+  for (const k of ["hd5", "hrS", "rate15"]) facts[k] = !!f[k] && fresh(f[k]);
+  return achView(list, facts, info.officialSongs);
+}
+
+/**
+ * The same from the game's synced bests and recent plays: only for play achievements a card already showed before the
+ * server checked them (plays from back then can't be judged any more), read the way the game reads them.
+ */
+function syncedView(data, officialSongs) {
+  const list = [], plays = [], facts = { combo: 0, hd5: false, hrS: false, rate15: false };
+  const charts = data && typeof data.charts === "object" && data.charts ? Object.entries(data.charts).slice(0, V.maxCharts) : [];
+  for (const [key, c] of charts) {
+    if (!c || typeof c !== "object") continue;
+    list.push({ song: String(key).split("/")[0], d: String(c.difficulty || ""), title: String(c.title || ""), st: isNum(c.stars, 0, V.maxStars) ? c.stars : 0,
+      k: isInt(c.keyCount, 0, 20) ? c.keyCount : 0, g: GRADE_ORDER.includes(c.bestGrade) ? c.bestGrade : "F", fc: c.fullCombo === true, pf: c.perfectPlay === true,
+      best: isNum(c.bestAccuracy, 0, 100) ? c.bestAccuracy : 0, combo: isInt(c.maxCombo, 0, V.maxCombo) ? c.maxCombo : 0 });
+    if (Array.isArray(c.top)) plays.push(...c.top.slice(0, 50));
+  }
+  if (Array.isArray(data?.recent)) plays.push(...data.recent.slice(0, 1000));
+  for (const p of plays) {
+    if (!p || typeof p !== "object" || p.failed === true) continue;
+    const st = isNum(p.stars, 0, V.maxStars) ? p.stars : 0, mods = typeof p.mods === "string" ? p.mods : "";
+    if (st >= 5 && hasMod(mods, "HD")) facts.hd5 = true;
+    if (gradeRank(p.grade) >= 5 && hasMod(mods, "HR")) facts.hrS = true;
+    if (st >= 5 && rateOf(mods) >= 1.5) facts.rate15 = true;
+  }
+  return achView(list, facts, officialSongs);
+}
+
+/** What play achievements read: counts and bests over a list of charts' results (judged or synced), and special plays. */
+function achView(list, facts, officialSongs) {
+  const cleared = (e) => gradeRank(e.g) >= 1;
+  const v = { list, officialSongs, fc: 0, s: 0, ss: 0, pf: false, pf6: false, combo: facts.combo, clear: 0, fcStars: 0, acc99: false, keys: 0,
+    hd5: facts.hd5, hrS: facts.hrS, rate15: facts.rate15, remixCleared: 0, allOfficial: false };
+  for (const e of list) {
+    if (e.fc) { v.fc++; v.fcStars = Math.max(v.fcStars, e.st); }
+    if (gradeRank(e.g) >= 5) v.s++;
+    if (e.g === "SS") v.ss++;
+    if (e.pf) { v.pf = true; if (e.st >= 6) v.pf6 = true; }
+    v.combo = Math.max(v.combo, e.combo);
+    if (cleared(e)) {
+      v.clear = Math.max(v.clear, e.st); v.keys = Math.max(v.keys, e.k);
+      if (e.song.startsWith("octive-") && e.d.includes("OCTIVE Remix")) v.remixCleared++;
+    }
+    if (e.st >= 5 && e.best >= 99) v.acc99 = true;
+  }
+  const on = (song, diff) => list.filter((e) => e.song === "octive-" + song && (!diff || e.d.toLowerCase().includes(diff.toLowerCase())));
+  v.clearOn = (song, diff) => on(song, diff).some(cleared);
+  v.gradeOn = (song, diff, g) => on(song, diff).some((e) => gradeRank(e.g) >= gradeRank(g));
+  v.fcOn = (song, diff) => on(song, diff).some((e) => e.fc);
+  v.allOfficial = officialSongs.size > 0 && [...officialSongs].every((sg) => list.some((e) => e.song === sg && cleared(e)));
+  return v;
+}
+
+/** What the server knows about a player for their achievements (read when a claim needs checking). */
+async function achContext(env, id, r, pub, base, synced) {
+  const [supRec, boost, acct, inbox, follows, shared, j, rk] = await Promise.all([
+    r2json(env, `supporters/${id}.json`, null), r2json(env, `boosters/${id}.json`, null), r2json(env, `accounts/${id}.json`, null),
+    r2json(env, dmInboxKey(id), null), r2json(env, `follows/${id}.json`, { following: [] }), env.RELEASES.head(`scores/rate/${id}.json`).catch(() => null),
+    achJudged(env, id), rankedSummary(env, id),
+  ]);
+  const sup = supportStatus(supRec, id, boost);
+  const mine = ((await judgeDb(env)).items || []).filter((x) => x.creatorId === id);
+  const counted = (j && j.count) || {};
+  const tot = {};
+  for (const k of ["plays", "timeMs", "notes", "score"]) tot[k] = Math.min(Number(synced[k]) || 0, (Number(base[k]) || 0) + (Number(counted[k]) || 0));
+  tot.charts = Math.min(Number(synced.charts) || 0, (Number(base.charts) || 0) + Object.keys(j.charts || {}).length + Object.keys(j.unverified || {}).length);
+  return {
+    sup, supSince: sup.since ? Date.parse(sup.since) || 0 : 0,
+    discord: !!acct?.discord?.id, discordUpdates: !!acct?.discordPrefs?.updates,
+    uploads: mine.length, verifiedUploads: mine.filter((x) => x.verified).length,
+    friends: (inbox?.friends || []).length, threads: Object.keys(inbox?.threads || {}).length, officialChat: !!inbox?.threads?.[OFFICIAL_ID],
+    following: (follows?.following || []).length, scoreShared: !!shared, rk,
+    pp: Number(pub.pp) || 0, level: Number(pub.level) || 1, tot,
+    v: await judgedView(env, j, r.resetAt),
+  };
+}
+
+/**
+ * The achievements a player's card shows (see above): what their game says it unlocked, kept only when the server can
+ * see it was earned; dated when the game says (a real date, never before supporter time could have reached it), else now.
+ */
+async function checkAchievements(env, id, claimed, r, pub) {
+  const claims = cleanAchievements(claimed);
+  const rec = (await r2json(env, achKey(id), null)) || { v: 1, ok: {} };
+  rec.ok = rec.ok && typeof rec.ok === "object" ? rec.ok : {};
+  const now = Date.now(), data = r.synced || {};
+  const synced = { plays: r.playCount || 0, timeMs: r.playTimeMs || 0, notes: cleanInt(data.totalNotesHit, 0, V.maxBig, 0), score: r.totalScore || 0, charts: (r.charts || []).length };
+  let changed = false;
+  if (!rec.base) {
+    rec.base = { ...synced, at: new Date(now).toISOString() };
+    // what the card showed before the server checked achievements: its play achievements stay when the synced bests show them
+    const old = (await publicItems(config(env), id, ["card"]).catch(() => ({}))).card;
+    rec.prior = old && typeof old === "object" && !Array.isArray(old) ? cleanAchievements(old.achievements) : {};
+    changed = true;
+  }
+  const pending = Object.keys(claims).filter((k) => !rec.ok[k] && ACH_RULES[k]).sort();
+  // claims it couldn't accept yet are looked at again after 15 minutes (or at once when the game claims something new)
+  const tried = achTried.get(id);
+  if (pending.length && !(tried && tried.keys === pending.join(",") && now - tried.at < 900_000)) {
+    const x = await achContext(env, id, r, pub, rec.base, synced);
+    let xs = null; // the same with the synced bests, for achievements the card showed before (rec.prior)
+    for (const k of pending) {
+      let ok = false;
+      try { ok = ACH_RULES[k](x) === true; } catch { ok = false; }
+      const was = rec.prior && rec.prior[k];
+      if (!ok && was && achDateOk(was) && Date.parse(was) <= Date.parse(rec.base.at)) {
+        xs ||= { ...x, v: syncedView(data, x.v.officialSongs) };
+        try { ok = ACH_RULES[k](xs) === true; } catch { ok = false; }
+      }
+      if (!ok) continue;
+      let at = achDateOk(claims[k]) ? Date.parse(claims[k]) : now;
+      if (SUP_DAYS[k] && x.supSince) at = Math.max(at, x.supSince + SUP_DAYS[k] * 86_400_000);
+      rec.ok[k] = new Date(Math.min(at, now)).toISOString();
+      changed = true;
+    }
+    const left = pending.filter((k) => !rec.ok[k]);
+    if (left.length) achTried.set(id, { at: now, keys: left.join(",") }); else achTried.delete(id);
+    if (achTried.size > 2000) achTried.delete(achTried.keys().next().value);
+  }
+  if (changed) { rec.at = new Date(now).toISOString(); await r2put(env, achKey(id), rec); }
+  return { ...rec.ok };
+}
+
+/**
+ * Takes achievements that can't be real off cards the server hasn't checked yet (unknown ones, impossible dates,
+ * supporter time nobody had), through the ranking a batch an hour (offset in ach/sweep.json), so games reading a card
+ * straight from cloud save don't show them either. A card gets its full check when its player syncs.
+ */
+async function achSweep(env, max = 80) {
+  const state = await r2json(env, "ach/sweep.json", { offset: 0, done: false, fixed: 0 });
+  if (state.done) return state;
+  const cfg = config(env);
+  await supporters(env);
+  const page = await api(`${cfg.scores}?offset=${state.offset}&limit=${max}`, cfg.auth);
+  const results = (page && page.results) || [];
+  for (const e of results) {
+    const id = e.playerId;
+    if (!id || isOfficial(id)) continue;
+    try {
+      const card = (await publicItems(cfg, id, ["card"])).card;
+      if (!card || typeof card !== "object" || Array.isArray(card) || card.achV >= 1) continue;
+      const shown = shownAchievements(card, id);
+      if (Object.keys(shown).length === Object.keys(cleanAchievements(card.achievements)).length) continue;
+      await serverWrite(() => saveItem(env, id, "card", { ...card, achievements: shown }, true));
+      cards.delete(id);
+      state.fixed = (state.fixed || 0) + 1;
+    } catch (err) { console.log("achievement sweep", id, err && err.message); }
+  }
+  state.offset += results.length;
+  if (results.length < max) { state.done = true; state.finishedAt = new Date().toISOString(); }
+  await r2put(env, "ach/sweep.json", state);
+  return state;
 }
 
 /**
@@ -370,7 +784,7 @@ async function judgedPlays(env, playerId, charts) {
   }
   return r2update(env, judgedKey(playerId), () => ({ v: 1, charts: {} }), (d) => {
     d.charts ||= {};
-    for (const [k, v] of Object.entries(found)) if (!d.charts[k] || d.charts[k].pp < v.pp) d.charts[k] = v;
+    for (const [k, v] of Object.entries(found)) if (!d.charts[k] || d.charts[k].pp < v.pp) d.charts[k] = mergeJudged(d.charts[k], v, true);
     d.built = new Date().toISOString();
   });
 }
@@ -591,6 +1005,7 @@ async function buildBoard(env) {
   const page = await api(`${cfg.scores}?offset=0&limit=${TOP + 10}`, cfg.auth);
   if (!page) throw new Error(`Leaderboard "${LEADERBOARD}" not found: create it in the Unity dashboard.`);
   await loadModeration(cfg);
+  await supporters(env).catch(() => null); // (cards' supporter achievements are checked against it)
   const entries = (page.results ?? []).filter((e) => !moderation.bans[e.playerId] && !isOfficial(e.playerId)).slice(0, TOP);
   const now = Date.now();
 
@@ -643,7 +1058,7 @@ async function buildBoard(env) {
       maxCombo: card.maxCombo ?? 0,
       playTimeMs: card.playTimeMs ?? 0,
       bio: typeof card.bio === "string" ? card.bio : "",
-      achievements: card.achievements && typeof card.achievements === "object" ? card.achievements : {},
+      achievements: shownAchievements(card, e.playerId),
       devFriend: !!card.devFriend,
       role: DEVELOPERS.includes(e.playerId) ? "DEV" : (badgesOf(e.playerId)[0] || moderation.roles[e.playerId] || null),
       badges: badgesOf(e.playerId), check: checkOf(e.playerId),
@@ -1531,7 +1946,7 @@ async function account(request, env, route) {
       const lvKnown = rec.level > 1 || rec.levelKnown === true;
       const approved = rec.approvedUntil && Date.parse(rec.approvedUntil) > now;
       let pub = r, held = null;
-      if (!official && !approved && (r.pp - basePR > V.dayPR || (lvKnown && r.level - baseLv > V.dayLevels))) {
+      if (!official && !approved && ((r.pacePP ?? r.pp) - basePR > V.dayPR || (lvKnown && r.level - baseLv > V.dayLevels))) {
         held = { pp: r.pp, level: r.level, at: new Date(now).toISOString() };
         pub = lvKnown ? { ...r, pp: Math.min(r.pp, rec.pp), level: Math.min(r.level, rec.level), levelProgress: r.level > rec.level ? 1 : r.levelProgress } : { ...r, pp: Math.min(r.pp, rec.pp) };
         if (!lvKnown) { rec.level = r.level; rec.levelKnown = true; }
@@ -1567,7 +1982,11 @@ async function account(request, env, route) {
         playTimeMs: pub.playTimeMs, bio: cleanBio(b.bio), devFriend: await isDevFriend(env, id).catch(() => false), rank: 0,
         socials: badgesOf(id).includes("CREATOR") ? socialsOf({ socials: b.socials }) : {},
         version: typeof b.version === "string" && /^\d{1,3}\.\d{1,3}\.\d{1,4}$/.test(b.version) ? b.version : "",
-        ppVersion: pub.ppVersion, achievements: cleanAchievements(b.achievements),
+        ppVersion: pub.ppVersion,
+        // (2.0.1) only the achievements the server can see were earned (see checkAchievements); achV marks a checked card
+        achievements: official ? cleanAchievements(b.achievements)
+          : await checkAchievements(env, id, b.achievements, r, pub).catch((e) => { console.log("achievements", id, e && e.message); return {}; }),
+        achV: 1,
       };
       // friends see new achievements (only a few at once: a first sync, or many unlocked together, isn't news)
       const achNow = Object.keys(card.achievements || {});
@@ -1645,6 +2064,7 @@ async function account(request, env, route) {
         await saveItem(env, id, "statsReset", at, false);
       });
       await env.RELEASES.put(`rank/reset/${id}.json`, JSON.stringify({ at, by: who.playerId }), { httpMetadata: { contentType: "application/json" } });
+      await env.RELEASES.delete(achKey(id)).catch(() => {}); // (2.0.1) the achievements the server accepted
       await env.RELEASES.delete(`rank/players/${id}.json`);
       // off every chart leaderboard too
       let cursor, boardsTouched = 0;
@@ -2051,13 +2471,14 @@ async function profileOf(env, playerId) {
   if (ranked) return ranked;
   const items = await publicItems(config(env), playerId, ["card", "seen", "platform"]);
   if (!items.card || moderation.bans[playerId]) return null;
+  try { await supporters(env); } catch { /* its supporter achievements are left out */ }
   const card = safeCard(items.card);
   const seen = items.seen ? Date.parse(items.seen) : 0;
   const ov = moderation.overrides[playerId] || {};
   return {
     id: playerId, rank: card.rank || 0, pp: card.pp || 0, name: ov.name || card.name || "Player", accuracy: card.accuracy || 0,
     level: isOfficial(playerId) ? 1000 : card.level || 1, levelProgress: isOfficial(playerId) ? 1 : card.levelProgress || 0, playCount: card.playCount || 0, maxCombo: card.maxCombo || 0,
-    fullCombos: card.fullCombos || 0, playTimeMs: card.playTimeMs || 0, totalScore: card.totalScore || 0, bio: card.bio || "", achievements: card.achievements || {},
+    fullCombos: card.fullCombos || 0, playTimeMs: card.playTimeMs || 0, totalScore: card.totalScore || 0, bio: card.bio || "", achievements: shownAchievements(card, playerId),
     badges: badgesOf(playerId), check: checkOf(playerId), online: isOfficial(playerId) || (seen > 0 && Date.now() - seen < ONLINE_MS), lastSeen: seen ? new Date(seen).toISOString() : null,
     platform: items.platform || "", status: isOfficial(playerId) ? "official" : seen > 0 && Date.now() - seen < ONLINE_MS ? platformStatus(items.platform) : null,
     avatarHash: ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : (card.avatar || ""),
@@ -2734,7 +3155,15 @@ async function chartScores(request, env, url) {
       if (ks > 0) entry.pp = Math.min(entry.pp, round2(playPRMax(ks + 0.15, entry.accuracy) * 1.03 + 0.5));
     } catch { /* as sent, within the limits above */ }
     // the server-made ranking: this judged play's PR counts (its best per board), whether or not it beats their board score
-    await rememberJudged(env, who.playerId, songId, chartId, entry).catch((e) => console.log("judged play", e && e.message));
+    // (2.0.1) with what achievements read from it: the chart's stars and keys, its difficulty, Hidden / Hard Rock / speed plays
+    {
+      const info = (await boardChartInfo(env).catch(() => null))?.charts.get(`${songId}/${chartId}`) || null;
+      const st1 = Number(info?.stars) || 0, rate = rateOf(replay.mods);
+      await rememberJudged(env, who.playerId, songId, chartId, entry, {
+        stars: st1 || undefined, keys: where.compiled.keyCount, difficulty: where.difficulty || info?.difficulty || undefined, rate,
+        facts: playFacts(result, replay, rate >= 1 ? st1 : 0), result: versionBefore(replay.octiveVersion, "2.0.1") ? null : result, durationMs: chartMs(where.compiled) / rate,
+      }).catch((e) => console.log("judged play", e && e.message));
+    }
     const key = `scores/${songId}/${chartId}.json`;
     boards.delete(key);
     const data = await readBoard(env, songId, chartId);
@@ -2788,7 +3217,148 @@ async function chartScores(request, env, url) {
     return reply({ ok: true, improved, rank: rank || null, total: data.entries.length, missions: missions.length ? missions : undefined,
       judged: { score, accuracy: Math.round(acc * 100) / 100, maxCombo: result.maxCombo, counts: result.counts, fullCombo: result.fullCombo, grade: result.grade } });
   }
+  // (2.0.1) a play of a chart that isn't verified, judged from the chart and replay it brings
+  if (url.pathname === "/scores/unverified") return unverifiedPlay(request, env);
   fail(404, "Not found");
+}
+
+// ---------------------------------------------------------------- unverified plays (2.0.1)
+// A chart that isn't verified has no board and no copy on the server, so its play brings its chart along. The server
+// reads the chart, works out its stars at the play's speed (the game's own star rating, judge.js), judges the replay
+// against it (the same judging and anti-cheat as board scores) and works out the PR itself: the numbers the game shows
+// are never used. A third of that PR counts toward the ranking (rankFromPlays). Against made-up plays and charts:
+//  - a chart counts once per player, by its notes (a renamed song or chart is the same chart; its best play counts);
+//  - a replay counts once: another player's copy is refused, and so is your own sent again for an edited copy;
+//  - stars never go past the hardest verified chart's (or 10), so a made-up chart can't give more than a real one, and a
+//    third of that is less than a bot could try for on a verified chart, where the same anti-cheat watches;
+//  - a few hundred plays a day at most.
+const UNVERIFIED_SHARE = 1 / 3;
+const UNVERIFIED_GZ_MAX = 4_000_000;      // the chart's gzip bytes (a big FNF modchart is a few hundred kB)
+const UNVERIFIED_TEXT_MAX = 24 * 1048576; // and unpacked
+const UNVERIFIED_PER_DAY = 800;           // plays sent a day (the game sends earlier bests once, best first)
+const UNVERIFIED_KEEP = 3000;             // charts kept per player (the best)
+const UNVERIFIED_STAR_FLOOR = 10;         // the star cap is the hardest verified chart's, never below this
+// plays made before 2.0.1 (the game sends each chart's best once) count at once, without the day's pace check holding
+// the jump for a moderator, until this date
+const RESTORE_UNTIL = Date.parse("2027-02-01T00:00:00Z");
+
+/** The game version is older than a.b.c. */
+function versionBefore(v, want) {
+  const p = (x) => String(x || "").split(".").map((n) => parseInt(n, 10) || 0);
+  const a = p(v), b = p(want);
+  for (let i = 0; i < 3; i++) if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) < (b[i] || 0);
+  return false;
+}
+
+/** A chart sent with a play (gzip JSON in base64), as text. */
+async function sentChartText(b64) {
+  if (typeof b64 !== "string" || b64.length < 8) fail(400, "This play came without its chart. Update OCTIVE.");
+  if (b64.length > UNVERIFIED_GZ_MAX * 1.4) fail(413, "That chart is too big for the server to check.");
+  let u;
+  try { u = b64Bytes(b64); } catch { fail(400, "The chart couldn't be read."); }
+  if (u.length < 18 || u[0] !== 0x1f || u[1] !== 0x8b) fail(400, "The chart couldn't be read.");
+  const parts = [];
+  let n = 0, big = false;
+  try {
+    const reader = new Blob([u]).stream().pipeThrough(new DecompressionStream("gzip")).getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      n += value.length;
+      if (n > UNVERIFIED_TEXT_MAX) { big = true; try { await reader.cancel(); } catch { /* stopped */ } break; }
+      parts.push(value);
+    }
+  } catch { fail(400, "The chart couldn't be read."); }
+  if (big) fail(413, "That chart is too big for the server to check.");
+  const all = new Uint8Array(n);
+  let o = 0;
+  for (const part of parts) { all.set(part, o); o += part.length; }
+  return new TextDecoder().decode(all);
+}
+
+/** A chart by its notes, what's judged (the same for a renamed song or chart, different for any changed note). */
+async function chartNotesHash(c) {
+  return (await sha256Hex([c.keyCount, Array.from(c.time).join(","), Array.from(c.lane).join(","), Array.from(c.kind).join(",")].join("|"))).slice(0, 32);
+}
+
+let hardestStars = 0, hardestAt = 0;
+/** The most stars an unverified chart counts for: the hardest verified chart's (cached 10 minutes), never below 10. */
+async function unverifiedStarCap(env) {
+  if (!hardestAt || Date.now() - hardestAt > 600_000) {
+    let max = 0;
+    try { for (const c of (await boardChartInfo(env)).charts.values()) if (c.stars > max && c.stars <= V.maxStars) max = c.stars; } catch { /* the floor */ }
+    hardestStars = max; hardestAt = Date.now();
+  }
+  return Math.max(UNVERIFIED_STAR_FLOOR, hardestStars);
+}
+
+/** POST /scores/unverified: a play of a chart that isn't verified, with the chart and the replay (see above). */
+async function unverifiedPlay(request, env) {
+  const b = await bodyOf(request, 8_000_000);
+  const who = await signedIn(request, env);
+  const cfg = config(env);
+  await loadModeration(cfg);
+  if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+  const songId = String(b.songId || "").slice(0, 120), chartId = String(b.chartId || "").slice(0, 120);
+  if (!songId || !chartId) fail(400, "Which chart was played?");
+  // verified charts (and OCTIVE's own) count on their boards, in full
+  for (const s of new Set([songId, String(b.board || "")])) if (s && (await boardSong(env, s).catch(() => false))) fail(409, "This song has a leaderboard: its plays count from there.");
+  // a day's plays
+  const day = new Date().toISOString().slice(0, 10), rateKey = `rank/unverified-rate/${who.playerId}.json`;
+  const sent = await r2json(env, rateKey, { day, n: 0 });
+  if (sent.day !== day) { sent.day = day; sent.n = 0; }
+  if (sent.n >= UNVERIFIED_PER_DAY) fail(429, "That's a lot of plays for one day. The rest are sent tomorrow.");
+  sent.n++;
+  await r2put(env, rateKey, sent);
+  // the chart, read and compiled here
+  let text = await sentChartText(b.chart), compiled;
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  try { compiled = compileChart(loadChart(text)); }
+  catch (e) { if (e instanceof JudgeDataError) fail(400, "The server can't read this chart: " + e.message); throw e; }
+  if (!compiled.time.length) fail(400, "That chart has nothing to hit.");
+  // the play, judged again from its replay (since 1.5.2 a replay names its player; older plays by the rules they had)
+  const { replay, result } = await judgePlay(who, replayBytes(b.replay), { compiled }, { what: "A play", songId, chartId, minVersion: 2 });
+  const hash = await chartNotesHash(compiled);
+  const sig = result.signature ? (await sha256Hex(result.signature)).slice(0, 16) : "";
+  const have = ((await r2json(env, judgedKey(who.playerId), null)) || {}).unverified?.[hash];
+  if (have && sig && have.sig === sig) return reply({ ok: true, same: true, pp: have.pp || 0, counted: round2((have.pp || 0) * UNVERIFIED_SHARE) });
+  // a replay counts once: not another player's passed on, and not yours again on an edited copy of the chart
+  await refuseCopies(env, `unverified|${hash}`, who, result);
+  await refuseCopies(env, `unverified-mine|${who.playerId}`, who, result, false);
+  const title = cleanText(b.title || replay.title, 120), difficulty = cleanText(b.difficulty || replay.difficulty, 60);
+  // the same anti-cheat as board scores (without comparing numbers: an edited chart judges differently from the game)
+  await judgeFlags(env, who.playerId, `unverified ${title || songId}${difficulty ? ` [${difficulty}]` : ""}`, result, null);
+  // stars and PR, worked out here: the chart's own stars (achievements) and at the play's speed (PR), never past the cap
+  const rate = rateOf(replay.mods), cap = await unverifiedStarCap(env);
+  let stars1, stars;
+  try { stars1 = Math.min(starRating(text, 1), cap); stars = rate === 1 ? stars1 : Math.min(starRating(text, rate), cap); }
+  catch (e) { if (e instanceof JudgeDataError) fail(400, "The server can't rate this chart: " + e.message); throw e; }
+  const failed = replay.result.failed === true;
+  const pp = playPR(stars, result.counts, compiled.time.length, failed, replay.mods);
+  const entry = {
+    pp, acc: round2(result.accuracy), fc: !!result.fullCombo, combo: result.maxCombo || 0, g: result.grade, pf: allPerfect(result.counts),
+    at: new Date().toISOString(), m: String(replay.mods || "").slice(0, 40) || undefined, st: round2(stars1), k: compiled.keyCount,
+    song: songId, title: title || undefined, d: difficulty || undefined,
+  };
+  const old = versionBefore(replay.octiveVersion, "2.0.1");
+  let improved = false;
+  await r2update(env, judgedKey(who.playerId), () => ({ v: 1, charts: {} }), (d) => {
+    d.unverified ||= {};
+    const cur = d.unverified[hash];
+    improved = !cur || pp > (cur.pp || 0);
+    const next = mergeJudged(cur, entry, !failed && rate >= 1);
+    if (improved) { next.sig = sig; if (old) next.old = true; else delete next.old; }
+    d.unverified[hash] = next;
+    noteFacts(d, playFacts(result, replay, stars));
+    if (!old) countPlay(d, result, chartMs(compiled) / rate); // (earlier plays are in the totals the server started from)
+    const keys = Object.keys(d.unverified);
+    if (keys.length > UNVERIFIED_KEEP)
+      for (const k of keys.sort((a, c) => (d.unverified[a].pp || 0) - (d.unverified[c].pp || 0)).slice(0, keys.length - UNVERIFIED_KEEP)) delete d.unverified[k];
+  });
+  await rememberReplay(env, `unverified|${hash}`, who.playerId, result.signature);
+  await rememberReplay(env, `unverified-mine|${who.playerId}`, who.playerId, result.signature, 500);
+  return reply({ ok: true, improved, pp, counted: round2(pp * UNVERIFIED_SHARE), stars: round2(stars), capped: stars >= cap || undefined,
+    judged: { score: result.score, accuracy: round2(result.accuracy), maxCombo: result.maxCombo, counts: result.counts, fullCombo: result.fullCombo, grade: result.grade } });
 }
 
 // ---------------------------------------------------------------- what a player is on
@@ -4158,7 +4728,7 @@ async function chatPictureSafe(env, bytes) {
 // the message again and caches the fresh link for up to 12 hours. Previews are kept in R2 for the item lists.
 const WS_TYPES = { ".oct": "charts", ".octskin": "skins", ".octtheme": "themes", ".octstyle": "styles" };
 /** Song tags people can pick when they share (filters in the Workshop). */
-const WS_TAGS = ["stream", "jumpstream", "handstream", "chordjack", "jacks", "speedjack", "technical", "ln", "hybrid", "sv", "stamina", "speed", "dump", "trills", "vibro", "gimmick", "fnf", "osu", "pack", "easy", "marathon"];
+const WS_TAGS = ["stream", "jumpstream", "handstream", "chordjack", "jacks", "speedjack", "technical", "ln", "hybrid", "sv", "stamina", "speed", "dump", "trills", "vibro", "gimmick", "modchart", "fnf", "osu", "pack", "easy", "marathon"];
 const wsTags = (v) => [...new Set(String(v || "").toLowerCase().split(",").map((t) => t.trim()).filter((t) => WS_TAGS.includes(t)))].slice(0, 8);
 /** The most PR a song's hardest difficulty can give (100%, verified), for cards and sorting. */
 function wsTopPR(it) {
@@ -4552,11 +5122,41 @@ async function judgeChartOf(env, it, songId, want) {
   return null;
 }
 
+/**
+ * A modchart (2.0.1): the chart moves its lanes or notes (lane animations, note-path effects, an FNF stage, input swaps
+ * or note behaviours). Its uploads get the "modchart" tag by themselves.
+ */
+function hasModchart(text) {
+  let j;
+  try { j = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); } catch { return false; }
+  if (!j || typeof j !== "object") return false;
+  const some = (a) => Array.isArray(a) && a.length > 0;
+  return !!(j.fnf || some(j.lanes) || some(j.mods) || some(j.inputMaps) || (Array.isArray(j.notes) && j.notes.some((n) => n && some(n.behaviors))));
+}
+
 /** Puts a chart's shape on its Workshop details: len (seconds), ln (long-note share), nps (notes a second), autoTags. */
 function setChartShape(ch, st) {
   if (!ch || !st) return;
-  ch.len = st.len; ch.ln = st.ln; ch.nps = st.nps; ch.autoTags = st.tags;
+  ch.len = st.len; ch.ln = st.ln; ch.nps = st.nps; ch.autoTags = st.tags; ch.autoTagsAll = st.tags;
+  if (st.mc !== undefined) ch.mc = st.mc;
 }
+
+/**
+ * An upload's auto-tags without the ones its uploader took off (2.0.1): each chart's autoTags is autoTagsAll (what the
+ * server worked out from its notes) less the upload's removedTags. Everything that reads tags reads autoTags; Ranked
+ * reads autoTagsAll (a modchart stays out of it whatever its tags say).
+ */
+function applyRemovedTags(it) {
+  if (!it || !it.meta) return;
+  const off = new Set(Array.isArray(it.removedTags) ? it.removedTags : []);
+  for (const sg of it.meta.songs || [])
+    for (const c of (sg && sg.charts) || []) {
+      if (!Array.isArray(c.autoTagsAll)) { if (!Array.isArray(c.autoTags)) continue; c.autoTagsAll = c.autoTags; }
+      c.autoTags = c.autoTagsAll.filter((t) => !off.has(t));
+    }
+}
+/** A chart that moves its lanes or notes (the server's own check, see hasModchart): never in Ranked. */
+const chartIsModchart = (c) => c.mc === 1 || (Array.isArray(c.autoTagsAll) ? c.autoTagsAll : c.autoTags || []).includes("modchart");
 
 /**
  * Fills in the shape of charts uploaded before shapes were worked out, a few uploads at a time, verified ones first.
@@ -4602,6 +5202,7 @@ async function fillChartShapes(env, maxItems = 6) {
         const ch = sg?.charts?.[j];
         if (!ch || ch.len !== undefined) continue;
         setChartShape(ch, st);
+        applyRemovedTags(byId.get(id));
         if (!(sg.durationUs > 0) && st.len > 0) sg.durationUs = Math.round(st.len * 1e6);
       }
       for (const id of tried) { const it = byId.get(id); if (it && it.meta) it.meta.shapeTries = (it.meta.shapeTries || 0) + 1; }
@@ -4609,6 +5210,57 @@ async function fillChartShapes(env, maxItems = 6) {
     judgeDbCache = null;
   }
   return { uploads: todo.length, charts: found.length, left: Math.max(0, all.length - todo.length) };
+}
+
+/**
+ * Finds out which charts of older uploads are modcharts (2.0.1: before, only new uploads were looked at), a few uploads
+ * at a time, verified ones first (Ranked leaves modcharts out): each chart file read once from B2. A modchart gets the
+ * "modchart" auto-tag; every chart looked at gets mc 0 or 1. Run with the chart shapes.
+ */
+async function fillModchartFlags(env, maxItems = 6) {
+  const db = await r2json(env, WS_DB, { items: [] });
+  const missing = (it) => it.type === "charts" && !it.removed && it.meta && (it.b2Files || []).length && (it.meta.mcTries || 0) < 3 &&
+    (it.meta.songs || []).some((sg) => (sg.charts || []).some((c) => c.mc === undefined));
+  const all = (db.items || []).filter(missing);
+  const todo = all.sort((a, b) => (b.verified ? 1 : 0) - (a.verified ? 1 : 0)).slice(0, maxItems);
+  const found = [], tried = [];
+  for (const it of todo) {
+    const songs = it.meta.songs || [], files = it.b2Files || [];
+    let any = false;
+    for (let fi = 0; fi < files.length && fi < 20; fi++) {
+      const f = files[fi];
+      if (!f || !f.key || Number(f.size) > 200 * 1048576) continue;
+      let m;
+      try { m = await judgeManifest(env, f); } catch (e) { console.log("modchart flags", it.id, e && e.message); continue; }
+      let si = m.songId ? songs.findIndex((x) => x.songId === m.songId) : -1;
+      if (si < 0 && songs.length === files.length) si = fi;
+      if (si < 0) continue;
+      const charts = songs[si].charts || [];
+      for (let j = 0; j < charts.length && j < m.charts.length; j++) {
+        if (charts[j].mc !== undefined || !m.charts[j].entry) continue;
+        try { found.push([it.id, si, j, hasModchart(new TextDecoder().decode(await judgeZipFile(env, f, m.charts[j].entry))) ? 1 : 0]); any = true; }
+        catch (e) { console.log("modchart flags", it.id, e && e.message); }
+      }
+    }
+    if (!any) tried.push(it.id);
+  }
+  if (found.length || tried.length) {
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      const byId = new Map((d.items || []).map((x) => [x.id, x]));
+      const touched = new Set();
+      for (const [id, si, j, mc] of found) {
+        const ch = byId.get(id)?.meta?.songs?.[si]?.charts?.[j];
+        if (!ch || ch.mc !== undefined) continue;
+        ch.mc = mc;
+        if (mc) ch.autoTagsAll = [...new Set([...(Array.isArray(ch.autoTagsAll) ? ch.autoTagsAll : ch.autoTags || []), "modchart"])];
+        touched.add(id);
+      }
+      for (const id of touched) applyRemovedTags(byId.get(id));
+      for (const id of tried) { const it = byId.get(id); if (it && it.meta) it.meta.mcTries = (it.meta.mcTries || 0) + 1; }
+    });
+    judgeDbCache = null; rkPoolCache[4] = rkPoolCache[7] = null;
+  }
+  return { uploads: todo.length, charts: found.length, modcharts: found.filter((x) => x[3]).length, left: Math.max(0, all.length - todo.length) };
 }
 
 let judgeDbCache = null, judgeDbAt = 0;
@@ -4649,7 +5301,7 @@ async function judgePlay(who, bytes, where, opts = {}) {
   try { replay = await readReplay(bytes); }
   catch (e) { if (e instanceof JudgeDataError) fail(400, "The play's replay couldn't be read: " + e.message); throw e; }
   // (REPLAY_VERSION is the newest the judge reads; older plays are judged by the rules they were played with)
-  if (replay.version < SCORE_REPLAY_MIN) fail(400, "That replay comes from an older OCTIVE. Update the game and play it again.");
+  if (replay.version < (opts.minVersion || SCORE_REPLAY_MIN)) fail(400, "That replay comes from an older OCTIVE. Update the game and play it again.");
   if (replay.autoplay) fail(400, "Autoplay doesn't count.");
   if (!replay.playerId || replay.playerId !== who.playerId) fail(403, "That replay isn't your own play.");
   if (opts.noMods && (parseMods(replay.mods) !== 0 || rateOf(replay.mods) !== 1)) fail(400, opts.noModsText || "This is played without mods.");
@@ -4871,7 +5523,11 @@ async function wsMeta(kind, u8) {
           const e = byName.get(String(src[i]?.file || "").split(BACKSLASH).join("/").toLowerCase());
           const bytes = e ? await zipRead(u8, e, 16 * 1048576) : null;
           if (!bytes) continue;
-          setChartShape(out.charts[i], chartStats(compileChart(loadChart(new TextDecoder().decode(bytes)))));
+          const text = new TextDecoder().decode(bytes);
+          const st = chartStats(compileChart(loadChart(text)));
+          st.mc = hasModchart(text) ? 1 : 0; // (2.0.1)
+          if (st.mc) st.tags = [...st.tags, "modchart"];
+          setChartShape(out.charts[i], st);
         } catch { /* left without: filled in later by fillChartShapes */ }
       }
       if (!(out.durationUs > 0)) out.durationUs = Math.round(Math.max(0, ...out.charts.map((c) => c.len || 0)) * 1e6);
@@ -5563,9 +6219,10 @@ function rkRewardItems(upTo) {
   return out;
 }
 let rkRewardsUpTo = -1;
-/** The reward items in the shop's list, up to next season's (new seasons' titles appear as the months go by). */
+const RK_REWARDS_AHEAD = 20; // (2.0.1) every season's rewards are made ahead, up to Season 20 (4K and 7K)
+/** The reward items in the shop's list: up to Season 20, then up to next season's as the months go by. */
 function rkEnsureRewardItems() {
-  const want = rkSeason().n + 1;
+  const want = Math.max(RK_REWARDS_AHEAD, rkSeason().n + 1);
   if (rkRewardsUpTo >= want) return;
   const have = new Set(SHOP.map((x) => x.id));
   for (const x of rkRewardItems(want)) if (!have.has(x.id)) SHOP.push(x);
@@ -5703,11 +6360,15 @@ async function rkPool(env, mode) {
   const out = [];
   for (const it of (await judgeDb(env)).items || []) {
     if (it.type !== "charts" || it.removed || !it.verified || !it.meta || !(it.b2Files || []).length) continue;
+    // (2.0.1) dans are courses of their own, not Ranked charts
+    const dans = new Set((Array.isArray(it.dans) ? it.dans : []).map((d) => `${d && d.songId}|${d && d.difficulty}`));
     for (const sg of it.meta.songs || []) {
       if (!sg || !sg.songId) continue;
       for (const c of sg.charts || []) {
         const stars = Number(c.stars);
         if (Number(c.keys) !== keys || !(stars > 0) || c.len === 0) continue; // (len 0: a chart the server couldn't read)
+        if (chartIsModchart(c)) continue; // (2.0.1) modcharts aren't played in Ranked
+        if (dans.has(`${sg.songId}|${c.difficulty || ""}`)) continue;
         out.push({
           itemId: it.id, version: it.version || 1, songId: sg.songId, chartId: c.chartId || null, osuMd5: c.osuMd5 || null, difficulty: c.difficulty || "",
           stars, title: sg.title || it.title || "", artist: sg.artist || "", creator: c.creator || it.creator || "", bpm: Math.round(Number(sg.bpm) || 0),
@@ -8168,6 +8829,7 @@ const wsPublic = (it) => ({
   verified: !!it.verified, builtin: !!it.builtin, originalId: it.originalId || null, customizable: it.type === "themes" ? true : it.type === "skins" || it.type === "styles" ? !(it.meta && it.meta.locked) : undefined,
   songIds: it.songIds || [], songs: it.meta && it.meta.songs ? it.meta.songs : undefined,
   tags: Array.isArray(it.tags) ? it.tags : [],
+  removedTags: Array.isArray(it.removedTags) && it.removedTags.length ? it.removedTags : undefined,
   likes: it.likes || 0, reviews: it.reviews || 0,
   verifyRequested: it.verifyRequest && !it.verified ? it.verifyRequest.at : undefined,
   verifyDenied: it.verifyDenied && !it.verified ? { reason: it.verifyDenied.reason, byName: it.verifyDenied.byName, at: it.verifyDenied.at } : undefined,
@@ -8535,6 +9197,34 @@ async function workshopRoutes(request, env, url, ctx) {
     });
     if (why) fail(400, why);
     return reply({ ok: true, item: wsPublic(out) });
+  }
+
+  // ---- an upload's auto-tags (2.0.1): its uploader (or staff) takes off ones that don't fit, or puts them back
+  mi = path.match(/^\/api\/items\/([a-z0-9]{16,40})\/autotags$/);
+  if (mi && request.method === "POST") {
+    const b = await bodyOf(request, 2000);
+    const who = await signedIn(request, env);
+    await loadModeration(config(env));
+    if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+    const staff = badgesOf(who.playerId).some((x) => x === "DEV" || x === "MOD") || who.playerId === OWNER || isOfficial(who.playerId);
+    const tag = String(b.tag || "").trim().toLowerCase().slice(0, 40), off = b.removed !== false;
+    let out = null, why = null;
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      const x = (d.items || []).find((y) => y.id === mi[1] && !y.removed);
+      if (!x) { why = "That item isn't in the Workshop any more."; return false; }
+      if (x.creatorId !== who.playerId && !staff) { why = "Only the person who shared it can change its tags."; return false; }
+      if (x.type !== "charts" || !x.meta) { why = "Only songs have auto-tags."; return false; }
+      const known = new Set((x.meta.songs || []).flatMap((sg) => ((sg && sg.charts) || []).flatMap((c) => (Array.isArray(c.autoTagsAll) ? c.autoTagsAll : c.autoTags || []))));
+      if (!known.has(tag)) { why = "That isn't one of its auto-tags."; return false; }
+      const list = new Set(Array.isArray(x.removedTags) ? x.removedTags : []);
+      if (off) list.add(tag); else list.delete(tag);
+      if (list.size) x.removedTags = [...list]; else delete x.removedTags;
+      applyRemovedTags(x);
+      out = x;
+    });
+    if (why) fail(400, why);
+    judgeDbCache = null; shapeIndexCache = null;
+    return reply({ ok: true, item: { ...wsPublic(out), meta: out.meta || null } });
   }
 
   // a verification request turned down, with the reviewer's reason (the uploader is told in the game)
@@ -9342,6 +10032,7 @@ async function workshopRoutes(request, env, url, ctx) {
         x.hashes = upParts.map((y) => y.hash); x.fileNames = upParts.map((y) => y.fileName);
         x.meta = it.type === "charts" ? { songs: upParts.map((y) => y.meta).filter(Boolean), locked: false } : (newMeta || { locked: false });
         x.songIds = it.type === "charts" ? upParts.map((y) => y.meta && y.meta.songId).filter(Boolean) : [];
+        applyRemovedTags(x);
       }
       x.b2Files = newFiles || oldFiles;
       if (!x.verified && verifiedNow && wsOfVerifiedSong(x, verifiedNow)) { x.verified = true; verIdx = null; danIdx = null; }
@@ -9723,11 +10414,14 @@ export default {
     if (event.cron === "15 * * * *") {
       ctx.waitUntil(Promise.all([recomputeRanking(env, 6).catch((e) => console.log("ranking recompute", e && e.message)),
         fillChartShapes(env, 20).catch((e) => console.log("chart shapes", e && e.message)),
+        fillModchartFlags(env, 15).catch((e) => console.log("modchart flags", e && e.message)),
         rkDiscordTick(env).catch((e) => console.log("ranked discord", e && e.message)),
         // a tournament moves on even when nobody looks (sign-ups closing, missed matches, the end)
         r2json(env, TOUR_KEY, null).then(async (t) => { if (t && await tourTick(env, t)) await r2put(env, TOUR_KEY, t); }).catch((e) => console.log("tournament", e && e.message)),
         // crew wars: last week's is settled (prizes, trophies)
-        warTick(env).catch((e) => console.log("crew war", e && e.message))]));
+        warTick(env).catch((e) => console.log("crew war", e && e.message)),
+        // (2.0.1) achievements that can't be real come off cards not checked since
+        achSweep(env, 80).catch((e) => console.log("achievement sweep", e && e.message))]));
       return;
     }
     ctx.waitUntil(Promise.all([refreshBoosters(env).catch((e) => console.log("boosters", e && e.message)), cleanDmFiles(env).catch((e) => console.log("dm files", e && e.message)),
