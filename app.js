@@ -1500,6 +1500,99 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     } catch (e) { setMsg(out, e.message); return false; }
   }
 
+  /**
+   * A cropping window for a picture before it's saved: drag it to move it, zoom with the slider, the mouse wheel or two
+   * fingers. The frame has the shape it's saved in (with a circle guide for profile pictures, which show round). Gives the
+   * part of the picture to keep ({ sx, sy, sw, sh } in its pixels), or null when cancelled.
+   */
+  function cropPicture(bmp, { title, aspect, round }) {
+    return new Promise((resolve) => {
+      const W = bmp.width, H = bmp.height;
+      const VW = Math.max(200, Math.round(Math.min(520, window.innerWidth - 72, (window.innerHeight - 280) * aspect)));
+      const VH = Math.round(VW / aspect);
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      const cv = h("canvas.crop-canvas", { width: VW * dpr, height: VH * dpr, "aria-label": "Drag to move the picture" });
+      cv.style.width = VW + "px"; cv.style.height = VH + "px";
+      if (round) cv.classList.add("round");
+      const ctx = cv.getContext("2d");
+      const minS = Math.max(VW / W, VH / H), maxS = minS * 8;
+      let s = minS, cx = W / 2, cy = H / 2;
+      const clamp = () => {
+        s = Math.min(maxS, Math.max(minS, s));
+        const hw = VW / 2 / s, hh = VH / 2 / s;
+        cx = Math.min(W - hw, Math.max(hw, cx)); cy = Math.min(H - hh, Math.max(hh, cy));
+      };
+      const zoom = h("input.crop-zoom", { type: "range", min: 0, max: 1000, value: 0, "aria-label": "Zoom" });
+      const toSlider = () => { zoom.value = String(Math.round(Math.log(s / minS) / Math.log(maxS / minS) * 1000)); };
+      const draw = () => {
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, VW, VH);
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(bmp, VW / 2 - cx * s, VH / 2 - cy * s, W * s, H * s);
+        if (round) {
+          // outside the circle: darkened (that part shows in square places only)
+          ctx.fillStyle = "#04050a99";
+          ctx.beginPath(); ctx.rect(0, 0, VW, VH); ctx.arc(VW / 2, VH / 2, Math.min(VW, VH) / 2, 0, Math.PI * 2, true); ctx.fill();
+          ctx.strokeStyle = "#ffffffaa"; ctx.lineWidth = 2;
+          ctx.beginPath(); ctx.arc(VW / 2, VH / 2, Math.min(VW, VH) / 2 - 1, 0, Math.PI * 2); ctx.stroke();
+        }
+      };
+      // zooming keeps the point under the pointer (or the middle) where it is
+      const zoomTo = (ns, px = VW / 2, py = VH / 2) => {
+        const ix = cx + (px - VW / 2) / s, iy = cy + (py - VH / 2) / s;
+        s = Math.min(maxS, Math.max(minS, ns));
+        cx = ix - (px - VW / 2) / s; cy = iy - (py - VH / 2) / s;
+        clamp(); toSlider(); draw();
+      };
+      zoom.addEventListener("input", () => zoomTo(minS * Math.pow(maxS / minS, Number(zoom.value) / 1000)));
+      cv.addEventListener("wheel", (e) => {
+        e.preventDefault();
+        const r = cv.getBoundingClientRect();
+        zoomTo(s * Math.pow(1.0015, -e.deltaY), e.clientX - r.left, e.clientY - r.top);
+      }, { passive: false });
+      // drag with a mouse or a finger; two fingers pinch
+      const pts = new Map();
+      let pinch = 0;
+      cv.addEventListener("pointerdown", (e) => { cv.setPointerCapture(e.pointerId); pts.set(e.pointerId, { x: e.clientX, y: e.clientY }); cv.classList.add("dragging"); });
+      cv.addEventListener("pointermove", (e) => {
+        const p = pts.get(e.pointerId); if (!p) return;
+        if (pts.size >= 2) {
+          p.x = e.clientX; p.y = e.clientY;
+          const [a, b] = [...pts.values()];
+          const d = Math.hypot(a.x - b.x, a.y - b.y);
+          const r = cv.getBoundingClientRect();
+          if (pinch > 0) zoomTo(s * d / pinch, (a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top);
+          pinch = d;
+          return;
+        }
+        cx -= (e.clientX - p.x) / s; cy -= (e.clientY - p.y) / s;
+        p.x = e.clientX; p.y = e.clientY;
+        clamp(); draw();
+      });
+      const up = (e) => { pts.delete(e.pointerId); pinch = 0; if (!pts.size) cv.classList.remove("dragging"); };
+      cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
+      const finish = (keep) => {
+        layer.remove(); document.removeEventListener("keydown", onKey);
+        resolve(keep ? { sx: cx - VW / 2 / s, sy: cy - VH / 2 / s, sw: VW / s, sh: VH / s } : null);
+      };
+      const onKey = (e) => { if (e.key === "Escape") finish(false); else if (e.key === "Enter") finish(true); };
+      const ok = h("button.btn.primary", { type: "button", onclick: () => finish(true) }, "Use it");
+      const cancel = h("button.btn.ghost", { type: "button", onclick: () => finish(false) }, "Cancel");
+      const reset = h("button.btn.ghost", { type: "button", onclick: () => { s = minS; cx = W / 2; cy = H / 2; toSlider(); draw(); } }, "Reset");
+      const box = h("div.crop-modal", { role: "dialog", "aria-modal": "true", "aria-label": title },
+        h("h2", { text: title }),
+        h("p.panel-sub", { text: "Drag the picture to move it, and zoom with the slider or the mouse wheel (or two fingers)." }),
+        h("div.crop-frame", {}, cv),
+        h("div.crop-zoom-row", {}, h("span.field-label", { text: "Zoom" }), zoom),
+        h("div.crop-actions", {}, reset, h("span.crop-gap"), cancel, ok));
+      const layer = h("div.modal-layer", { onclick: (e) => { if (e.target === layer) finish(false); } }, box);
+      document.body.append(layer);
+      document.addEventListener("keydown", onKey);
+      draw();
+      setTimeout(() => ok.focus(), 30);
+    });
+  }
+
   function picturePanel() {
     const out = msg();
     const input = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", hidden: true });
@@ -1511,13 +1604,16 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       input.value = "";
       if (!file) return;
       if (file.size > 15 * 1048576) return setMsg(out, "That picture is too big (15 MB at most).");
+      let bmp, crop;
+      try { bmp = await createImageBitmap(file); } catch { return setMsg(out, "That picture couldn't be read."); }
+      crop = await cropPicture(bmp, { title: "Crop your picture", aspect: 1, round: true });
+      if (!crop) return;
       await busy(btn, async () => {
         try {
-          const bmp = await createImageBitmap(file);
           const square = (size, q) => {
             const cv = document.createElement("canvas"); cv.width = cv.height = size;
-            const s = Math.min(bmp.width, bmp.height);
-            cv.getContext("2d").drawImage(bmp, (bmp.width - s) / 2, (bmp.height - s) / 2, s, s, 0, 0, size, size);
+            const c2 = cv.getContext("2d"); c2.imageSmoothingQuality = "high";
+            c2.drawImage(bmp, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, size, size);
             return cv.toDataURL("image/jpeg", q).split(",")[1];
           };
           const full = square(256, 0.9), small = square(128, 0.85);
@@ -1528,7 +1624,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         } catch (e) { setMsg(out, "That picture couldn't be read."); }
       });
     });
-    return section("Picture", me.avatarLocked ? "A developer set your picture, so it can't be changed." : "A square works best; other shapes are cropped to the middle.",
+    return section("Picture", me.avatarLocked ? "A developer set your picture, so it can't be changed." : "Choose a picture, then move and zoom it to pick what shows.",
       h("div.pic-row", {}, preview, btn, input), out);
   }
 
@@ -2262,12 +2358,15 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     bannerIn.addEventListener("change", async () => {
       const file = bannerIn.files && bannerIn.files[0]; bannerIn.value = "";
       if (!file) return;
+      let bmp, crop;
+      try { bmp = await createImageBitmap(file); } catch { return setMsg(out, "That picture couldn't be read."); }
+      crop = await cropPicture(bmp, { title: "Crop your banner", aspect: 3, round: false });
+      if (!crop) return;
       await busy(bannerBtn, async () => {
         try {
-          const bmp = await createImageBitmap(file);
           const W = 1200, H = 400, cv = document.createElement("canvas"); cv.width = W; cv.height = H;
-          const scale = Math.max(W / bmp.width, H / bmp.height), sw = W / scale, sh = H / scale;
-          cv.getContext("2d").drawImage(bmp, (bmp.width - sw) / 2, (bmp.height - sh) / 2, sw, sh, 0, 0, W, H);
+          const c2 = cv.getContext("2d"); c2.imageSmoothingQuality = "high";
+          c2.drawImage(bmp, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, W, H);
           const b64 = cv.toDataURL("image/jpeg", 0.85).split(",")[1];
           if (await saveLooks({ banner: b64 }, out, "Banner saved.")) bannerPrev.style.backgroundImage = `url("data:image/jpeg;base64,${b64}")`;
         } catch { setMsg(out, "That picture couldn't be read."); }

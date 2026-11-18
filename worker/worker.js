@@ -4706,19 +4706,29 @@ function digitEdits(a, b) {
  */
 async function chatPictureSafe(env, bytes) {
   if (!env.AI) return null;
-  const prompt = 'You moderate pictures for a game chat that teenagers use. Reply with JSON only, no other words: {"safe": true or false, "why": "a few words"}. ' +
-    "It is NOT safe if it shows nudity, sexual content or acts, genitals, sexualised minors, gore, graphic violence, self-harm, or hate symbols. Ordinary photos, screenshots, memes, drawings and game pictures are safe.";
-  const run = () => env.AI.run(SHARE_VISION, { prompt, image: Array.from(bytes), max_tokens: 80, temperature: 0 });
-  let out;
-  try { out = await run(); }
-  catch (e) {
-    if (shareVisionAgreed || !/agree|licen[cs]e/i.test(String(e && e.message))) { console.log("chat picture check", e && e.message); return null; }
-    try { await env.AI.run(SHARE_VISION, { prompt: "agree" }); shareVisionAgreed = true; out = await run(); }
-    catch (e2) { console.log("chat picture check", e2 && e2.message); return null; }
+  // (2.0.2) a plain one-word question: the long list of what isn't allowed made the model refuse to answer at all (then
+  // every picture was "couldn't be checked"). Two tries; an answer that isn't SAFE or UNSAFE is logged and not posted.
+  const prompt = "You check pictures before they are posted in the chat of a rhythm game played by teenagers. " +
+    "Is this picture fine to show there? Pictures with nudity, sexual content, gore or hate symbols are not. Screenshots, photos, memes and drawings usually are. " +
+    "Answer with one word: SAFE or UNSAFE.";
+  const ask = async () => {
+    try { return await env.AI.run(SHARE_VISION, { prompt, image: Array.from(bytes), max_tokens: 12, temperature: 0 }); }
+    catch (e) {
+      if (shareVisionAgreed || !/agree|licen[cs]e/i.test(String(e && e.message))) throw e;
+      await env.AI.run(SHARE_VISION, { prompt: "agree" }); shareVisionAgreed = true;
+      return env.AI.run(SHARE_VISION, { prompt, image: Array.from(bytes), max_tokens: 12, temperature: 0 });
+    }
+  };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let text;
+    try { const out = await ask(); text = String(out?.response ?? out?.description ?? ""); }
+    catch (e) { console.log("chat picture check error", e && e.message); continue; }
+    const t = text.toLowerCase();
+    if (/\bunsafe\b|not (fine|safe|appropriate|suitable)|\bno\b/.test(t)) return false;
+    if (/\bsafe\b|\byes\b|"safe"\s*:\s*true/.test(t)) return true;
+    console.log("chat picture check answer", JSON.stringify(text.slice(0, 200)));
   }
-  const m = String(out?.response ?? out?.description ?? "").match(/\{[\s\S]*\}/);
-  if (!m) return null; // a refusal or anything else: not posted
-  try { const r = JSON.parse(m[0]); return r.safe === true || r.safe === "true" ? true : r.safe === false || r.safe === "false" ? false : null; } catch { return null; }
+  return null;
 }
 
 // ---------------------------------------------------------------- workshop: charts, skins, themes and styles shared from the game
