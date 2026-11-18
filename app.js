@@ -2472,7 +2472,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       ["How do I remove my upload?", "The bin button on your own card in the Workshop removes it from the Workshop and deletes its post in the OCTIVE Discord. Moderators can remove uploads that break the rules."],
       ["What does Open in OCTIVE do?", "On a Workshop item on this website (or in its Discord post), Open in OCTIVE starts OCTIVE (or switches to it if it's already open), opens the Workshop and downloads that item for you. It works with OCTIVE 1.5 or newer on Windows and Android."],
       ["Can I update something I shared?", "Yes. The edit button on your own card in the Workshop changes its title or description, or uploads a new version. The post in the OCTIVE Discord is updated in place, and everyone who gets it afterwards gets the new version."],
-      ["How big can a file be?", "As big as the OCTIVE Discord allows right now (it depends on the server's boost level; usually 50 MB)."],
+      ["How big can a file be?", "Up to 150 MB (a pack of songs: 150 MB in all)."],
     ]],
     ["Discord", [
       ["How do I link my Discord?", "Account → Preferences on this website (or Settings → Profile → Discord in the game): you get a code, then type /link with it in the OCTIVE Discord."],

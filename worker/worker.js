@@ -911,7 +911,7 @@ async function paceCheck(env, cfg, playerId, now) {
 function cors(res) {
   const h = new Headers(res.headers);
   h.set("Access-Control-Allow-Origin", "*");
-  h.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  h.set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
   h.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   h.set("Access-Control-Max-Age", "86400");
   return new Response(res.body, { status: res.status, headers: h });
@@ -4834,11 +4834,15 @@ async function b2Delete(env, key) { const r = await b2Fetch(env, "DELETE", key);
 const wsB2Key = (id, version, n, fileName) => `workshop/${id}/v${version || 1}-${n}${((fileName || "").match(/\.[A-Za-z]+$/) || [".bin"])[0].toLowerCase()}`;
 /** Stores an upload's files (its parts) in B2; nothing is left behind when one fails. */
 async function wsStoreFiles(env, id, version, parts) {
-  const out = [];
+  const out = [], put = [];
   try {
-    for (const [k, x] of parts.entries()) { const key = wsB2Key(id, version, k, x.fileName); await b2Put(env, key, x.bytes); out.push({ key, name: x.fileName, size: x.bytes.length }); }
+    for (const [k, x] of parts.entries()) {
+      // (2.0.2) a file sent in parts: it's in B2 already
+      if (x.staged) { out.push({ key: x.staged.key, name: x.fileName, size: x.staged.size }); continue; }
+      const key = wsB2Key(id, version, k, x.fileName); await b2Put(env, key, x.bytes); out.push({ key, name: x.fileName, size: x.bytes.length }); put.push(key);
+    }
   } catch (e) {
-    for (const f of out) await b2Delete(env, f.key).catch(() => {});
+    for (const key of put) await b2Delete(env, key).catch(() => {});
     console.log("workshop store", e && e.message);
     fail(502, "The file couldn't be stored right now. Try again in a moment.");
   }
@@ -4925,10 +4929,202 @@ async function wsRepost(env, it) {
   return { channelId, messageId: posted.id, guildId: env.DISCORD_GUILD_ID };
 }
 
+// ---- (2.0.2) big Workshop files, sent in parts
+// A request can't carry a 150 MB file (the Worker has 128 MB of memory), so the game sends a big file in 16 MB parts
+// (POST /api/upload/stage, then PUT /api/upload/stage/<id>/<n>): each goes straight on to B2 as a part of one multipart
+// upload, and the file's SHA-256 is worked out part by part as they come (its state kept between parts). The upload
+// itself (/api/upload, /api/items/<id>/update) then names the staged files ("staged" fields) instead of carrying
+// them; they're checked from B2 (wsSlimZip: everything but the sound and video, read in byte ranges). Staged files
+// nothing used are removed after 12 hours (wsStageSweep, hourly).
+const WS_SINGLE_MAX = 50 * 1048576 - 1_000_000; // what one request can carry
+const WS_PART = 16 * 1048576; // the parts' size (the last one smaller); a multiple of 64 (SHA-256 blocks)
+const WS_STAGE_TTL = 12 * 3600_000;
+const wsStageKey = (playerId, id) => `workshop/stage/${playerId}/${id}.json`;
+
+/** An S3 request to B2 with a query string (multipart uploads). */
+async function b2S3(env, method, key, query, body = null, contentType = null) {
+  const host = String(env.B2_ENDPOINT).replace(/^https?:\/\//, "").replace(/\/+$/, "");
+  const region = (host.match(/^s3\.([a-z0-9-]+)\.backblazeb2\.com$/) || [])[1] || "us-east-1";
+  const path = `/${env.B2_BUCKET}/` + key.split("/").map((x) => encodeURIComponent(x)).join("/");
+  const q = Object.keys(query).sort().map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(query[k] ?? "")}`).join("&");
+  const amzDate = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const payloadHash = await sha256Hex(body || "");
+  const headers = { host, "x-amz-content-sha256": payloadHash, "x-amz-date": amzDate };
+  if (contentType) headers["content-type"] = contentType;
+  const auth = await s3Sign({ method, path, query: q, headers, payloadHash, keyId: env.B2_KEY_ID, secret: env.B2_APP_KEY, region, amzDate });
+  const send = { ...headers, authorization: auth }; delete send.host;
+  return fetch(`https://${host}${path}${q ? "?" + q : ""}`, { method, headers: send, body: body || undefined });
+}
+
+// SHA-256 a part at a time (Web Crypto can't carry on from where it stopped): the state is 8 numbers
+const SHA_K = new Uint32Array([0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+  0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d,
+  0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+  0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]);
+const sha256Start = () => [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+/** Runs whole 64-byte blocks of u8 (its length a multiple of 64) through the state h (changed in place). */
+function sha256Blocks(h, u8) {
+  const w = new Uint32Array(64);
+  let h0 = h[0] | 0, h1 = h[1] | 0, h2 = h[2] | 0, h3 = h[3] | 0, h4 = h[4] | 0, h5 = h[5] | 0, h6 = h[6] | 0, h7 = h[7] | 0;
+  for (let o = 0; o + 64 <= u8.length; o += 64) {
+    for (let i = 0; i < 16; i++) { const j = o + i * 4; w[i] = (u8[j] << 24) | (u8[j + 1] << 16) | (u8[j + 2] << 8) | u8[j + 3]; }
+    for (let i = 16; i < 64; i++) {
+      const x = w[i - 15], y = w[i - 2];
+      const s0 = ((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3);
+      const s1 = ((y >>> 17) | (y << 15)) ^ ((y >>> 19) | (y << 13)) ^ (y >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, hh = h7;
+    for (let i = 0; i < 64; i++) {
+      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const t1 = (hh + S1 + ((e & f) ^ (~e & g)) + SHA_K[i] + w[i]) | 0;
+      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const t2 = (S0 + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+      hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+    }
+    h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0; h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + hh) | 0;
+  }
+  h[0] = h0 >>> 0; h[1] = h1 >>> 0; h[2] = h2 >>> 0; h[3] = h3 >>> 0; h[4] = h4 >>> 0; h[5] = h5 >>> 0; h[6] = h6 >>> 0; h[7] = h7 >>> 0;
+}
+/** The last part (any length) and the whole file's length: the hash, hex like bytesHash. */
+function sha256Finish(h, u8, totalLen) {
+  const whole = u8.length - (u8.length % 64);
+  sha256Blocks(h, u8.subarray(0, whole));
+  const rest = u8.length - whole;
+  const tail = new Uint8Array(rest < 56 ? 64 : 128);
+  tail.set(u8.subarray(whole)); tail[rest] = 0x80;
+  const bits = totalLen * 8, dv = new DataView(tail.buffer);
+  dv.setUint32(tail.length - 8, Math.floor(bits / 4294967296)); dv.setUint32(tail.length - 4, bits >>> 0);
+  sha256Blocks(h, tail);
+  return h.map((x) => (x >>> 0).toString(16).padStart(8, "0")).join("");
+}
+
+/** An upload's files: the ones it carries, and (2.0.2) the ones sent before in parts ("staged"), each read when needed. */
+async function wsInputs(env, form, playerId) {
+  const out = form.getAll("file").filter((f) => f && typeof f !== "string")
+    .map((f) => ({ name: f.name, size: f.size, hash: null, staged: null, read: async () => new Uint8Array(await f.arrayBuffer()) }));
+  for (const sid of [...new Set(form.getAll("staged").map(String))].slice(0, 20)) {
+    if (!/^[a-z0-9]{20}$/.test(sid)) fail(400, "That upload isn't valid.");
+    const rec = await r2json(env, wsStageKey(playerId, sid), null);
+    if (!rec || !rec.done) fail(410, "A file of this upload didn't finish sending, or it was too long ago. Try again.");
+    out.push({ name: rec.fileName, size: rec.size, hash: rec.hash, staged: rec, read: () => wsStagedBytes(env, rec) });
+  }
+  return out;
+}
+/** A staged file, to check and read: songs and skins as a slim zip, themes and styles whole (they're small). */
+async function wsStagedBytes(env, rec) {
+  const t = WS_TYPES[((rec.fileName || "").match(/\.[A-Za-z]+$/) || [""])[0].toLowerCase()];
+  if (t === "charts" || t === "skins") return wsSlimZip(env, rec.key, rec.size);
+  if (rec.size > WS_SINGLE_MAX) fail(413, `Themes and styles can be up to ${Math.floor(WS_SINGLE_MAX / 1048576)} MB.`);
+  const r = await b2Get(env, rec.key);
+  if (!r.ok) fail(502, "The file couldn't be read right now. Try again in a moment.");
+  return new Uint8Array(await r.arrayBuffer());
+}
+/** Staged files an upload used: theirs now (their records go, so the sweep leaves the files). */
+async function wsStagesUsed(env, playerId, parts) {
+  for (const x of parts) if (x.staged) await env.RELEASES.delete(wsStageKey(playerId, x.staged.id)).catch(() => {});
+}
+
+/**
+ * A big package in B2 as a small zip to check and read (wsInspect, wsMeta): every file but the sound and video, read in
+ * byte ranges. Its file list is the whole package's (so the checks see every name); the files left out are empty in it.
+ */
+async function wsSlimZip(env, key, size) {
+  const bad = (m) => fail(400, m || "That file isn't a valid OCTIVE package (not a zip archive).");
+  if (size < 22) bad();
+  const tailStart = Math.max(0, size - 66_000);
+  const tail = await b2Range(env, key, tailStart, size - 1);
+  const tv = new DataView(tail.buffer, tail.byteOffset, tail.byteLength);
+  let eocd = -1;
+  for (let i = tail.length - 22; i >= 0; i--) if (tv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  if (eocd < 0) bad();
+  const count = tv.getUint16(eocd + 10, true), cdSize = tv.getUint32(eocd + 12, true), cdOff = tv.getUint32(eocd + 16, true);
+  if (count > 20000) bad("That package has too many files.");
+  if (count === 0xffff || cdOff === 0xffffffff || cdOff + cdSize > size) bad("That package can't be read (zip64 isn't supported).");
+  const cd = cdOff >= tailStart ? tail.slice(cdOff - tailStart, cdOff - tailStart + cdSize) : await b2Range(env, key, cdOff, cdOff + cdSize - 1);
+  const cv = new DataView(cd.buffer, cd.byteOffset, cd.byteLength);
+  const recs = [];
+  let budget = 40 * 1048576;
+  for (let n = 0, p = 0; n < count; n++) {
+    if (p + 46 > cd.length || cv.getUint32(p, true) !== 0x02014b50) bad("That package is damaged (its file list is broken).");
+    const nl = cv.getUint16(p + 28, true), xl = cv.getUint16(p + 30, true), cl = cv.getUint16(p + 32, true);
+    const comp = cv.getUint32(p + 20, true), local = cv.getUint32(p + 42, true);
+    const name = new TextDecoder().decode(cd.subarray(p + 46, p + 46 + nl));
+    const media = /\.(ogg|mp3|wav|flac|opus|m4a|aac|mp4|webm|mkv|avi|mov|m4v|wmv)$/i.test(name);
+    const keep = !media && comp <= 16 * 1048576 && local < cdOff && comp + 2048 <= budget;
+    if (keep) budget -= comp + 2048;
+    recs.push({ p, len: 46 + nl + xl + cl, local, comp, keep });
+    p += 46 + nl + xl + cl;
+  }
+  // the kept files' local records, read in runs of neighbours
+  const kept = recs.filter((r) => r.keep).sort((a, b) => a.local - b.local);
+  const data = new Map(); // local offset -> its local record (header, name, extra, data)
+  for (let i = 0; i < kept.length;) {
+    let j = i, end = Math.min(cdOff, kept[i].local + 30 + 1024 + kept[i].comp);
+    while (j + 1 < kept.length && kept[j + 1].local - end < 512 * 1024 && Math.min(cdOff, kept[j + 1].local + 30 + 1024 + kept[j + 1].comp) - kept[i].local < 24 * 1048576) { j++; end = Math.max(end, Math.min(cdOff, kept[j].local + 30 + 1024 + kept[j].comp)); }
+    const start = kept[i].local;
+    const run = await b2Range(env, key, start, end - 1);
+    for (let k = i; k <= j; k++) {
+      const r = kept[k], at = r.local - start;
+      let piece = run.subarray(at);
+      if (piece.length < 30) piece = await b2Range(env, key, r.local, Math.min(cdOff, r.local + 30 + 1024 + r.comp) - 1);
+      let dv = new DataView(piece.buffer, piece.byteOffset, piece.byteLength);
+      if (dv.getUint32(0, true) !== 0x04034b50) bad("That package is damaged.");
+      const len = 30 + dv.getUint16(26, true) + dv.getUint16(28, true) + r.comp;
+      if (len > piece.length) { piece = await b2Range(env, key, r.local, r.local + len - 1); }
+      data.set(r.local, piece.slice(0, len));
+    }
+    i = j + 1;
+  }
+  // the slim zip: an empty record for the files left out, the kept ones, the whole file list, the end
+  const stub = new Uint8Array(30); new DataView(stub.buffer).setUint32(0, 0x04034b50, true);
+  const chunks = [stub];
+  let off = 30;
+  const newLocal = new Map();
+  for (const r of kept) { newLocal.set(r.local, off); const d = data.get(r.local); chunks.push(d); off += d.length; }
+  const cdStart = off;
+  for (const r of recs) {
+    const c = cd.slice(r.p, r.p + r.len), dv = new DataView(c.buffer);
+    if (r.keep) dv.setUint32(42, newLocal.get(r.local), true);
+    else { dv.setUint16(10, 0, true); dv.setUint32(20, 0, true); dv.setUint32(24, 0, true); dv.setUint32(42, 0, true); }
+    chunks.push(c); off += c.length;
+  }
+  const end = new Uint8Array(22), ev = new DataView(end.buffer);
+  ev.setUint32(0, 0x06054b50, true); ev.setUint16(8, count, true); ev.setUint16(10, count, true); ev.setUint32(12, off - cdStart, true); ev.setUint32(16, cdStart, true);
+  chunks.push(end); off += 22;
+  const out = new Uint8Array(off);
+  let at = 0;
+  for (const c of chunks) { out.set(c, at); at += c.length; }
+  return out;
+}
+
+/** Staged files nothing used: gone after WS_STAGE_TTL (the multipart upload stopped, or the file deleted). */
+async function wsStageSweep(env, max = 200) {
+  let cursor, n = 0;
+  do {
+    const page = await env.RELEASES.list({ prefix: "workshop/stage/", cursor, limit: 500 });
+    for (const o of page.objects) {
+      if (Date.now() - new Date(o.uploaded).getTime() < WS_STAGE_TTL) continue;
+      if (++n > max) return;
+      const rec = await r2json(env, o.key, null);
+      try {
+        if (rec && rec.key && /^workshop\/staged\//.test(rec.key)) {
+          if (rec.done) await b2Delete(env, rec.key);
+          else if (rec.uploadId) await b2S3(env, "DELETE", rec.key, { uploadId: rec.uploadId });
+        }
+        await env.RELEASES.delete(o.key);
+      } catch (e) { console.log("stage sweep", e && e.message); }
+    }
+    cursor = page.truncated ? page.cursor : null;
+  } while (cursor);
+}
+
 /** The biggest file the server takes now (it follows the boost level, checked every 10 minutes), less a safety margin. */
 async function wsMaxBytes(env) {
-  // on B2 the limit is the server's own (what a request can hold), not Discord's
-  if (b2Ready(env)) return 50 * 1048576 - 1_000_000;
+  // on B2 the limit is the server's own, not Discord's: (2.0.2) 150 MB, files over what one request can carry
+  // (WS_SINGLE_MAX) sent in parts (/api/upload/stage)
+  if (b2Ready(env)) return 150 * 1048576 - 1_000_000;
   if (wsTier === null || Date.now() - wsTierAt > 600_000) {
     try { const g = await discordApi(env, "GET", `/guilds/${env.DISCORD_GUILD_ID}`); wsTier = Number(g.premium_tier || 0); wsTierAt = Date.now(); }
     catch { wsTier = wsTier ?? 0; }
@@ -9662,6 +9858,92 @@ async function workshopRoutes(request, env, url, ctx) {
   }
 
   // ---- upload from the game
+  // ---- (2.0.2) Ranked's connection check (the game, the first time Ranked opens each launch): the time to this server
+  // and back, bytes from it (random, so nothing on the way can shrink them) and bytes to it (counted, then thrown away)
+  if (path === "/api/speed/ping") return cors(new Response("ok", { headers: { "Content-Type": "text/plain", "Cache-Control": "no-store, no-transform" } }));
+  if (path === "/api/speed/down" && request.method === "GET") {
+    const n = Math.max(0, Math.min(50 * 1048576, Math.floor(Number(url.searchParams.get("bytes")) || 0)));
+    const block = crypto.getRandomValues(new Uint8Array(65536));
+    let sent = 0;
+    const body = new ReadableStream({
+      pull(c) { if (sent >= n) { c.close(); return; } const k = Math.min(block.length, n - sent); c.enqueue(block.slice(0, k)); sent += k; },
+    });
+    return cors(new Response(body, { headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store, no-transform" } }));
+  }
+  if (path === "/api/speed/up" && request.method === "POST") {
+    let n = 0;
+    const rd = request.body ? request.body.getReader() : null;
+    if (rd) for (;;) { const { done, value } = await rd.read(); if (done) break; n += value.length; if (n > 50 * 1048576) { await rd.cancel().catch(() => {}); break; } }
+    return reply({ ok: true, bytes: n });
+  }
+
+  // ---- (2.0.2) a big file sent in parts (see WS_SINGLE_MAX): start, then each part in order
+  if (path === "/api/upload/stage" && request.method === "POST") {
+    if (!b2Ready(env)) fail(503, "Uploads aren't set up on the server.");
+    const who = await signedIn(request, env);
+    await loadModeration(config(env));
+    if (moderation.bans[who.playerId]) fail(403, "This account is banned.");
+    let body;
+    try { body = await request.json(); } catch { fail(400, "Expected JSON."); }
+    const fileName = String((body && body.fileName) || "item").replace(/[^A-Za-z0-9 ._()\[\]'&+,-]/g, "_").slice(0, 100);
+    const ext = (fileName.match(/\.[A-Za-z]+$/) || [""])[0].toLowerCase();
+    if (!WS_TYPES[ext]) fail(400, "Only .oct (charts), .octskin (skins), .octtheme (themes) and .octstyle (styles) files can be shared.");
+    const size = Math.floor(Number(body && body.size) || 0);
+    const max = await wsMaxBytes(env);
+    if (!(size > 0)) fail(400, "The file is empty.");
+    if (size > max) fail(413, `That's too big: uploads can be up to ${Math.floor(max / 1048576)} MB.`);
+    const open = await env.RELEASES.list({ prefix: `workshop/stage/${who.playerId}/`, limit: 30 });
+    if (open.objects.length >= 25) fail(429, "Too many uploads are on their way at once. Try again in a while.");
+    const id = crypto.randomUUID().replace(/-/g, "").slice(0, 20);
+    const key = `workshop/staged/${id}${ext}`;
+    const r = await b2S3(env, "POST", key, { uploads: "" }, null, "application/octet-stream");
+    const text = await r.text().catch(() => "");
+    const uploadId = (/<UploadId>([^<]+)<\/UploadId>/.exec(text) || [])[1];
+    if (!r.ok || !uploadId) { console.log("stage start", r.status, text.slice(0, 200)); fail(502, "The upload couldn't start right now. Try again in a moment."); }
+    await r2put(env, wsStageKey(who.playerId, id), { id, key, uploadId, fileName, size, at: Date.now(), parts: [], h: sha256Start(), done: false });
+    return reply({ ok: true, stageId: id, partSize: WS_PART });
+  }
+  // how far a staged file got (the game carries on from there after a dropped connection, or a restart)
+  m = path.match(/^\/api\/upload\/stage\/([a-z0-9]{20})$/);
+  if (m && request.method === "GET") {
+    const who = await signedIn(request, env);
+    const rec = await r2json(env, wsStageKey(who.playerId, m[1]), null);
+    if (!rec) fail(404, "That upload was too long ago. Start it again.");
+    return reply({ ok: true, fileName: rec.fileName, size: rec.size, partSize: WS_PART, received: Math.min(rec.size, rec.parts.length * WS_PART), done: !!rec.done });
+  }
+  m = path.match(/^\/api\/upload\/stage\/([a-z0-9]{20})\/([0-9]{1,3})$/);
+  if (m && request.method === "PUT") {
+    const who = await signedIn(request, env);
+    const rk = wsStageKey(who.playerId, m[1]);
+    const rec = await r2json(env, rk, null);
+    if (!rec) fail(404, "That upload was too long ago. Start it again.");
+    const n = Number(m[2]);
+    const received = () => Math.min(rec.size, rec.parts.length * WS_PART);
+    if (n >= 1 && n <= rec.parts.length) return reply({ ok: true, received: received(), done: !!rec.done }); // sent already (a retry)
+    if (n !== rec.parts.length + 1) fail(409, "The parts came out of order. Start the upload again.");
+    const offset = (n - 1) * WS_PART, expect = Math.min(WS_PART, rec.size - offset);
+    if (expect <= 0) fail(400, "The file doesn't have that many parts.");
+    const cl = Number(request.headers.get("Content-Length") || 0);
+    if (cl && cl !== expect) fail(400, `That part should be ${expect} bytes.`);
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.length !== expect) fail(400, `That part should be ${expect} bytes.`);
+    const last = offset + expect >= rec.size;
+    const r = await b2S3(env, "PUT", rec.key, { partNumber: String(n), uploadId: rec.uploadId }, bytes);
+    const etag = r.headers.get("ETag");
+    if (!r.ok || !etag) { console.log("stage part", r.status, (await r.text().catch(() => "")).slice(0, 200)); fail(502, "That part couldn't be stored right now. Try again in a moment."); }
+    rec.parts.push({ n, etag });
+    if (last) {
+      rec.hash = sha256Finish(rec.h, bytes, rec.size); rec.h = null;
+      const xml = `<CompleteMultipartUpload>${rec.parts.map((x) => `<Part><PartNumber>${x.n}</PartNumber><ETag>${x.etag.replace(/[<>&]/g, "")}</ETag></Part>`).join("")}</CompleteMultipartUpload>`;
+      const c = await b2S3(env, "POST", rec.key, { uploadId: rec.uploadId }, new TextEncoder().encode(xml), "application/xml");
+      const ct = await c.text().catch(() => "");
+      if (!c.ok || /<Error>/.test(ct)) { console.log("stage complete", c.status, ct.slice(0, 200)); fail(502, "The file couldn't be put together right now. Start the upload again."); }
+      rec.done = true;
+    } else sha256Blocks(rec.h, bytes);
+    await r2put(env, rk, rec);
+    return reply({ ok: true, received: received(), done: !!rec.done });
+  }
+
   if (path === "/api/upload" && request.method === "POST") {
     if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_GUILD_ID) fail(503, "Uploads aren't set up on the server.");
     // OCTIVE's own content can also be published by the developer's tools as the official account (with a key
@@ -9681,12 +9963,13 @@ async function workshopRoutes(request, env, url, ctx) {
 
     const max = await wsMaxBytes(env);
     const len = Number(request.headers.get("Content-Length") || 0);
-    if (len > max + 200_000) fail(413, `That's too big: uploads can be up to ${Math.floor(max / 1048576)} MB.`);
+    if (len > WS_SINGLE_MAX + 200_000) fail(413, len > max + 200_000 ? `That's too big: uploads can be up to ${Math.floor(max / 1048576)} MB.` : `Files over ${Math.floor(WS_SINGLE_MAX / 1048576)} MB need the newest OCTIVE: update the game to share it.`);
     let form;
     try { form = await request.formData(); } catch { fail(400, "The upload wasn't readable (multipart/form-data expected)."); }
     if (importer && form.get("builtin") !== "1") fail(403, "The import key only publishes OCTIVE's own content.");
     // one file, or (charts) the songs of one entry: a pack or speed copies, up to 20 songs in one item
-    const files = form.getAll("file").filter((f) => f && typeof f !== "string");
+    // ((2.0.2) big ones sent before in parts)
+    const files = await wsInputs(env, form, who.playerId);
     if (!files.length) fail(400, "No file was attached.");
     const parts = [];
     let type = null, total = 0;
@@ -9699,14 +9982,14 @@ async function workshopRoutes(request, env, url, ctx) {
       type = t;
       total += file.size;
       if (total > max) fail(413, `That's too big: uploads can be up to ${Math.floor(max / 1048576)} MB in all.`);
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const hash = await bytesHash(bytes);
+      const bytes = await file.read();
+      const hash = file.hash || await bytesHash(bytes);
       if (parts.some((x) => x.hash === hash)) continue; // the same file twice: once is enough
       const { preview } = await wsInspect(t, bytes);
       const meta1 = await wsMeta(t, bytes);
       // the same song twice in one pack (another copy of it): once is enough
       if (meta1 && meta1.songId && parts.some((x) => x.meta && x.meta.songId === meta1.songId)) continue;
-      parts.push({ fileName, bytes, preview, hash, meta: meta1 });
+      parts.push({ fileName, bytes, preview, hash, meta: meta1, staged: file.staged });
     }
     if (parts.length > 1 && type !== "charts") fail(400, "Only songs can be shared several at a time.");
     if (parts.length > 20) fail(400, "Share at most 20 songs in one post.");
@@ -9786,6 +10069,7 @@ async function workshopRoutes(request, env, url, ctx) {
         for (const x of d.items) if (!x.removed && x.builtin && x.originalId === item.originalId) { x.removed = true; replaced.push(x); }
       d.items.push(item);
     });
+    await wsStagesUsed(env, who.playerId, parts);
     for (const x of replaced) { if (x.messageId) { try { await discordApi(env, "DELETE", `/channels/${x.channelId}/messages/${x.messageId}`); } catch { /* gone */ } } await wsDeleteFiles(env, x); wsUrls.delete(x.id); }
     rate.n += 1;
     await r2put(env, rateKey, rate);
@@ -9955,7 +10239,7 @@ async function workshopRoutes(request, env, url, ctx) {
     if (it.creatorId !== who.playerId && !staff) fail(403, "Only the person who shared it can update it.");
     const max = await wsMaxBytes(env);
     const len = Number(request.headers.get("Content-Length") || 0);
-    if (len > max + 200_000) fail(413, `That's too big: uploads can be up to ${Math.floor(max / 1048576)} MB.`);
+    if (len > WS_SINGLE_MAX + 200_000) fail(413, len > max + 200_000 ? `That's too big: uploads can be up to ${Math.floor(max / 1048576)} MB.` : `Files over ${Math.floor(WS_SINGLE_MAX / 1048576)} MB need the newest OCTIVE: update the game to share it.`);
     let form;
     try { form = await request.formData(); } catch { fail(400, "The update wasn't readable (multipart/form-data expected)."); }
     const clean = (v, n) => String(v || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@\u200b$1").trim().slice(0, n);
@@ -9966,7 +10250,7 @@ async function workshopRoutes(request, env, url, ctx) {
     const creator = canCredit && form.get("creator") != null ? clean(form.get("creator"), 40) || it.creator : it.creator;
     const newCreatorId = canCredit && /^[A-Za-z0-9_-]{8,64}$/.test(String(form.get("creatorId") || "")) ? String(form.get("creatorId")) : it.creatorId;
     // a new version: one file, or (a pack) all its songs again
-    const upFiles = form.getAll("file").filter((f) => f && typeof f !== "string");
+    const upFiles = await wsInputs(env, form, who.playerId);
     const upParts = [];
     let upTotal = 0;
     for (const file of upFiles.slice(0, 20)) {
@@ -9975,13 +10259,13 @@ async function workshopRoutes(request, env, url, ctx) {
       if (WS_TYPES[ext] !== it.type) fail(400, `An update must be the same kind of file (${WS_LABEL[it.type].toLowerCase()}).`);
       upTotal += file.size;
       if (upTotal > max) fail(413, `That's too big: uploads can be up to ${Math.floor(max / 1048576)} MB.`);
-      const b8 = new Uint8Array(await file.arrayBuffer());
-      const h = await bytesHash(b8);
+      const b8 = await file.read();
+      const h = file.hash || await bytesHash(b8);
       if (upParts.some((x) => x.hash === h)) continue;
       const pv = (await wsInspect(it.type, b8)).preview;
       const mt = await wsMeta(it.type, b8);
       if (mt && mt.songId && upParts.some((x) => x.meta && x.meta.songId === mt.songId)) continue;
-      upParts.push({ fileName: fn, bytes: b8, preview: pv, hash: h, meta: mt });
+      upParts.push({ fileName: fn, bytes: b8, preview: pv, hash: h, meta: mt, staged: file.staged });
     }
     let bytes = upParts.length ? upParts[0].bytes : null, fileName = upParts.length ? upParts[0].fileName : it.fileName, preview = (upParts.find((x) => x.preview) || {}).preview || null;
     if (!preview && upParts.length) {
@@ -10041,6 +10325,7 @@ async function workshopRoutes(request, env, url, ctx) {
       out = x;
     });
     if (newFiles && it.b2Files) await wsDeleteFiles(env, it);
+    if (newFiles) await wsStagesUsed(env, who.playerId, upParts);
     // the Discord card: edited in place (same link), or an older post replaced by a card
     let patched = false;
     const after = out || it;
@@ -10421,7 +10706,9 @@ export default {
         // crew wars: last week's is settled (prizes, trophies)
         warTick(env).catch((e) => console.log("crew war", e && e.message)),
         // (2.0.1) achievements that can't be real come off cards not checked since
-        achSweep(env, 80).catch((e) => console.log("achievement sweep", e && e.message))]));
+        achSweep(env, 80).catch((e) => console.log("achievement sweep", e && e.message)),
+        // (2.0.2) big files sent in parts that no upload used
+        wsStageSweep(env).catch((e) => console.log("stage sweep", e && e.message))]));
       return;
     }
     ctx.waitUntil(Promise.all([refreshBoosters(env).catch((e) => console.log("boosters", e && e.message)), cleanDmFiles(env).catch((e) => console.log("dm files", e && e.message)),
