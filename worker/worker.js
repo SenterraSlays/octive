@@ -3069,6 +3069,47 @@ async function boardSong(env, id) {
 }
 const chartIdOk = (id) => /^[A-Za-z0-9_-]{1,80}$/.test(id || "");
 
+/**
+ * (2.0.2) A board score's mods as shown: its mod letters and, played faster or slower, its rate ("MR OT 1.3x"). Before,
+ * only the letters were kept, so the board never said a score was played at another rate.
+ */
+function boardMods(codes) {
+  const letters = String(codes || "").replace(/[^A-Z ]/g, " ").replace(/\s+/g, " ").trim();
+  const rate = rateOf(String(codes || ""));
+  return (letters + (rate !== 1 ? ` ${rate}x` : "")).trim().slice(0, 40);
+}
+
+/**
+ * (2.0.2) Board scores kept before the rate was: their rate read back from their replays, once (each gets rc: 1).
+ * Only the first 50 (what the board shows) are looked at.
+ */
+async function boardRatesBackfill(env, songId, chartId, data) {
+  const todo = (data.entries || []).slice(0, 50).filter((e) => !e.rc && e.playerId);
+  if (!todo.length) return;
+  const found = new Map();
+  for (const e of todo) {
+    let mods = null;
+    try {
+      const o = await env.RELEASES.get(boardReplayKey(songId, chartId, e.playerId));
+      if (o) mods = (await readReplay(new Uint8Array(await o.arrayBuffer()))).mods;
+    } catch { /* no readable replay: as it was */ }
+    found.set(e.playerId, mods == null ? null : boardMods(mods));
+  }
+  const key = `scores/${songId}/${chartId}.json`;
+  const out = await r2update(env, key, () => ({ entries: [] }), (d) => {
+    let changed = false;
+    for (const e of d.entries || []) {
+      if (e.rc || !found.has(e.playerId)) continue;
+      const m = found.get(e.playerId);
+      // only when the replay is of this score (the letters it has match), so a newer score's replay never relabels an older one
+      if (m != null && m.replace(/ ?[0-9.]+x$/, "") === String(e.mods || "").trim()) e.mods = m;
+      e.rc = 1; changed = true;
+    }
+    if (!changed) return false;
+  });
+  boards.set(key, { data: out, at: Date.now() });
+}
+
 async function readBoard(env, songId, chartId) {
   const key = `scores/${songId}/${chartId}.json`;
   const c = boards.get(key);
@@ -3108,7 +3149,9 @@ async function chartScores(request, env, url) {
   const m = url.pathname.match(/^\/scores\/([a-z0-9-]{1,90})\/([A-Za-z0-9_-]{1,80})$/);
   if (m && request.method === "GET") {
     if (!(await boardSong(env, m[1]))) return reply({ entries: [], official: false });
-    const data = await readBoard(env, m[1], m[2]);
+    let data = await readBoard(env, m[1], m[2]);
+    // (2.0.2) older scores' rates, from their replays (once per score)
+    if ((data.entries || []).slice(0, 50).some((e) => !e.rc)) { try { await boardRatesBackfill(env, m[1], m[2], data); data = await readBoard(env, m[1], m[2]); } catch (e) { console.log("board rates", e && e.message); } }
     if (Date.now() - boardAt > BOARD_TTL) { try { await loadModeration(config(env)); } catch { /* keep */ } }
     let sup = {};
     try { sup = await supporters(env); } catch { /* none */ }
@@ -3148,7 +3191,8 @@ async function chartScores(request, env, url) {
       badges: badgesOf(who.playerId),
       date: new Date().toISOString(),
       version: String(replay.octiveVersion || b.version || "").slice(0, 12),
-      mods: String(replay.mods || "").replace(/[^A-Z ]/g, "").slice(0, 40),
+      mods: boardMods(replay.mods),
+      rc: 1,
       judged: JUDGE_VERSION,
     };
     // a verified chart's stars are known here: the PR on its board is never more than they give at that accuracy
