@@ -474,16 +474,20 @@ export function chartStats(c) {
     if (r && t - r.t <= 3000) r.lanes.push(c.lane[i]); else rows.push({ t, lanes: [c.lane[i]] });
   }
   // only rows in runs of notes count (closer than 180 ms to the row before)
-  let dense = 0, streamRows = 0, jumps = 0, hands = 0, chords = 0, jackRows = 0, chordJacks = 0;
+  let dense = 0, streamRows = 0, jumps = 0, hands = 0, chords = 0, jackRows = 0, chordJacks = 0, fastJacks = 0, varied = 0;
+  let prevGap = 0;
   for (let r = 1; r < rows.length; r++) {
     const a = rows[r - 1], b = rows[r], gap = b.t - a.t;
-    if (gap > 180_000) continue;
+    if (gap > 180_000) { prevGap = 0; continue; }
     dense++;
+    // (2.0.2) the rhythm changing from one row to the next (technical charts mix snaps)
+    if (prevGap > 0 && (gap / prevGap < 0.8 || gap / prevGap > 1.25)) varied++;
+    prevGap = gap;
     const size = b.lanes.length;
     if (size >= 2) chords++;
     if (size === 2) jumps++; else if (size >= 3) hands++;
     const again = b.lanes.some((l) => a.lanes.includes(l)); // a lane hit again straight away: a jack
-    if (again) { jackRows++; if (size >= 2 && a.lanes.length >= 2) chordJacks++; }
+    if (again) { jackRows++; if (size >= 2 && a.lanes.length >= 2) chordJacks++; if (gap <= 105_000) fastJacks++; }
     else if (size === 1 && a.lanes.length === 1 && gap <= 150_000) streamRows++;
   }
   const sh = (x) => (dense ? x / dense : 0);
@@ -502,9 +506,12 @@ export function chartStats(c) {
     if (name === "jacks" && tags.includes("chordjack")) continue;
     tags.push(name);
   }
+  // (2.0.2) fast jacks (a lane hit again within 105 ms: 1/4s at 143 BPM and up), and rhythms that keep changing
+  if (sh(fastJacks) >= 0.15) tags.push("speedjack");
+  if (dense >= 50 && sh(varied) >= 0.35) tags.push("technical");
   if (nps >= 16) tags.push("speed");
   if (span >= 180 && nps >= 8) tags.push("stamina");
-  return { len, ln: Math.round(ln * 100) / 100, nps: Math.round(nps * 10) / 10, tags: tags.slice(0, 4) };
+  return { len, ln: Math.round(ln * 100) / 100, nps: Math.round(nps * 10) / 10, tags: tags.slice(0, 6) };
 }
 
 /** A compiled chart as compact JSON (kept by the server so a chart is read and compiled once). */

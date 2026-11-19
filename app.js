@@ -598,6 +598,13 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     }
     decorateCard(card, p);
     card.after(socialRow(p));
+    // (2.0.2) their crew, a link to its page
+    loadCosmetics().then((cs) => {
+      const cr = cs && cs.players && cs.players[p.id] && cs.players[p.id].crew;
+      if (!cr || !cr.id || !card.isConnected) return;
+      const link = h("a.crew-chip", { href: "#/crew/" + encodeURIComponent(cr.id), title: "Their crew" }, crewTag(cr), h("span", { text: "Crew →" }));
+      card.querySelector(".card-name")?.after(link);
+    });
     // what they shared to the Workshop
     const uploads = h("section.ws-profile", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: "Workshop uploads" }), h("a.more", { href: "#/workshop" }, "Workshop →")), h("div.ws-grid"));
     card.parentNode.appendChild(uploads);
@@ -2855,6 +2862,68 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     }, 8000);
   }
 
+  // ---------------------------------------------------------------- #/crews and #/crew/<id>: the crew board and a crew's page (2.0.2)
+  const crewCol = (c) => (/^#[0-9A-Fa-f]{6}$/.test(String(c || "")) ? c : "#3FD8FF");
+  function crewTag(c, big) {
+    const col = crewCol(c.color);
+    return h("span.crew-tag" + (big ? ".big" : ""), { text: c.tag || "?", style: `color:${col};background:${col}22;border-color:${col}99` });
+  }
+  function crewsPage() {
+    const one = (location.hash.match(/^#\/crew\/([a-z0-9]{10,24})/) || [])[1];
+    if (one) return crewPage(one);
+    document.title = "Crews · OCTIVE";
+    const list = h("div.crew-list", {}, h("p.empty", { text: "Loading the crew board…" }));
+    app.replaceChildren(h("section", {},
+      h("div.section-head", {}, h("h1.section-title", { text: "Crew board" }), h("a.more", { href: "#/rankings" }, "Players →")),
+      h("p.panel-sub.crew-intro", { text: "Crews are teams of up to 12 players. A crew's score is its five best members' PR added up. Make or join one in the game: Profile → Crew." }),
+      list));
+    fetch(`${worker}/play/crews`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+      if (!list.isConnected) return;
+      const crews = (d && d.crews) || [];
+      if (!crews.length) { list.replaceChildren(h("p.empty", { text: "No crews yet." })); return; }
+      list.replaceChildren(...crews.map((c) => h("a.crew-row", { href: "#/crew/" + encodeURIComponent(c.id) },
+        h("span.crew-rank", { text: "#" + c.rank }),
+        crewTag(c),
+        h("span.crew-name", { text: c.name }),
+        h("span.crew-members", { text: `${c.members} member${c.members === 1 ? "" : "s"}` }),
+        h("b.crew-score", { text: fmt0.format(Math.round(c.score || 0)) + " PR" }))));
+    });
+  }
+  function crewPage(id) {
+    document.title = "Crew · OCTIVE";
+    const box = h("div", {}, h("p.empty", { text: "Loading the crew…" }));
+    app.replaceChildren(h("div.crew-page", {}, h("a.back", { href: "#/crews" }, "← Crew board"), box));
+    fetch(`${worker}/play/crews/of?id=${encodeURIComponent(id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+      if (!box.isConnected) return;
+      const c = d && d.crew;
+      if (!c) { box.replaceChildren(h("p.empty", { text: "That crew isn't around any more." })); return; }
+      document.title = `${c.name} · Crews · OCTIVE`;
+      const col = crewCol(c.color);
+      const stat = (label, value) => h("div.crew-stat", {}, h("span.field-label", { text: label }), h("b", { text: value }));
+      const wars = c.wars || {};
+      const hero = h("section.crew-hero", { style: `--crew:${col}` },
+        h("div.crew-top", {}, crewTag(c, true), h("div.crew-titles", {}, h("h1", { text: c.name }), c.desc ? h("p.crew-desc", { text: c.desc }) : null)),
+        h("div.crew-stats", {},
+          stat("Crew rank", c.rank > 0 ? "#" + fmt0.format(c.rank) : "–"),
+          stat("Score", fmt0.format(Math.round(c.score || 0)) + " PR"),
+          stat("Members", `${(c.members || []).length} / ${c.max || 12}`),
+          stat("Crew wars won", fmt0.format(wars.wins || 0))),
+        h("p.panel-sub", { text: "Score: the five best members' PR added up." }));
+      const members = (c.members || []).map((m) => {
+        const av = h("span.crew-av", { text: (m.name || "?").charAt(0).toUpperCase() });
+        const img = h("img", { src: `${worker}/avatar/${encodeURIComponent(m.id)}`, alt: "", loading: "lazy" });
+        img.onerror = () => img.remove();
+        av.append(img);
+        return h("a.crew-member", { href: "#/u/" + encodeURIComponent(m.id) },
+          av,
+          h("span.crew-name", { text: m.name || "Player" }),
+          m.role === "owner" ? h("span.crew-owner", { text: "OWNER", style: `color:${col};background:${col}22` }) : null,
+          h("b.crew-score", { text: fmt0.format(Math.round(m.pp || 0)) + " PR" }));
+      });
+      box.replaceChildren(hero, h("h2.section-title.crew-sub", { text: "Members" }), h("div.crew-list", {}, members));
+    });
+  }
+
   function page() {
     const hash = location.hash || "#/";
     if (/^#\/u\//.test(hash)) return "player";
@@ -2865,7 +2934,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function route(fromHashChange) {
     const pg = page();
     const mine = pg === "player" && me && decodeURIComponent(location.hash.slice(4)) === me.playerId;
-    const navKey = pg === "player" ? (mine ? "me" : "rankings") : pg === "account" ? "settings" : pg;
+    const navKey = pg === "player" ? (mine ? "me" : "rankings") : pg === "account" ? "settings" : pg === "crew" ? "crews" : pg;
     for (const a of document.querySelectorAll("[data-nav]")) a.classList.toggle("active", a.dataset.nav === navKey || (navKey === "settings" && a.dataset.nav === "account"));
     if ((pg === "rankings" || pg === "player" || pg === "ranked") && !data) { app.replaceChildren(h("p.empty", { text: "Loading the ranking…" })); return; }
     if (pg === "player") player(decodeURIComponent(location.hash.slice(4)));
@@ -2880,6 +2949,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     else if (pg === "workshop") workshopPage();
     else if (pg === "messages") messagesPage();
     else if (pg === "open") openPage();
+    else if (pg === "crews" || pg === "crew") crewsPage();
     else home();
     if (fromHashChange) window.scrollTo(0, 0);
   }

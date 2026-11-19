@@ -823,7 +823,7 @@ async function chartShapeIndex(env) {
       for (const c of sg.charts || []) {
         const ch = set > 0 && c.osuMd5 ? c.osuMd5 : c.chartId;
         if (!ch || !(Number(c.stars) > 0)) continue;
-        out.set(`${board}/${ch}`, { stars: Number(c.stars), keys: Number(c.keys) || 0, tags: (c.autoTags || []).map(String) });
+        out.set(`${board}/${ch}`, { stars: Number(c.stars), keys: Number(c.keys) || 0, tags: [...new Set([...(c.autoTags || []), ...(it.tags || [])].map(String))] });
       }
     }
   }
@@ -832,12 +832,15 @@ async function chartShapeIndex(env) {
 }
 
 /** The radar's axes: a name and the chart tags that count for it. */
+// (2.0.2) eight of them, an octagon: tags from the notes, and the uploader's own tags (Tech and SV are often only those)
 const SKILL_AXES = [
-  ["stream", "Stream", ["stream"]],
   ["jumpstream", "Jumpstream", ["jumpstream"]],
   ["handstream", "Handstream", ["handstream"]],
-  ["jacks", "Jacks", ["jacks", "chordjack"]],
-  ["ln", "Long notes", ["ln", "hybrid"]],
+  ["chordjack", "Chordjack", ["chordjack"]],
+  ["speedjack", "Speedjack", ["speedjack"]],
+  ["ln", "LNs", ["ln", "hybrid"]],
+  ["tech", "Tech", ["technical"]],
+  ["sv", "SV", ["sv"]],
   ["speed", "Speed", ["speed", "stamina"]],
 ];
 
@@ -5332,6 +5335,16 @@ async function judgeChartOf(env, it, songId, want) {
  * A modchart (2.0.1): the chart moves its lanes or notes (lane animations, note-path effects, an FNF stage, input swaps
  * or note behaviours). Its uploads get the "modchart" tag by themselves.
  */
+/** (2.0.2) A chart with scroll speed changes that matter: 4 or more SV points 10% off normal speed (or stops / reverses). */
+function hasSv(text) {
+  let j;
+  try { j = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); } catch { return false; }
+  const sv = j && Array.isArray(j.sv) ? j.sv : [];
+  let n = 0;
+  for (const e of sv) { const v = Number(e && e.value); if (Number.isFinite(v) && (v <= 0 || Math.abs(v - 1) >= 0.1) && e.enabled !== false) n++; }
+  return n >= 4;
+}
+
 function hasModchart(text) {
   let j;
   try { j = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); } catch { return false; }
@@ -5343,8 +5356,11 @@ function hasModchart(text) {
 /** Puts a chart's shape on its Workshop details: len (seconds), ln (long-note share), nps (notes a second), autoTags. */
 function setChartShape(ch, st) {
   if (!ch || !st) return;
-  ch.len = st.len; ch.ln = st.ln; ch.nps = st.nps; ch.autoTags = st.tags; ch.autoTagsAll = st.tags;
+  const tags = [...(st.tags || [])];
   if (st.mc !== undefined) ch.mc = st.mc;
+  if (ch.mc === 1 && !tags.includes("modchart")) tags.push("modchart"); // (a shape worked out again keeps it)
+  if (st.sv !== undefined) { ch.sv = st.sv ? 1 : 0; if (st.sv && !tags.includes("sv")) tags.push("sv"); }
+  ch.len = st.len; ch.ln = st.ln; ch.nps = st.nps; ch.autoTags = tags; ch.autoTagsAll = tags;
 }
 
 /**
@@ -5373,7 +5389,7 @@ const chartIsModchart = (c) => c.mc === 1 || (Array.isArray(c.autoTagsAll) ? c.a
 async function fillChartShapes(env, maxItems = 6) {
   const db = await r2json(env, WS_DB, { items: [] });
   const missing = (it) => it.type === "charts" && !it.removed && it.meta && (it.b2Files || []).length && (it.meta.shapeTries || 0) < 3 &&
-    (it.meta.songs || []).some((sg) => (sg.charts || []).some((c) => c.len === undefined));
+    (it.meta.songs || []).some((sg) => (sg.charts || []).some((c) => c.len === undefined || c.sv === undefined));
   const all = (db.items || []).filter(missing);
   const todo = all.sort((a, b) => (b.verified ? 1 : 0) - (a.verified ? 1 : 0)).slice(0, maxItems);
   const found = [], tried = [];
@@ -5391,9 +5407,11 @@ async function fillChartShapes(env, maxItems = 6) {
       if (si < 0) continue;
       const charts = songs[si].charts || [];
       for (let j = 0; j < charts.length && j < m.charts.length; j++) {
-        if (charts[j].len !== undefined) continue;
+        if (charts[j].len !== undefined && charts[j].sv !== undefined) continue;
         let st;
         try { st = chartStats(await judgeCompiled(env, f, m, j)); } catch { st = { len: 0, ln: 0, nps: 0, tags: [] }; }
+        // (2.0.2) its SV, from the chart file itself
+        try { st.sv = m.charts[j].entry ? hasSv(new TextDecoder().decode(await judgeZipFile(env, f, m.charts[j].entry))) : false; } catch { st.sv = false; }
         found.push([it.id, si, j, st]);
         any = true;
       }
@@ -5406,7 +5424,7 @@ async function fillChartShapes(env, maxItems = 6) {
       for (const [id, si, j, st] of found) {
         const sg = byId.get(id)?.meta?.songs?.[si];
         const ch = sg?.charts?.[j];
-        if (!ch || ch.len !== undefined) continue;
+        if (!ch || (ch.len !== undefined && ch.sv !== undefined)) continue;
         setChartShape(ch, st);
         applyRemovedTags(byId.get(id));
         if (!(sg.durationUs > 0) && st.len > 0) sg.durationUs = Math.round(st.len * 1e6);
@@ -5732,7 +5750,9 @@ async function wsMeta(kind, u8) {
           const text = new TextDecoder().decode(bytes);
           const st = chartStats(compileChart(loadChart(text)));
           st.mc = hasModchart(text) ? 1 : 0; // (2.0.1)
+          st.sv = hasSv(text); // (2.0.2)
           if (st.mc) st.tags = [...st.tags, "modchart"];
+          if (st.sv) st.tags = [...st.tags, "sv"];
           setChartShape(out.charts[i], st);
         } catch { /* left without: filled in later by fillChartShapes */ }
       }
@@ -7834,6 +7854,9 @@ async function eventAdmin(env, who, b) {
 // so it goes out with their cosmetics like a title.
 const CREW_MAX = 12, CREW_INDEX = "crews/index.json";
 const crewKey = (id) => `crews/${id}.json`;
+/** (2.0.2) A crew's chat: crews/chat/<id>.json { seq, msgs: [{ seq, id, at, text, from: { id, name } }] }. */
+const crewChatKey = (id) => `crews/chat/${id}.json`;
+const CREW_CHAT_KEEP = 150;
 const CREW_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 _.'-]{1,22}[A-Za-z0-9.']$/, CREW_TAG_RE = /^[A-Z0-9]{2,4}$/;
 const CREW_TAG_RESERVED = ["DEV", "MOD", "OCT", "GM", "ADMN", "STAF", "OCTV", "BOT", "AI"];
 function crewCheck(name, tag, staff) {
@@ -8025,12 +8048,36 @@ async function crewRoutes(request, env, url, path) {
     const rank = Object.values(idx.crews || {}).filter((x) => x.score > (c.score || 0)).length + 1;
     return reply({ crew: { ...crewPublic(c, me), rank } });
   }
+  // (2.0.2) the crew's chat: its members only (the last CREW_CHAT_KEEP messages, read from a sequence number on)
+  if (path === "/play/crews/chat" && request.method === "GET") {
+    const who = await signedIn(request, env);
+    const crew = await crewOfPlayer(env, who.playerId);
+    if (!crew || crew.gone) fail(404, "You're not in a crew.");
+    const box = await r2json(env, crewChatKey(crew.id), { seq: 0, msgs: [] });
+    const after = Number(url.searchParams.get("after")) || 0;
+    return reply({ crew: crew.id, seq: box.seq || 0, msgs: (box.msgs || []).filter((m) => m.seq > after).slice(-CREW_CHAT_KEEP) });
+  }
   if (request.method !== "POST") fail(404, "Not found.");
   const who = await signedIn(request, env), me = who.playerId;
   const b = await bodyOf(request, 4_000);
   const staff = me === OWNER || isOfficial(me);
   if (moderation.bans[me]) fail(403, "This account is banned.");
   const myName = await displayName(env, me);
+  if (path === "/play/crews/chat") {
+    const crew = await crewOfPlayer(env, me);
+    if (!crew || crew.gone || !(crew.members || []).some((m) => m.id === me)) fail(403, "You're not in a crew.");
+    const text = chatClean(b.text);
+    if (!text) fail(400, "Type a message first.");
+    if (text.length > CHAT_MAX) fail(400, `Messages can be ${CHAT_MAX} characters at most.`);
+    await chatRate(env, me, false);
+    let msg = null;
+    const box = await r2update(env, crewChatKey(crew.id), () => ({ seq: 0, msgs: [] }), (bx) => {
+      bx.seq = (bx.seq || 0) + 1;
+      msg = { seq: bx.seq, id: "c" + crypto.randomUUID().replace(/-/g, "").slice(0, 14), at: new Date().toISOString(), text, from: { id: me, name: myName } };
+      bx.msgs = [...(bx.msgs || []), msg].slice(-CREW_CHAT_KEEP);
+    });
+    return reply({ ok: true, msg, seq: box.seq });
+  }
   if (path === "/play/crews/create") {
     if ((await walletOf(env, me)).crew) fail(409, "You're in a crew already: leave it first.");
     const name = cleanText(b.name, 24), tag = String(b.tag || "").trim().toUpperCase();
