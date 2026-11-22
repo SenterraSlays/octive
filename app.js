@@ -575,6 +575,45 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     document.addEventListener("keydown", onKey);
   }
 
+  // (2.1) a profile laid out like a rhythm game profile usually is: a cover with the picture over its edge, the ranks
+  // and a rank graph, a stats panel, the level, then everything else in sections
+  const regionName = (() => { try { const dn = new Intl.DisplayNames(["en"], { type: "region" }); return (c) => { try { return dn.of(c); } catch { return c; } }; } catch { return (c) => c; } })();
+
+  /** Global rank over the kept days (rank 1 at the top), with the day under the pointer. */
+  function rankGraph(days) {
+    const NS = "http://www.w3.org/2000/svg", W = 600, H = 80, pad = 6;
+    const ranks = days.map((d) => d[3]);
+    const lo = Math.min(...ranks), hi = Math.max(...ranks);
+    const y = (r) => hi === lo ? H / 2 : pad + (r - lo) / (hi - lo) * (H - pad * 2);
+    const x = (i) => i / (days.length - 1) * W;
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("preserveAspectRatio", "none"); svg.setAttribute("aria-hidden", "true");
+    const defs = document.createElementNS(NS, "defs");
+    defs.innerHTML = `<linearGradient id="pf-rank-line" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="${W}" y2="0"><stop offset="0" stop-color="#a764ff"/><stop offset=".5" stop-color="#ff4d9d"/><stop offset="1" stop-color="#ffd23f"/></linearGradient>`
+      + '<linearGradient id="pf-rank-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff4d9d" stop-opacity=".3"/><stop offset="1" stop-color="#ff4d9d" stop-opacity="0"/></linearGradient>';
+    const pts = days.map((d, i) => `${x(i).toFixed(1)},${y(d[3]).toFixed(1)}`).join(" ");
+    const area = document.createElementNS(NS, "polygon");
+    area.setAttribute("points", `0,${H} ${pts} ${W},${H}`);
+    const line = document.createElementNS(NS, "polyline");
+    line.setAttribute("points", pts);
+    line.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.append(defs, area, line);
+    const dot = h("span.pf-dot", { hidden: true }), tip = h("span.pf-tip", { hidden: true });
+    const box = h("div.pf-chart", { title: "Global rank, day by day" }, svg, dot, tip);
+    const dayText = (s) => new Date(s + "T12:00:00Z").toLocaleDateString(undefined, { day: "numeric", month: "short" });
+    box.addEventListener("pointermove", (e) => {
+      const r = box.getBoundingClientRect();
+      const i = Math.max(0, Math.min(days.length - 1, Math.round((e.clientX - r.left) / r.width * (days.length - 1))));
+      const d = days[i], px = x(i) / W * r.width, py = y(d[3]) / H * r.height;
+      dot.hidden = tip.hidden = false;
+      dot.style.left = px + "px"; dot.style.top = py + "px";
+      tip.textContent = `#${fmt0.format(d[3])} · ${fmt0.format(d[1])} PR · ${dayText(d[0])}`;
+      tip.style.left = Math.max(0, Math.min(r.width - tip.offsetWidth, px - tip.offsetWidth / 2)) + "px";
+    });
+    box.addEventListener("pointerleave", () => { dot.hidden = tip.hidden = true; });
+    return box;
+  }
+
   function player(id) {
     const p = findPlayer(id);
     if (!p) {
@@ -582,32 +621,109 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       setTimeout(giftPopup, 400);
       return;
     }
-    const view = clone("tpl-player");
-    const card = view.querySelector(".card");
-    nameInto(view.querySelector(".card-name"), p);
-    view.querySelector(".card-rank").textContent = isOfficial(p) ? INF : "#" + fmt0.format(p.rank);
-    setAvatar(view.querySelector(".card-avatar"), p);
-    const role = setRole(card, view.querySelector(".badge"), p);
-    if (role) { const t = view.querySelector(".card-title"); t.textContent = role.title; t.hidden = false; }
-    const status = view.querySelector(".card-status");
+    const official = isOfficial(p);
+    const players = data ? data.players : [];
+
+    // the head: cover, picture, name, country and crew
+    const avatar = h("div.card-avatar", {}, h("img", { alt: "", hidden: true }), h("span.initial"), h("span.dot", { hidden: true }));
+    const nameEl = h("h1.card-name");
+    const nameRow = h("div.card-name-row", {}, nameEl, h("span.badge", { hidden: true }));
+    const titleEl = h("div.card-title", { hidden: true });
+    const sub = h("div.pf-sub", {}, p.country && /^[A-Z]{2}$/.test(p.country) ? h("span", { text: regionName(p.country) }) : null);
+    const status = h("div.card-status");
+    const card = h("article.card.pf-head", {}, h("div.pf-cover"), h("div.pf-id", {}, avatar, h("div.pf-idtext", {}, nameRow, titleEl, sub, status)));
+    nameInto(nameEl, p);
+    setAvatar(avatar, p);
+    const role = setRole(card, nameRow.querySelector(".badge"), p);
+    if (role) { titleEl.textContent = role.title; titleEl.hidden = false; }
     status.textContent = p.online ? "● " + statusText(p) : statusText(p);
     status.classList.toggle("on", !!p.online);
-    if (isOfficial(p)) {
+    if (official) {
       // its status line keeps changing while the page is open
       const tick = setInterval(() => { if (!status.isConnected) { clearInterval(tick); return; } status.textContent = "● " + statusText(p); }, 1000);
     }
     decorateCard(card, p);
-    card.after(socialRow(p));
     // (2.0.2) their crew, a link to its page
     loadCosmetics().then((cs) => {
       const cr = cs && cs.players && cs.players[p.id] && cs.players[p.id].crew;
       if (!cr || !cr.id || !card.isConnected) return;
-      const link = h("a.crew-chip", { href: "#/crew/" + encodeURIComponent(cr.id), title: "Their crew" }, crewTag(cr), h("span", { text: "Crew →" }));
-      card.querySelector(".card-name")?.after(link);
+      sub.append(h("a.crew-chip", { href: "#/crew/" + encodeURIComponent(cr.id), title: "Their crew" }, crewTag(cr), h("span", { text: "Crew →" })));
     });
+
+    // ranks, the rank graph and the numbers
+    const countryRank = p.country ? players.filter((x) => x.country === p.country && !isOfficial(x)).sort((a, b) => a.rank - b.rank).findIndex((x) => x.id === p.id) + 1 : 0;
+    const big = (label, value) => h("div.pf-big", {}, h("span", { text: label }), h("b", { text: value }));
+    const small = (label, value) => h("div.pf-small", {}, h("span", { text: label }), h("b", { text: value }));
+    const graph = h("div.pf-graph");
+    const achCount = Object.keys(p.achievements || {}).length;
+    const main = h("div.pf-main", {},
+      h("div.pf-bigs", {},
+        big("Global ranking", official ? INF : "#" + fmt0.format(p.rank)),
+        countryRank > 0 && !official ? big("Country ranking", "#" + fmt0.format(countryRank)) : null),
+      graph,
+      h("div.pf-smalls", {},
+        small("Achievements", fmt0.format(achCount)),
+        small("Performance", official ? INF + " PR" : fmt0.format(p.pp || 0) + " PR"),
+        small("Play time", official ? INF : p.playTimeMs ? playTime(p.playTimeMs) : "—")));
+    const row = (label, value) => h("div", {}, h("dt", { text: label }), h("dd", { text: value }));
+    const panel = h("dl.pf-panel", {},
+      row("Accuracy", official ? "100.00%" : fmt2.format(p.accuracy || 0) + "%"),
+      row("Total score", official ? INF : fmt0.format(p.totalScore || 0)),
+      row("Play count", official ? INF : fmt0.format(p.playCount || 0)),
+      row("Full combos", official ? INF : fmt0.format(p.fullCombos || 0)),
+      row("Max combo", official ? INF + "x" : p.maxCombo ? fmt0.format(p.maxCombo) + "x" : "—"),
+      row("Experience", official ? INF : fmt0.format(p.xp || 0)));
+    const stats = h("section.pf-stats", {}, main, panel);
+    if (worker && !official) {
+      fetch(`${worker}/play/progress?player=${encodeURIComponent(p.id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+        if (!graph.isConnected) return;
+        const days = ((d && d.days) || []).filter((x) => Array.isArray(x) && x[3] > 0).slice(-90);
+        graph.replaceChildren(days.length >= 2 ? rankGraph(days) : h("p.pf-graph-none", { text: "The rank graph fills in after a couple of days on the ranking." }));
+      });
+    }
+
+    // followers and the level
+    const lv = official ? 1000 : (p.level || 1);
+    const prog = official ? 1 : Math.max(0, Math.min(1, p.levelProgress || 0));
+    const toNext = Math.round((xpFor(lv + 1) - xpFor(lv)) * (1 - prog));
+    const level = h("div.pf-level", { title: official ? "Max level" : `${fmt0.format(toNext)} xp to level ${lv + 1}` },
+      h("div.pf-lvbar", {}, h("div.pf-lvfill", { style: `width:${Math.round(prog * 100)}%` }), h("span", { text: Math.round(prog * 100) + "%" })),
+      h("div.pf-oct", {}, h("span", { text: String(lv) })));
+    const social = socialRow(p);
+    const bar = h("section.pf-bar", {}, social, level);
+
+    // everything else, in sections
+    const overview = h("div.prof-overview");
+    if (p.devFriend && !ROLES[p.id]) overview.append(h("div.devfriend", {}, h("span.heart", { text: "♥" }), " Friends with DEV ", h("span.devfriend-sub", { text: "· friends with the developer of OCTIVE" })));
+    if (p.bio && p.bio.trim()) {
+      const text = h("p.bio-text");
+      renderBio(text, p.bio);
+      overview.append(h("section.bio", {}, h("h2", { text: "About me" }), text));
+    }
+    if ((p.badges || []).includes("CREATOR") && p.socials) {
+      const links = h("div.social-links");
+      if (renderSocials(links, p.socials) > 0) overview.append(h("section.socials", {}, h("h2", { text: "Socials" }), links));
+    }
+    // the title bought in the points shop (under the name) and the showcase
+    const showcase = h("section.showcase", { hidden: true }, h("h2", { text: "Showcase" }), h("div.sc-row"));
+    overview.append(showcase);
+    loadCosmetics().then((cz) => {
+      const mine = cz.players[p.id] || {};
+      const title = mine.title && cz.titles[mine.title];
+      if (title) nameRow.after(h("div.shop-title", { text: title }));
+      if (official) return;
+      const songs = (mine.showcase || []).filter((x) => x && x.kind !== "ach").slice(0, 3);
+      if (!mine.hasShowcase && !songs.length) return; // they haven't unlocked one
+      const scRow = showcase.querySelector(".sc-row");
+      for (let i = 0; i < 3; i++) scRow.append(songs[i] ? showcaseCard(songs[i]) : h("div.sc-empty", { text: "Empty" }));
+      showcase.hidden = false;
+    });
+    const sup = supporterSection(p);
+    if (sup) overview.append(sup);
+    overview.append(achievementsSection(p));
     // what they shared to the Workshop
     const uploads = h("section.ws-profile", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: "Workshop uploads" }), h("a.more", { href: "#/workshop" }, "Workshop →")), h("div.ws-grid"));
-    card.parentNode.appendChild(uploads);
+    overview.append(uploads);
     fetch(`${worker}/api/items?creator=${encodeURIComponent(p.id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
       const items = (d && d.items) || [];
       if (!items.length || !uploads.isConnected) return;
@@ -615,74 +731,21 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       uploads.querySelector(".ws-grid").replaceChildren(...items.map(workshopCard));
       uploads.hidden = false;
     });
-    const set = (sel, v) => { view.querySelector(sel).textContent = v; };
-    set(".c-pp", fmt0.format(p.pp || 0) + " PR");
-    set(".c-acc", fmt2.format(p.accuracy || 0) + "%");
-    set(".c-rank", "#" + fmt0.format(p.rank));
-    const lv = p.level || 1;
-    set(".c-lvl", "Lv" + lv);
-    set(".s-level", "Lv" + lv);
-    set(".s-score", fmt0.format(p.totalScore || 0));
-    set(".s-plays", fmt0.format(p.playCount || 0));
-    set(".s-fc", fmt0.format(p.fullCombos || 0));
-    set(".s-rank", "#" + fmt0.format(p.rank));
-    set(".s-combo", p.maxCombo ? fmt0.format(p.maxCombo) + "x" : "—");
-    set(".s-time", p.playTimeMs ? playTime(p.playTimeMs) : "—");
-    set(".s-xp", fmt0.format(p.xp || 0));
-    view.querySelector(".fill").style.width = Math.round(Math.max(0, Math.min(1, p.levelProgress || 0)) * 100) + "%";
-    const toNext = Math.round((xpFor(lv + 1) - xpFor(lv)) * (1 - (p.levelProgress || 0)));
-    set(".c-next", `${fmt0.format(toNext)} xp to Lv${lv + 1}`);
-    if (isOfficial(p)) {
-      // the official account: every number is infinite, and it never misses
-      set(".c-pp", INF + " PR"); set(".c-acc", "100.00%"); set(".c-rank", INF);
-      set(".c-lvl", "Lv1000"); set(".s-level", "Lv1000"); set(".c-next", "Max level");
-      for (const sel of [".s-score", ".s-plays", ".s-fc", ".s-rank", ".s-time", ".s-xp"]) set(sel, INF);
-      set(".s-combo", INF + "x");
-      view.querySelector(".fill").style.width = "100%";
-    }
-    if (p.devFriend && !ROLES[p.id]) view.querySelector(".devfriend").hidden = false;
-    if (p.bio && p.bio.trim()) {
-      view.querySelector(".bio").hidden = false;
-      renderBio(view.querySelector(".bio-text"), p.bio);
-    }
-    // the title bought in the points shop (under the name) and the showcase (under About)
-    const showcase = h("section.showcase", { hidden: true }, h("h2", { text: "Showcase" }), h("div.sc-row"));
-    view.querySelector(".bio").after(showcase);
-    loadCosmetics().then((cz) => {
-      const mine = cz.players[p.id] || {};
-      const title = mine.title && cz.titles[mine.title];
-      if (title) { const row = card.querySelector(".card-name-row"); if (row) row.after(h("div.shop-title", { text: title })); }
-      if (isOfficial(p)) return;
-      const songs = (mine.showcase || []).filter((x) => x && x.kind !== "ach").slice(0, 3);
-      if (!mine.hasShowcase && !songs.length) return; // they haven't unlocked one
-      const row = showcase.querySelector(".sc-row");
-      for (let i = 0; i < 3; i++) row.append(songs[i] ? showcaseCard(songs[i]) : h("div.sc-empty", { text: "Empty" }));
-      showcase.hidden = false;
-    });
-    const sup = supporterSection(p);
-    if (sup) view.querySelector(".tiles").after(sup);
-    view.querySelector(".tiles").parentNode.append(achievementsSection(p));
-    if ((p.badges || []).includes("CREATOR") && p.socials) {
-      const box = view.querySelector(".social-links");
-      if (box && renderSocials(box, p.socials) > 0) view.querySelector(".socials").hidden = false;
-    }
-    // everything under the card goes into tabs: the overview, and who they follow / are followed by / are friends with
-    const overview = h("div.prof-overview");
-    for (const el of [...view.children]) if (!el.matches(".back, .card, .social-row")) overview.append(el);
+
+    // the profile, and who they follow / are followed by / are friends with
     const pane = h("div.prof-pane");
     const tabBtns = {};
-    const tabs = h("nav.prof-tabs", {}, ...[["overview", "Overview"], ["followers", "Followers"], ["following", "Following"], ["friends", "Friends"]].map(([k, label]) =>
+    const tabs = h("nav.prof-tabs", {}, ...[["overview", "Profile"], ["followers", "Followers"], ["following", "Following"], ["friends", "Friends"]].map(([k, label]) =>
       (tabBtns[k] = h("button.prof-tab", { type: "button", onclick: () => openTab(k) }, label))));
     function openTab(k) {
       for (const [key, b] of Object.entries(tabBtns)) b.classList.toggle("active", key === k);
       if (k === "overview") { pane.replaceChildren(overview); return; }
       pane.replaceChildren(peopleList(p, k));
     }
-    view.append(tabs, pane);
     openTab("overview");
-    view.querySelector(".social-row")?.addEventListener("open-list", (e) => { openTab(e.detail); tabs.scrollIntoView({ behavior: "smooth", block: "start" }); });
-    app.replaceChildren(view);
-    document.title = `${p.name} · OCTIVE Rankings`;
+    social.addEventListener("open-list", (e) => { openTab(e.detail); tabs.scrollIntoView({ behavior: "smooth", block: "start" }); });
+    app.replaceChildren(h("a.back", { href: "#/rankings" }, "← All players"), h("div.pf", {}, card, stats, bar), tabs, pane);
+    document.title = `${p.name} · OCTIVE`;
     setTimeout(giftPopup, 400);
     window.scrollTo(0, 0);
   }
@@ -757,248 +820,83 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     return svg;
   }
 
-  /** A little playfield with notes falling into the receptors (pure CSS animation). */
-  function playfield() {
-    const lanes = h("div.pf-lanes");
-    // a fixed, musical-looking pattern: [lane, beat]
-    const pattern = [[0, 0], [1, 1], [2, 2], [3, 3], [1, 4], [2, 4.5], [0, 5], [3, 5.5], [1, 6], [2, 6], [0, 7], [3, 7.5]];
-    for (let lane = 0; lane < 4; lane++) {
-      const col = h("div.pf-lane" + (lane === 1 || lane === 2 ? ".inner" : ""));
-      for (const [l, beat] of pattern) if (l === lane) {
-        const n = h("span.pf-note");
-        n.style.animationDelay = (beat * 0.375) + "s";
-        col.appendChild(n);
-      }
-      col.appendChild(h("span.pf-receptor"));
-      lanes.appendChild(col);
-    }
-    return h("div.playfield", { "aria-hidden": "true" }, lanes, h("div.pf-judge", { text: "PERFECT" }), h("div.pf-combo", { text: "128" }));
-  }
-
-  const FEATURES = [
-    ["osu", "Your osu! library", "Point OCTIVE at your osu! folder and play every mania map (and convert the rest). Collections come along too."],
-    ["pp", "Global ranking", "Every chart has a star rating. Your best plays earn performance rating (PR), levels and a place on the ranking."],
-    ["mp", "Multiplayer", "Make a room, share the code and play the same chart together, or watch a friend play live."],
-    ["practice", "Practice mode", "Loop the hard part, slow it down to 0.5x and work up to full speed."],
-    ["editor", "Chart editor", "Make your own charts with a waveform, scrub bar, test play and up to 20 keys."],
-    ["skins", "Skins and themes", "Arrows, bars, circles, osu! skin import, and menu themes to make it yours."],
-    ["replay", "Replays", "Every play is saved. Rewatch it, seek through it and slow it down to see what went wrong."],
-    ["mobile", "Play anywhere", "Windows and Android, with touch controls you can set up the way you like."],
+  // ---------------------------------------------------------------- the front page
+  const ABOUT = [
+    ["Your osu!mania maps", "Point OCTIVE at your osu! folder and your mania maps show up, collections included. Maps from other modes get converted."],
+    ["The Workshop", "Charts, skins, themes and styles other players made. Get them here or from inside the game."],
+    ["Ranking", "Every chart has a star rating. Good plays earn performance rating (PR), and your PR decides your place."],
+    ["Daily charts", "Three new charts every day: easy, normal and hard. One try at each, points for playing, and a streak to keep going."],
+    ["Multiplayer and crews", "Make a room and share the code, talk over voice chat, watch friends play live, or join a crew."],
+    ["Practice", "Loop the part you keep missing and slow it down to 0.5x until it sticks."],
+    ["Chart editor", "Waveform, scrub bar and test play, for anything from 1 to 20 keys."],
+    ["Skins and replays", "Bars, arrows, circles or your own osu! skin. Every play is saved as a replay you can scrub through."],
   ];
-  const ICONS = {
-    osu: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/>',
-    pp: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
-    mp: '<circle cx="8" cy="9" r="3"/><circle cx="17" cy="9" r="3"/><path d="M2 20c0-3 3-5 6-5s6 2 6 5M13 15c1-.6 2.5-1 4-1 3 0 5 2 5 5"/>',
-    practice: '<path d="M4 12a8 8 0 1 0 3-6.3"/><path d="M4 4v5h5"/><path d="M12 8v4l3 2"/>',
-    editor: '<path d="M4 20h4L20 8l-4-4L4 16z"/><path d="M14 6l4 4"/>',
-    skins: '<path d="M12 3a9 9 0 1 0 0 18c1.5 0 2-1 2-2 0-1.5-1-2 0-3s3 0 5-1 2-4 2-4c0-4.5-4-8-9-8z"/><circle cx="7.5" cy="11" r="1.2"/><circle cx="11" cy="7" r="1.2"/><circle cx="16" cy="8.5" r="1.2"/>',
-    replay: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9l5 3-5 3z"/>',
-    mobile: '<rect x="6" y="2" width="12" height="20" rx="2"/><path d="M11 18h2"/>',
-  };
-  const icon = (id) => { const s = document.createElement("span"); s.className = "f-icon"; s.innerHTML = `<svg viewBox="0 0 24 24">${ICONS[id] || ""}</svg>`; return s; };
 
-  // ---------------------------------------------------------------- the front page's live playfield
-  // A real chart from a song that comes with OCTIVE (data/demo.json, made from the game's own files), played by
-  // autoplay on a canvas: notes, long notes, receptor flashes, judgements, combo and score. Sound is optional.
-  let demoData = null;
-  function livePlayfield() {
-    const wrap = h("div.live-pf");
-    const cv = h("canvas", { "aria-hidden": "true" });
-    const tag = h("div.live-tag", {}, h("span.live-dot"), h("span", { text: "Live autoplay" }));
-    const song = h("div.live-song", {}, h("b", { text: "Loading…" }), h("span"));
-    const sound = h("button.live-sound", { type: "button", title: "Play with sound", "aria-label": "Play with sound" }, "🔈 Sound");
-    wrap.append(cv, tag, song, sound);
-    const ctx = cv.getContext("2d");
-    const reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    let audio = null, t0 = performance.now(), lastT = -1, hit = 0, combo = 0, judgeAt = -1e9, judgeText = "", flash = [0, 0, 0, 0], bursts = [], visible = true;
-    const COL = [["#ffb3cb", "#ff5c8a"], ["#a6f5ff", "#3fd8e6"], ["#a6f5ff", "#3fd8e6"], ["#ffb3cb", "#ff5c8a"]];
-    const io2 = "IntersectionObserver" in window ? new IntersectionObserver((e) => { visible = e[0].isIntersecting; }) : null;
-    if (io2) io2.observe(wrap);
-
-    function size() {
-      const r = wrap.getBoundingClientRect(), dpr = Math.min(2, window.devicePixelRatio || 1);
-      const w = Math.max(200, Math.round(r.width)), hh = Math.max(260, Math.round(r.height));
-      if (cv.width !== w * dpr || cv.height !== hh * dpr) { cv.width = w * dpr; cv.height = hh * dpr; cv.style.width = w + "px"; cv.style.height = hh + "px"; ctx.setTransform(dpr, 0, 0, dpr, 0, 0); }
-      return [w, hh];
-    }
-    const rr = (x, y, w, h2, r) => { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h2, r) : ctx.rect(x, y, w, h2); };
-
-    function frame() {
-      if (!wrap.isConnected) { if (audio) audio.pause(); io2 && io2.disconnect(); return; }
-      requestAnimationFrame(frame);
-      if (!demoData || (!visible && !audio)) return;
-      const d = demoData, [W, H] = size();
-      let t = audio && !audio.paused ? audio.currentTime * 1000 : (performance.now() - t0) % d.durationMs;
-      if (reduce && !audio) t = 9000;
-      if (t < lastT) { hit = 0; combo = 0; bursts = []; }
-      // autoplay hits every note when it reaches the line
-      while (hit < d.notes.length && d.notes[hit][0] <= t) {
-        const n = d.notes[hit++];
-        combo++; flash[n[1]] = 1; judgeAt = t; judgeText = hit % 23 === 0 ? "PERFECT" : "MARVELOUS";
-        bursts.push({ lane: n[1], at: t });
-      }
-      lastT = t;
-      const pad = 16, laneW = (W - pad * 2) / d.keys, hitY = H - 70, speed = 0.62; // px per ms
-      ctx.clearRect(0, 0, W, H);
-      // lanes
-      for (let l = 0; l < d.keys; l++) {
-        const x = pad + l * laneW;
-        ctx.fillStyle = l % 2 ? "rgba(255,255,255,0.035)" : "rgba(255,255,255,0.02)";
-        ctx.fillRect(x + 2, 0, laneW - 4, H);
-        if (flash[l] > 0) {
-          const g = ctx.createLinearGradient(0, hitY, 0, hitY - 160);
-          g.addColorStop(0, `rgba(255,255,255,${0.16 * flash[l]})`); g.addColorStop(1, "rgba(255,255,255,0)");
-          ctx.fillStyle = g; ctx.fillRect(x + 2, hitY - 160, laneW - 4, 160);
-        }
-      }
-      // long note bodies, then the notes
-      const noteH = 16;
-      for (let i = hit - 40 < 0 ? 0 : hit - 40; i < d.notes.length; i++) {
-        const [nt, lane, end] = d.notes[i];
-        const y = hitY - (nt - t) * speed;
-        if (y < -40 && !end) break;
-        if (y < -40 && end && hitY - (end - t) * speed > H) break;
-        const x = pad + lane * laneW + 5, w = laneW - 10;
-        const [c1, c2] = COL[lane % 4];
-        if (end) {
-          if (t > end) continue;
-          const yHead = Math.min(y, hitY), yTail = hitY - (end - t) * speed;
-          if (yTail < yHead) {
-            ctx.fillStyle = t >= nt ? c2 + "aa" : c2 + "66";
-            rr(x + w * 0.18, yTail, w * 0.64, yHead - yTail, 6); ctx.fill();
-          }
-          if (t >= nt) { flash[lane] = Math.max(flash[lane], 0.6); continue; } // held: the head sits in the receptor
-        } else if (nt < t) continue;
-        if (y > H + 20) continue;
-        const g = ctx.createLinearGradient(0, y - noteH / 2, 0, y + noteH / 2);
-        g.addColorStop(0, c1); g.addColorStop(1, c2);
-        ctx.fillStyle = g; ctx.shadowColor = c2; ctx.shadowBlur = 12;
-        rr(x, y - noteH / 2, w, noteH, 7); ctx.fill();
-        ctx.shadowBlur = 0;
-      }
-      // receptors and hit bursts
-      for (let l = 0; l < d.keys; l++) {
-        const x = pad + l * laneW + 5, w = laneW - 10;
-        ctx.strokeStyle = `rgba(255,255,255,${0.35 + 0.5 * flash[l]})`; ctx.lineWidth = 2;
-        rr(x, hitY - noteH / 2 - 2, w, noteH + 4, 8); ctx.stroke();
-        flash[l] = Math.max(0, flash[l] - 0.08);
-      }
-      bursts = bursts.filter((b) => t - b.at < 260);
-      for (const b of bursts) {
-        const k = (t - b.at) / 260, cx = pad + b.lane * laneW + laneW / 2;
-        ctx.strokeStyle = `rgba(255,255,255,${0.8 * (1 - k)})`; ctx.lineWidth = 3 * (1 - k) + 1;
-        ctx.beginPath(); ctx.ellipse(cx, hitY, laneW * (0.35 + 0.5 * k), 12 + 22 * k, 0, 0, Math.PI * 2); ctx.stroke();
-      }
-      // HUD: combo, judgement, score
-      ctx.textAlign = "center";
-      if (combo >= 3) {
-        ctx.fillStyle = "rgba(255,255,255,0.92)"; ctx.font = "800 40px Inter, system-ui, sans-serif";
-        ctx.fillText(String(combo), W / 2, H * 0.36);
-        ctx.fillStyle = "rgba(255,255,255,0.45)"; ctx.font = "700 10px Inter, system-ui, sans-serif"; ctx.fillText("COMBO", W / 2, H * 0.36 + 16);
-      }
-      const ja = t - judgeAt;
-      if (ja < 700) {
-        const pop = 1 + 0.18 * Math.max(0, 1 - ja / 80), alpha = ja < 450 ? 1 : 1 - (ja - 450) / 250;
-        ctx.save(); ctx.translate(W / 2, H * 0.52); ctx.scale(pop, pop);
-        ctx.font = "800 17px Inter, system-ui, sans-serif"; ctx.fillStyle = judgeText === "PERFECT" ? `rgba(255,216,102,${alpha})` : `rgba(165,240,255,${alpha})`;
-        ctx.shadowColor = ctx.fillStyle; ctx.shadowBlur = 14; ctx.fillText(judgeText, 0, 0); ctx.restore();
-      }
-      ctx.textAlign = "right"; ctx.fillStyle = "rgba(255,255,255,0.85)"; ctx.font = "800 15px Inter, system-ui, sans-serif";
-      ctx.fillText(String(Math.round(1e6 * hit / d.notes.length)).padStart(7, "0"), W - 12, 24);
-      ctx.fillStyle = "rgba(255,255,255,0.5)"; ctx.font = "700 11px Inter, system-ui, sans-serif"; ctx.fillText("100.00%", W - 12, 40);
-      // progress
-      ctx.fillStyle = "rgba(139,123,255,0.8)"; ctx.fillRect(0, 0, W * (t / d.durationMs), 3);
-    }
-
-    const go = (d) => {
-      demoData = d;
-      song.firstChild.textContent = `${d.artist} - ${d.title}`;
-      song.lastChild.textContent = `${d.difficulty} · ${d.keys}K · ★${Number(d.rating).toFixed(2)}`;
-      requestAnimationFrame(frame);
-    };
-    if (demoData) go(demoData);
-    else fetch("data/demo.json?v=1.5.0", { cache: "force-cache" }).then((r) => r.ok ? r.json() : null).then((d) => { if (d) go(d); else song.firstChild.textContent = ""; }).catch(() => { song.firstChild.textContent = ""; });
-    sound.addEventListener("click", () => {
-      if (!audio) {
-        audio = new Audio("data/demo.mp3"); audio.loop = true; audio.volume = 0.6;
-        // start where the picture is, so the sound and the notes line up
-        audio.currentTime = ((performance.now() - t0) % (demoData ? demoData.durationMs : 32000)) / 1000;
-        audio.play().catch(() => {});
-        sound.textContent = "🔊 Mute"; sound.title = "Mute";
-      } else if (audio.paused) { audio.play().catch(() => {}); sound.textContent = "🔊 Mute"; }
-      else { audio.pause(); t0 = performance.now() - audio.currentTime * 1000; sound.textContent = "🔈 Sound"; }
-    });
-    return wrap;
+  // the short summary line under an announcement's title ("**Crews get a big update**, your skills…")
+  function releaseSummary(x) {
+    const lines = String(x.announcement || "").split("\n").map((l) => l.trim());
+    const s = lines.find((l) => l.length > 20 && !/^(#|•|-|\*\s|>|---)/.test(l));
+    return (s || x.notes || "").replace(/\*\*/g, "").replace(/<@\d+>/g, "").trim();
   }
 
   function home() {
     const players = data ? data.players : [];
     const online = players.filter((p) => p.online).length;
-    const top = players[0];
-    const verPill = h("span.h2-pill", {}, h("span.h2-dot"), "Free · Windows, Android and your browser");
-    const hero = h("section.h2-hero", {},
-      h("div.h2-glow"),
-      h("div.h2-copy", {},
-        verPill,
-        h("h1", {}, "The rhythm game", h("br"), h("span.grad", { text: "you make your own." })),
-        h("p.lead", { text: "OCTIVE is a vertical scrolling rhythm game for 1 to 20 keys. Play your osu!mania library, chart your own songs, share skins and charts in the Workshop, and climb a global ranking with friends." }),
+    const best = players[0];
+    const stat = (label, value, cls) => h("div.hm-stat" + (cls ? "." + cls : ""), {}, h("b", { text: value }), h("span", { text: label }));
+    const ver = stat("Latest version", "…");
+    const strip = h("section.hm-stats", {},
+      stat("Online now", data ? fmt0.format(online) : "…", "on"),
+      stat("Ranked players", data ? fmt0.format(players.length) : "…"),
+      stat("Top performance", best ? fmt0.format(best.pp || 0) + " PR" : "—"),
+      ver);
+    const update = h("aside.hm-update", {}, h("p.empty", { text: "Loading the latest update…" }));
+    const hero = h("section.hm-hero", {},
+      h("div.hm-intro", {},
+        h("h1.hm-name", {}, h("img", { src: "logo.svg", alt: "", width: 52, height: 52 }), h("span.hm-word", { text: "OCTIVE" })),
+        h("p.hm-lead", { text: "A free vertical scrolling rhythm game for 1 to 20 keys, on Windows, Android and in your browser. Bring your osu!mania maps, grab charts other players made from the Workshop, or make your own." }),
         h("div.cta", {},
-          h("a.btn.primary.big", { href: "#/download" }, "Download free"),
-          h("a.btn.big", { href: "play/" }, "▶ Play in browser"))),
-      h("div.h2-art", {}, h("div.h2-frame", {}, livePlayfield()), emblemSvg(64)));
-    const live = (label, value, cls) => h("div.h2-live" + (cls ? "." + cls : ""), {}, h("b", { text: value }), h("span", { text: label }));
-    const vEl = live("Latest version", "…");
-    const strip = h("section.h2-strip", {},
-      live("Online now", data ? fmt0.format(online) : "…", "on"),
-      live("Ranked players", data ? fmt0.format(players.length) : "…"),
-      live("Top performance", top ? fmt0.format(top.pp) + " PR" : "—"),
-      vEl);
+          h("a.btn.primary.big", { href: "#/download" }, "Download"),
+          h("a.btn.big", { href: "play/" }, "Play in the browser"))),
+      update);
 
-    // what's new: the latest release and its notes
-    const news = h("article.h2-card.h2-news", {}, h("p.empty", { text: "Loading the latest update…" }));
-    // fresh from the Workshop
-    const shelf = h("div.h2-shelf", {}, h("p.empty", { text: "Loading the Workshop…" }));
-    const row2 = h("section.h2-row", {},
-      h("div.h2-col", {}, h("div.section-head", {}, h("h2.section-title", { text: "What's new" }), h("a.more", { href: "#/updates" }, "All updates →")), news),
-      h("div.h2-col.wide", {}, h("div.section-head", {}, h("h2.section-title", { text: "Fresh in the Workshop" }), h("a.more", { href: "#/workshop" }, "Browse →")), shelf));
+    const shelf = h("div.hm-shelf", {}, h("p.empty", { text: "Loading the Workshop…" }));
+    const workshop = h("section.hm-sec", {},
+      h("div.section-head", {}, h("h2.section-title", { text: "New in the Workshop" }), h("a.more", { href: "#/workshop" }, "See all")),
+      shelf);
 
-    const features = h("section.h2-features", {},
-      h("h2.section-title", { text: "Everything you need to play, make and share" }),
-      h("div.h2-bento", {}, FEATURES.map(([id, title, text], i) => h("article.h2-feature" + (i < 2 ? ".big" : ""), {}, icon(id), h("h3", { text: title }), h("p", { text })))));
+    const top = h("ol.hm-top", {}, players.slice(0, 8).map((p) => {
+      const a = h("a", { href: "#/u/" + encodeURIComponent(p.id), "data-place": p.rank },
+        h("span.hm-rank", { text: "#" + p.rank }),
+        h("span.avatar", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial"), h("span.dot", { hidden: true })),
+        h("span.hm-who", {}, h("span.name", { text: p.name || "Player" }), h("span.badge", { hidden: true })),
+        h("span.hm-pr", { text: fmt0.format(p.pp || 0) + " PR" }));
+      setAvatar(a.querySelector(".avatar"), p);
+      setRole(a, a.querySelector(".badge"), p);
+      addLbIcon(a.querySelector(".name"), p.id);
+      return h("li", {}, a);
+    }));
+    const board = h("div.hm-col", {},
+      h("div.section-head", {}, h("h2.section-title", { text: "Top players" }), h("a.more", { href: "#/rankings" }, "Full ranking")),
+      players.length ? top : h("p.empty", { text: data ? "Nobody is ranked yet." : "Loading the ranking…" }));
+    const about = h("div.hm-col", {},
+      h("div.section-head", {}, h("h2.section-title", { text: "What's in the game" })),
+      h("dl.hm-list", {}, ABOUT.map(([t, d]) => h("div", {}, h("dt", { text: t }), h("dd", { text: d })))));
 
-    const podium = h("section.home-top", {},
-      h("div.section-head", {}, h("h2.section-title", { text: "Top players" }), h("a.more", { href: "#/rankings" }, "Full ranking →")),
-      h("div.podium", {}, players.slice(0, 3).map((p) => {
-        const a = h("a.pod", { href: "#/u/" + encodeURIComponent(p.id), "data-place": p.rank },
-          h("span.pod-rank", { text: "#" + p.rank }),
-          h("span.avatar", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial"), h("span.dot", { hidden: true })),
-          h("span.pod-name", {}, h("span.name", { text: p.name || "Player" }), h("span.badge", { hidden: true })),
-          h("span.pod-pp", { text: fmt0.format(p.pp || 0) + " PR" }),
-          h("span.pod-sub", { text: `${fmt2.format(p.accuracy || 0)}% · Lv${p.level || 1}` }));
-        setAvatar(a.querySelector(".avatar"), p);
-        setRole(a, a.querySelector(".badge"), p);
-        addLbIcon(a.querySelector(".name"), p.id);
-        return a;
-      }), !players.length ? h("p.empty", { text: data ? "No ranked players yet. Be the first!" : "Loading the ranking…" }) : null));
-    const end = h("section.h2-end", {},
-      emblemSvg(72),
-      h("div", {}, h("h2", { text: "Ready to play?" }), h("p", { text: "It's free. The installer always gets the newest version, and the game updates itself." })),
-      h("div.cta", {}, h("a.btn.primary.big", { href: "#/download" }, "Download OCTIVE")));
-    app.replaceChildren(hero, strip, row2, features, podium, end);
-    document.title = "OCTIVE · The rhythm game you make your own";
+    app.replaceChildren(hero, strip, workshop, h("section.hm-sec.hm-two", {}, board, about));
+    document.title = "OCTIVE";
 
-    loadRelease().then((m) => {
-      if (!m || !hero.isConnected) return;
-      vEl.querySelector("b").textContent = "v" + m.version;
-      verPill.lastChild.textContent = `Free · v${m.version} · Windows, Android and your browser`;
-    });
+    loadRelease().then((m) => { if (m && hero.isConnected) ver.querySelector("b").textContent = "v" + m.version; });
     fetch(worker + "/releases/history.json", { cache: "no-cache" }).then((r) => r.ok ? r.json() : []).catch(() => []).then((hist) => {
-      if (!news.isConnected) return;
+      if (!update.isConnected) return;
       const x = (Array.isArray(hist) ? hist : []).find((y) => y && y.version && !/test/i.test(y.version));
-      if (!x) { news.replaceChildren(h("p.empty", { text: "No updates yet." })); return; }
-      const when = x.published ? new Date(x.published).toLocaleDateString(undefined, { dateStyle: "long" }) : "";
-      const body = x.announcement ? markdown(x.announcement) : h("div.md", {}, h("p", { text: x.notes || "" }));
-      news.replaceChildren(h("header.h2-news-head", {}, h("b", { text: "OCTIVE " + x.version }), h("span", { text: when })), body, h("a.btn.small", { href: "#/updates/" + x.version }, "Read it all"));
+      if (!x) { update.replaceChildren(h("p.empty", { text: "No updates yet." })); return; }
+      const when = x.published ? new Date(x.published).toLocaleDateString(undefined, { day: "numeric", month: "long" }) : "";
+      update.replaceChildren(
+        h("p.hm-kicker", { text: "Latest update" + (when ? ", " + when : "") }),
+        h("h2", { text: "OCTIVE " + x.version }),
+        h("p", { text: releaseSummary(x) }),
+        h("a", { href: "#/updates/" + x.version }, "Read the patch notes"));
     });
     fetch(worker + "/api/items?sort=new", { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
       if (!shelf.isConnected) return;
