@@ -237,6 +237,22 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   // ---------------------------------------------------------------- pages
 
+  /** One of the top three on a podium: big picture in a medal ring, name and badges, the main number and a line under it. */
+  function lbPod(p, place, value, sub, extra, color) {
+    const a = h("a.lb-pod", { href: "#/u/" + encodeURIComponent(p.id), "data-place": place, style: color ? `--pc:${color}` : null },
+      h("span.lb-place", { text: ["", "1st", "2nd", "3rd"][place] || "#" + place }),
+      h("span.avatar", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial"), h("span.dot", { hidden: true })),
+      h("span.lb-pod-name", {}, h("span.name"), h("span.badge", { hidden: true })),
+      extra || null,
+      h("b.lb-pod-value", { text: value }),
+      sub ? h("span.lb-pod-sub", { text: sub }) : null);
+    nameInto(a.querySelector(".name"), p);
+    addLbIcon(a.querySelector(".name"), p.id);
+    setAvatar(a.querySelector(".avatar"), p);
+    setRole(a, a.querySelector(".badge"), p);
+    return a;
+  }
+
   function rankings() {
     const view = clone("tpl-rankings");
     const rows = view.querySelector("[data-rows]");
@@ -251,13 +267,21 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       notice.hidden = false;
     } else notice.hidden = !data.sample;
     const empty = view.querySelector("[data-empty]");
+    const table = view.querySelector(".table");
+    const podium = h("div.lb-podium");
+    table.before(podium);
+    const topPR = Math.max(1, ...data.players.map((p) => p.pp || 0));
 
     function render(filter) {
       rows.textContent = "";
       const q = (filter || "").trim().toLowerCase();
-      const list = q ? data.players.filter((p) => (p.name || "").toLowerCase().includes(q)) : data.players.slice();
+      const top = q ? [] : data.players.slice(0, 3);
+      podium.replaceChildren(...top.map((p) => lbPod(p, p.rank, fmt0.format(p.pp || 0) + " PR", `${fmt2.format(p.accuracy || 0)}% · Lv${p.level || 1}`)));
+      podium.hidden = !top.length;
+      const list = q ? data.players.filter((p) => (p.name || "").toLowerCase().includes(q)) : data.players.slice(3);
       if (q && data.official && ("octive".includes(q) || (data.official.name || "").toLowerCase().includes(q))) list.unshift(data.official);
-      empty.hidden = list.length > 0;
+      table.hidden = !list.length && !q;
+      empty.hidden = list.length > 0 || top.length > 0;
       if (!list.length && q) empty.textContent = `Nobody called "${filter.trim()}" is ranked.`;
       for (const p of list) {
         const r = clone("tpl-row").firstElementChild;
@@ -284,6 +308,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         r.querySelector(".lvl").textContent = "Lv" + (isOfficial(p) ? 1000 : p.level || 1);
         r.querySelector(".plays").textContent = isOfficial(p) ? INF : fmt0.format(p.playCount || 0);
         r.querySelector(".pp").textContent = (isOfficial(p) ? INF : fmt0.format(p.pp || 0)) + " PR";
+        if (!isOfficial(p)) r.querySelector(".pp").append(h("span.lb-prbar", {}, h("span", { style: `width:${Math.max(2, Math.round((p.pp || 0) / topPR * 100))}%` })));
         if (isOfficial(p)) r.classList.add("official-row");
         if ((p.ppVersion || 2) < 3) {
           r.classList.add("pp-old");
@@ -394,8 +419,10 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("div.hero-side", {}, stat("Season", "data-rk-season"), stat("Placed", "data-rk-count"), stat("Season ends", "data-rk-ends"))),
       h("div.rk-modes", {}, ...[4, 7].map((m) => h("button.chip" + (m === rankedMode ? ".on" : ""), { type: "button", onclick: () => { if (rankedMode !== m) { rankedMode = m; rankedPage(); } } }, `${m}K ladder`))),
       h("div.rk-ranks", {}, ...RK_GROUPS.map(([name, t, stars]) =>
-        h("div.rk-rank", { title: `${name}: charts around ${stars}` }, rankEmblem(t >= 16 ? t : t + 2, 36), h("span", { text: name, style: `color:${RK_COLORS[rkGroup(t)]}` })))),
+        h("div.rk-rank", { title: `${name}: charts around ${stars}`, style: `--rc:${RK_COLORS[rkGroup(t)]}` }, rankEmblem(t >= 16 ? t : t + 2, 40),
+          h("span", { text: name, style: `color:${RK_COLORS[rkGroup(t)]}` }), h("small", { text: stars })))),
       h("div.notice", { "data-rk-error": true, hidden: true }),
+      h("div.lb-podium", { "data-rk-podium": true, hidden: true }),
       h("div.table.ranked-table", { role: "table", "aria-label": "Ranked board" },
         h("div.thead", { role: "row" }, col("Rank"), col("Player"), col("Division", ".num"), col("Matches", ".num.hide-sm"), col("Win rate", ".num.hide-sm"), col("Progress", ".num")),
         h("div", { "data-rows": true }, h("p.empty", { text: "Loading the ranked board…" }))));
@@ -421,7 +448,17 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     if (!list.length) { rows.append(h("p.empty", { text: "Nobody is placed this season yet: play your three placement songs in OCTIVE 2.0 to be the first." })); return; }
     // the same rows as the global ranking: picture, name, badges, supporter look
     const byId = new Map(((data && data.players) || []).map((p) => [p.id, p]));
-    for (const x of list) {
+    // the top three on a podium, with their rank's emblem and colour
+    const podium = view.querySelector("[data-rk-podium]");
+    podium.replaceChildren(...list.slice(0, 3).map((x) => {
+      const games = (x.wins || 0) + (x.losses || 0);
+      return lbPod(byId.get(x.id) || { id: x.id, name: x.name }, x.place, (x.rank || RK_NAMES[x.tier] || "") + (x.legend ? " #" + x.legend : ""),
+        `${fmt0.format(x.wins || 0)}W ${fmt0.format(x.losses || 0)}L${games ? " · " + Math.round(100 * (x.wins || 0) / games) + "%" : ""}`,
+        rankEmblem(x.tier, 54), RK_COLORS[rkGroup(x.tier)]);
+    }));
+    podium.hidden = false;
+    view.querySelector(".ranked-table").hidden = list.length <= 3;
+    for (const x of list.slice(3)) {
       const known = byId.get(x.id);
       const p = known || { id: x.id, name: x.name };
       const r = clone("tpl-row").firstElementChild;
@@ -1091,7 +1128,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     load();
   }
 
-  /** One Workshop item: its picture, description and (songs) every difficulty, like an osu! beatmap page. */
+  /** One Workshop item: a banner from its picture, its numbers and tags, then (songs) every difficulty, like an osu! beatmap page. */
   function workshopItemPage(id) {
     document.title = "Workshop · OCTIVE";
     const box = h("div.ws-item", {}, h("p.empty", { text: "Loading…" }));
@@ -1102,32 +1139,82 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (!it) { box.replaceChildren(h("p.empty", { text: "That item isn't in the Workshop any more." })); return; }
       document.title = `${it.title} · Workshop · OCTIVE`;
       const kb = it.size / 1048576;
-      const pic = h("div.ws-item-pic" + (it.type === "skins" || it.type === "styles" ? ".contain" : ""));
+      const songs = (it.meta && it.meta.songs) || it.songs || [];
+      const charts = songs.flatMap((sg) => sg.charts || []);
+      const top = charts.reduce((m, c) => Math.max(m, Number(c.stars) || 0), 0);
+      const keys = [...new Set(charts.map((c) => c.keys).filter(Boolean))].sort((a, b) => a - b);
+      const date = (t) => new Date(t).toLocaleDateString(undefined, { dateStyle: "medium" });
+      const isSong = it.type === "charts";
+
+      // the banner: the picture sharp on the left and blurred behind everything
+      const pic = h("div.wsi-pic" + (it.type === "skins" || it.type === "styles" ? ".contain" : ""));
       if (it.preview) pic.append(h("img", { src: it.preview, alt: "" }));
-      const meta = it.meta || {};
-      const diffs = h("div.ws-diffs");
-      for (const sg of meta.songs || []) {
-        diffs.append(h("div.ws-song", {}, h("b", { text: `${sg.artist} - ${sg.title}` }),
-          h("span.field-hint", { text: [sg.bpm ? `${Math.round(sg.bpm * 10) / 10} BPM` : "", sg.durationUs ? fmtLength(sg.durationUs) : ""].filter(Boolean).join(" · ") })));
-        for (const c of (sg.charts || []).slice().sort((a, b) => a.keys - b.keys || a.stars - b.stars))
-          diffs.append(h("div.ws-diff", {}, h("span.ws-diff-bar", { style: `background:${starColor(c.stars)}` }), h("span.ws-diff-keys", { text: `${c.keys}K` }),
-            h("span.ws-diff-name", { text: c.difficulty }), c.creator ? h("span.field-hint", { text: "by " + c.creator }) : null,
-            h("span.field-hint", { text: `${fmt0.format(c.notes || 0)} notes` }), h("b.ws-diff-stars", { text: `★ ${Number(c.stars || 0).toFixed(2)}`, style: `color:${starColor(c.stars)}` })));
+      if (it.verified && isSong) pic.append(h("span.ws-verified", { text: "✓ VERIFIED", title: "Verified by OCTIVE: global leaderboards and full PR" }));
+      if (isSong && top > 0) pic.append(h("span.ws-stars", { text: "★ " + top.toFixed(2), style: `background:${starColor(top)}` }));
+      const chip = (text, title, cls, style) => h("span.wsi-chip" + (cls ? "." + cls : ""), { title, style }, text);
+      const sg0 = songs[0] || {};
+      const stats = h("div.wsi-stats", {},
+        isSong && top > 0 ? chip("★ " + top.toFixed(2), "Its hardest difficulty", "star", `--c:${starColor(top)}`) : null,
+        keys.length ? chip(keys.map((k) => k + "K").join(" · "), "Keys", "keys") : null,
+        songs.length === 1 && sg0.bpm ? chip(`${Math.round(sg0.bpm * 10) / 10} BPM`, "Tempo", "bpm") : null,
+        songs.length === 1 && sg0.durationUs ? chip(fmtLength(sg0.durationUs), "Length", "len") : null,
+        songs.length > 1 ? chip(`${songs.length} songs`, "A pack", "len") : null,
+        chip(`${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"}`, "Downloads", "dl"),
+        chip(`${kb.toFixed(kb < 1 ? 2 : 1)} MB`, "Size", "size"));
+      const tagList = [...new Set([...(it.tags || []), ...charts.flatMap((c) => c.autoTags || [])])];
+      const own = new Set(it.tags || []);
+      const tags = tagList.length ? h("div.ws-tags.wsi-tags", {}, tagList.map((t) => h("span.ws-tag" + (own.has(t) ? "" : ".auto"), { text: wsTagName(t), title: own.has(t) ? "Tagged by the uploader" : "Auto-tag: worked out from the charts' notes" }))) : null;
+      const hero = h("section.wsi-hero", { style: it.preview ? `--pic:url("${it.preview}")` : null },
+        pic,
+        h("div.wsi-head", {},
+          h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
+          h("h1", { text: it.title }),
+          h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
+          stats, tags,
+          h("div.wsi-actions", {},
+            h("a.btn.primary", { href: `octive://workshop/${it.id}`, onclick: () => openHint() }, "Open in OCTIVE"),
+            h("a.btn", { href: `${worker}/api/download/${it.id}?redirect=1` }, (it.fileNames || []).length > 1 ? "Download (first song)" : "Download"),
+            it.discord ? h("a.btn.discord", { href: it.discord, target: "_blank", rel: "noopener" }, h("img", { src: "discord.png", alt: "" }), "On Discord") : null)));
+
+      // every difficulty: a coloured star tile, its name and charter, its numbers and a bar for how hard it is
+      const diffs = h("section.panel.wsi-diffs", {}, h("h2", { text: charts.length ? `Difficulties · ${charts.length}` : "Difficulties" }));
+      for (const sg of songs) {
+        diffs.append(h("div.wsi-song", {}, h("b", { text: `${sg.artist} - ${sg.title}` }),
+          h("span", { text: [sg.bpm ? `${Math.round(sg.bpm * 10) / 10} BPM` : "", sg.durationUs ? fmtLength(sg.durationUs) : ""].filter(Boolean).join(" · ") })));
+        for (const c of (sg.charts || []).slice().sort((a, b) => a.keys - b.keys || a.stars - b.stars)) {
+          const st = Number(c.stars) || 0, col = starColor(st);
+          diffs.append(h("div.wsi-diff", { style: `--c:${col}` },
+            h("span.wsi-star", { text: "★ " + st.toFixed(2) }),
+            h("div.wsi-diff-name", {}, h("b", { text: c.difficulty || "Chart" }), c.creator ? h("span", { text: "by " + c.creator }) : null),
+            h("div.wsi-diff-facts", {},
+              h("span", { text: `${c.keys}K` }),
+              h("span", { text: `${fmt0.format(c.notes || 0)} notes` }),
+              c.nps ? h("span", { text: `${c.nps} NPS`, title: "Notes per second" }) : null,
+              c.od != null ? h("span", { text: `OD ${c.od}`, title: "Overall difficulty: how tight the timing is" }) : null),
+            h("span.wsi-meter", { title: `${st.toFixed(2)} stars` }, h("span", { style: `width:${Math.min(100, st * 10)}%` }))));
+        }
       }
-      if (it.type === "skins" || it.type === "styles") diffs.append(h("p.field-hint", { text: it.customizable ? "Customizable: you can change it in the skin maker." : "🔒 Locked: only its maker can change it." }));
-      box.replaceChildren(
-        h("div.ws-item-top", {}, pic,
-          h("div.ws-item-head", {},
-            h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
-            h("h1", {}, it.title, it.verified ? h("span.ws-verified.inline", { text: "✓ VERIFIED" }) : null),
-            h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
-            h("p.field-hint", { text: `${kb.toFixed(kb < 1 ? 2 : 1)} MB · ${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"} · ${new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })}${it.updated ? " · updated " + new Date(it.updated).toLocaleDateString(undefined, { dateStyle: "medium" }) : ""}` }),
-            h("div.ws-actions", {},
-              h("a.btn.primary", { href: `octive://workshop/${it.id}`, onclick: () => openHint() }, "Open in OCTIVE"),
-              h("a.btn", { href: `${worker}/api/download/${it.id}?redirect=1` }, (it.fileNames || []).length > 1 ? "Download (first song)" : "Download"),
-              it.discord ? h("a.btn.ghost", { href: it.discord, target: "_blank", rel: "noopener" }, "On Discord") : null))),
-        it.description ? h("p.ws-item-desc", { text: it.description }) : null,
-        diffs);
+
+      // the details on the side
+      const row = (k, v) => v == null || v === "" ? null : h("div", {}, h("dt", { text: k }), h("dd", {}, v));
+      const osuSet = songs.find((sg) => sg.osuSet > 0)?.osuSet;
+      const status = !isSong ? null : it.verified ? h("span.wsi-ok", { text: "✓ Verified" }) : it.verifyRequested ? h("span.wsi-wait", { text: "Waiting for a check" }) : h("span", { text: "Not verified" });
+      const info = h("aside.panel.wsi-info", {}, h("h2", { text: "Details" }),
+        h("dl", {},
+          row("Shared", date(it.at)),
+          it.updated ? row("Updated", date(it.updated)) : null,
+          row("Version", it.version ? "v" + it.version : null),
+          row("Downloads", fmt0.format(it.downloads || 0)),
+          row("Size", `${kb.toFixed(kb < 1 ? 2 : 1)} MB`),
+          (it.fileNames || []).length > 1 ? row("Files", fmt0.format(it.fileNames.length)) : null,
+          row("Status", status),
+          osuSet ? row("osu!", h("a", { href: `https://osu.ppy.sh/beatmapsets/${osuSet}`, target: "_blank", rel: "noopener" }, "Beatmap page ↗")) : null,
+          it.type === "skins" || it.type === "styles" ? row("Editing", it.customizable ? "Customizable in the skin maker" : "🔒 Only its maker") : null));
+
+      box.replaceChildren(hero,
+        h("div.wsi-grid", {},
+          h("div.wsi-main", {}, it.description ? h("section.panel.wsi-about", {}, h("h2", { text: "About" }), h("p", { text: it.description })) : null, songs.length ? diffs : null),
+          info));
     });
   }
 
@@ -1165,8 +1252,11 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("span.btn.wide.disabled", { "aria-disabled": "true" }, "Not available"));
     const notes = h("section.release-notes", { hidden: true });
     const testerBox = h("section.tester-dl", { hidden: true });
+    const verChip = h("span.ph-chip.ver", { text: "Latest version" });
+    loadRelease().then((m) => { if (m && m.version) verChip.textContent = "v" + m.version; });
     const page = h("div.download-page", {},
-      h("section.page-head", {}, h("h1", { text: "Download OCTIVE" }), h("p.sub", { text: "Free on Windows and Android. Your account, scores and friends work on both." })),
+      h("section.page-head", {}, h("h1", { text: "Download OCTIVE" }), h("p.sub", { text: "Free on Windows and Android. Your account, scores and friends work on both." }),
+        h("div.ph-chips", {}, h("span.ph-chip.free", { text: "Free" }), verChip, h("span.ph-chip", { text: "Windows · Android · Browser" }))),
       testerBox,
       h("div.dl-grid", {}, win, android, web, linux, mac),
       notes);
@@ -2574,12 +2664,14 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function updatesPage() {
     document.title = "Updates · OCTIVE";
     const list = h("div.updates-list", {}, h("p.empty", { text: "Loading the update history…" }));
+    const chips = h("div.ph-chips");
     app.replaceChildren(h("div.updates-page", {},
-      h("section.page-head", {}, h("h1", { text: "Update history" }), h("p.sub", { text: "Every OCTIVE release, newest first. The game updates itself when a new one comes out." })),
+      h("section.page-head", {}, h("h1", { text: "Update history" }), h("p.sub", { text: "Every OCTIVE release, newest first. The game updates itself when a new one comes out." }), chips),
       list));
     fetch(worker + "/releases/history.json", { cache: "no-cache" }).then((r) => r.ok ? r.json() : []).catch(() => []).then((hist) => {
       hist = (Array.isArray(hist) ? hist : []).filter((x) => x && x.version && !/test/i.test(x.version));
       if (!hist.length) { list.replaceChildren(h("p.empty", { text: "The update history couldn't be loaded right now." })); return; }
+      chips.replaceChildren(h("span.ph-chip.ver", { text: "Latest: v" + hist[0].version }), h("span.ph-chip", { text: `${hist.length} release${hist.length === 1 ? "" : "s"}` }));
       list.replaceChildren(...hist.map((x, i) => {
         const when = x.published ? new Date(x.published) : null;
         const date = when && !isNaN(when) ? when.toLocaleString(undefined, { dateStyle: "long", timeStyle: "short" }) : "";
@@ -2770,20 +2862,33 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const one = (location.hash.match(/^#\/crew\/([a-z0-9]{10,24})/) || [])[1];
     if (one) return crewPage(one);
     document.title = "Crews · OCTIVE";
+    const podium = h("div.cw-podium");
     const list = h("div.crew-list", {}, h("p.empty", { text: "Loading the crew board…" }));
-    app.replaceChildren(h("section", {},
+    app.replaceChildren(h("section.cw-board", {},
       h("div.section-head", {}, h("h1.section-title", { text: "Crew board" }), h("a.more", { href: "#/rankings" }, "Players →")),
       h("p.panel-sub.crew-intro", { text: "Crews are teams of up to 12 players. A crew's score is its five best members' PR added up. Make or join one in the game: Profile → Crew." }),
-      list));
+      podium, list));
     fetch(`${worker}/play/crews`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
       if (!list.isConnected) return;
       const crews = (d && d.crews) || [];
       if (!crews.length) { list.replaceChildren(h("p.empty", { text: "No crews yet." })); return; }
-      list.replaceChildren(...crews.map((c) => h("a.crew-row", { href: "#/crew/" + encodeURIComponent(c.id) },
+      const best = Math.max(1, ...crews.map((c) => c.score || 0));
+      const members = (c) => `${c.members} member${c.members === 1 ? "" : "s"}`;
+      // the top three on a podium (2nd, 1st, 3rd), like the game's crew board
+      podium.replaceChildren(...[1, 0, 2].map((i) => crews[i]).filter(Boolean).map((c) =>
+        h("a.cw-pod", { href: "#/crew/" + encodeURIComponent(c.id), "data-place": c.rank, style: `--crew:${crewCol(c.color)}` },
+          h("span.cw-place", { text: ["", "1st", "2nd", "3rd"][c.rank] || "#" + c.rank }),
+          crewTag(c, true),
+          h("b.cw-pod-name", { text: c.name }),
+          h("span.cw-pod-score", { text: fmt0.format(Math.round(c.score || 0)) + " PR" }),
+          h("span.cw-pod-members", { text: members(c) }))));
+      // everyone else, with a bar for their score next to the best crew's
+      list.replaceChildren(...crews.slice(3).map((c) => h("a.crew-row", { href: "#/crew/" + encodeURIComponent(c.id), style: `--crew:${crewCol(c.color)}` },
         h("span.crew-rank", { text: "#" + c.rank }),
         crewTag(c),
         h("span.crew-name", { text: c.name }),
-        h("span.crew-members", { text: `${c.members} member${c.members === 1 ? "" : "s"}` }),
+        h("span.crew-members", { text: members(c) }),
+        h("span.cw-bar", {}, h("span", { style: `width:${Math.max(2, Math.round((c.score || 0) / best * 100))}%` })),
         h("b.crew-score", { text: fmt0.format(Math.round(c.score || 0)) + " PR" }))));
     });
   }
@@ -2797,28 +2902,40 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (!c) { box.replaceChildren(h("p.empty", { text: "That crew isn't around any more." })); return; }
       document.title = `${c.name} · Crews · OCTIVE`;
       const col = crewCol(c.color);
+      const date = (t) => t ? new Date(t).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" }) : "";
       const stat = (label, value) => h("div.crew-stat", {}, h("span.field-label", { text: label }), h("b", { text: value }));
       const wars = c.wars || {};
-      const hero = h("section.crew-hero", { style: `--crew:${col}` },
-        h("div.crew-top", {}, crewTag(c, true), h("div.crew-titles", {}, h("h1", { text: c.name }), c.desc ? h("p.crew-desc", { text: c.desc }) : null)),
+      const all = (c.members || []).slice().sort((a, b) => (b.pp || 0) - (a.pp || 0));
+      const hero = h("section.crew-hero.cw-hero", { style: `--crew:${col}` },
+        h("div.crew-top", {}, crewTag(c, true),
+          h("div.crew-titles", {}, h("h1", { text: c.name }), c.desc ? h("p.crew-desc", { text: c.desc }) : null,
+            c.created ? h("p.cw-since", { text: "A crew since " + date(c.created) }) : null)),
         h("div.crew-stats", {},
           stat("Crew rank", c.rank > 0 ? "#" + fmt0.format(c.rank) : "–"),
           stat("Score", fmt0.format(Math.round(c.score || 0)) + " PR"),
-          stat("Members", `${(c.members || []).length} / ${c.max || 12}`),
-          stat("Crew wars won", fmt0.format(wars.wins || 0))),
+          stat("Members", `${all.length} / ${c.max || 12}`),
+          stat("Crew wars won", fmt0.format(wars.wins || 0)),
+          stat("War podiums", fmt0.format(wars.podiums || 0))),
         h("p.panel-sub", { text: "Score: the five best members' PR added up." }));
-      const members = (c.members || []).map((m) => {
-        const av = h("span.crew-av", { text: (m.name || "?").charAt(0).toUpperCase() });
-        const img = h("img", { src: `${worker}/avatar/${encodeURIComponent(m.id)}`, alt: "", loading: "lazy" });
-        img.onerror = () => img.remove();
-        av.append(img);
-        return h("a.crew-member", { href: "#/u/" + encodeURIComponent(m.id) },
+      // the members, best first: the five who count get a ★, and a bar for their PR next to the best member's
+      const best = Math.max(1, ...all.map((m) => m.pp || 0));
+      const members = all.map((m, i) => {
+        // the same picture as on the ranking (and an online dot), or their first letter
+        const av = h("span.avatar.crew-av", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial", { text: (m.name || "?").charAt(0).toUpperCase() }), h("span.dot", { hidden: true }));
+        const rp = findPlayer(m.id);
+        if (rp) setAvatar(av, rp);
+        return h("a.crew-member", { href: "#/u/" + encodeURIComponent(m.id), style: `--crew:${col}` },
+          h("span.cw-pos", { text: String(i + 1) }),
           av,
-          h("span.crew-name", { text: m.name || "Player" }),
+          h("span.cw-who", {}, h("span.crew-name", { text: m.name || "Player" }), m.joined ? h("span.cw-joined", { text: "joined " + date(m.joined) }) : null),
           m.role === "owner" ? h("span.crew-owner", { text: "OWNER", style: `color:${col};background:${col}22` }) : null,
+          i < 5 ? h("span.cw-star", { text: "★", title: "One of the five who count for the crew's score" }) : h("span.cw-star.off"),
+          h("span.cw-bar", {}, h("span", { style: `width:${Math.max(2, Math.round((m.pp || 0) / best * 100))}%` })),
           h("b.crew-score", { text: fmt0.format(Math.round(m.pp || 0)) + " PR" }));
       });
-      box.replaceChildren(hero, h("h2.section-title.crew-sub", { text: "Members" }), h("div.crew-list", {}, members));
+      box.replaceChildren(hero,
+        h("div.section-head.crew-sub", {}, h("h2.section-title", { text: `Members · ${all.length} / ${c.max || 12}` }), h("span.cw-note", { text: "★ counts for the crew's score" })),
+        h("div.crew-list", {}, members));
     });
   }
 
@@ -2876,4 +2993,17 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   document.addEventListener("visibilitychange", () => { if (!document.hidden) pingSeen(); });
   // keep online status fresh while the page is open
   setInterval(() => { const q = document.querySelector("[data-search]"); if (!document.hidden && !(q && q.value) && window.scrollY < 200 && ["home", "rankings", "player", "ranked"].includes(page())) load(); }, 90_000);
+  // ---------------------------------------------------------------- a secret: ↑ ↑ ↓ ↓ ← → ← → on the arrow keys
+  // A wrong key starts it over straight away (the keys you just pressed still count if they begin the code again).
+  const SECRET = ["ArrowUp", "ArrowUp", "ArrowDown", "ArrowDown", "ArrowLeft", "ArrowRight", "ArrowLeft", "ArrowRight"];
+  let secretKeys = [];
+  document.addEventListener("keydown", (e) => {
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return; // typing, not playing
+    secretKeys.push(e.key);
+    let k = Math.min(secretKeys.length, SECRET.length);
+    while (k > 0 && !SECRET.slice(0, k).every((s, i) => s === secretKeys[secretKeys.length - k + i])) k--;
+    secretKeys = secretKeys.slice(secretKeys.length - k);
+    if (k === SECRET.length) { secretKeys = []; location.href = "https://www.youtube.com/watch?v=QDia3e12czc"; }
+  });
 })();
