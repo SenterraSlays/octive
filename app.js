@@ -130,6 +130,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (r.ok) LIVE_NOW = (await r.json()).live || {};
     } catch { /* keep the last answer */ }
     for (const [dot, p] of liveDots) { if (!dot.isConnected) { liveDots.delete(dot); continue; } paintLiveDot(dot, p); }
+    paintLiveStrip();
   }
   loadLiveNow();
   setInterval(loadLiveNow, 60_000);
@@ -739,7 +740,9 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       fetch(`${worker}/play/progress?player=${encodeURIComponent(p.id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
         if (!graph.isConnected) return;
         const days = ((d && d.days) || []).filter((x) => Array.isArray(x) && x[3] > 0).slice(-90);
-        graph.replaceChildren(days.length >= 2 ? rankGraph(days) : h("p.pf-graph-none", { text: "The rank graph fills in after a couple of days on the ranking." }));
+        graph.replaceChildren(days.length >= 2 ? progressGraphs(days) : h("p.pf-graph-none", { text: "The graphs fill in after a couple of days on the ranking." }));
+        const sk = d && d.skills;
+        if (sk && (sk.axes || []).length >= 3 && sk.plays > 0 && skillsSlot.isConnected) skillsSlot.replaceWith(skillsSection(sk));
       });
     }
 
@@ -768,6 +771,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     // the title bought in the points shop (under the name) and the showcase
     const showcase = h("section.showcase", { hidden: true }, h("h2", { text: "Showcase" }), h("div.sc-row"));
     overview.append(showcase);
+    const skillsSlot = h("div.pf-skills-slot");
+    overview.append(skillsSlot);
     loadCosmetics().then((cz) => {
       const mine = cz.players[p.id] || {};
       const title = mine.title && cz.titles[mine.title];
@@ -950,7 +955,13 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("div.section-head", {}, h("h2.section-title", { text: "What's in the game" })),
       h("dl.hm-list", {}, ABOUT.map(([t, d]) => h("div", {}, h("dt", { text: t }), h("dd", { text: d })))));
 
-    app.replaceChildren(hero, strip, workshop, h("section.hm-sec.hm-two", {}, board, about));
+    const liveStrip = h("section.hm-sec.hm-live", { hidden: true });
+    const dailyRow = h("section.hm-sec.hm-daily", {},
+      h("div.section-head", {}, h("h2.section-title", { text: "Today's daily charts" }), h("a.more", { href: "#/daily" }, "Scores and more")),
+      h("div.hm-daily-row", {}, h("p.empty", { text: "Loading today's charts…" })));
+    app.replaceChildren(hero, liveStrip, strip, workshop, dailyRow, h("section.hm-sec.hm-two", {}, board, about));
+    paintLiveStrip();
+    loadDailyRow(dailyRow);
     document.title = "OCTIVE";
 
     loadRelease().then((m) => { if (m && hero.isConnected) ver.querySelector("b").textContent = "v" + m.version; });
@@ -1084,7 +1095,16 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const tabs = h("div.ws-tabs");
     const grid = h("div.ws-grid", {}, h("p.empty", { text: "Loading…" }));
     const status = h("p.ws-status");
-    const search = h("input.help-search.ws-search", { type: "search", placeholder: "Search titles and creators…", value: wsQuery });
+    // (2.1.2) the search also finds players (from the ranking)
+    const people = h("div.ws-people", { hidden: true });
+    function paintPeople() {
+      if (!people.isConnected && grid.parentNode) grid.parentNode.insertBefore(people, grid);
+      const q = (wsQuery || "").toLowerCase();
+      const found = q.length >= 2 && data ? data.players.filter((p) => (p.name || "").toLowerCase().includes(q)).slice(0, 8) : [];
+      people.hidden = !found.length;
+      people.replaceChildren(...(found.length ? [h("span.ws-people-cap", { text: `Players · ${found.length}` }), h("div.ws-people-row", {}, ...found.map(playerChip))] : []));
+    }
+    const search = h("input.help-search.ws-search", { type: "search", placeholder: "Search charts, creators and players…", value: wsQuery });
     const sort = h("select.ws-sort", {}, h("option", { value: "new", text: "Newest" }), h("option", { value: "popular", text: "Most downloaded" }), h("option", { value: "liked", text: "Most liked" }),
       h("option", { value: "hardest", text: "Stars: highest" }), h("option", { value: "easiest", text: "Stars: lowest" }), h("option", { value: "pr", text: "Most PR" }),
       h("option", { value: "title", text: "Title (A–Z)" }), h("option", { value: "oldest", text: "Oldest" }));
@@ -1137,6 +1157,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     function load() {
       const g = ++gen;
       status.textContent = "Loading…";
+      paintPeople();
       fetch(`${worker}/api/items?${wsQueryString()}`, { cache: "no-cache" })
         .then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
           if (g !== gen || !grid.isConnected) return;
@@ -1219,13 +1240,15 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
             it.discord ? h("a.btn.discord", { href: it.discord, target: "_blank", rel: "noopener" }, h("img", { src: "discord.png", alt: "" }), "On Discord") : null)));
 
       // every difficulty: a coloured star tile, its name and charter, its numbers and a bar for how hard it is
-      const diffs = h("section.panel.wsi-diffs", {}, h("h2", { text: charts.length ? `Difficulties · ${charts.length}` : "Difficulties" }));
+      const diffs = h("section.panel.wsi-diffs", {}, h("h2", { text: charts.length ? `Difficulties · ${charts.length}` : "Difficulties" }),
+        it.verified && isSong ? h("p.wsi-board-note", { text: "Verified: every difficulty has a global leaderboard. Click one to see it." }) : null);
+      const hardest = charts.reduce((m, c) => (!m || (Number(c.stars) || 0) > (Number(m.stars) || 0)) ? c : m, null);
       for (const sg of songs) {
         diffs.append(h("div.wsi-song", {}, h("b", { text: `${sg.artist} - ${sg.title}` }),
           h("span", { text: [sg.bpm ? `${Math.round(sg.bpm * 10) / 10} BPM` : "", sg.durationUs ? fmtLength(sg.durationUs) : ""].filter(Boolean).join(" · ") })));
         for (const c of (sg.charts || []).slice().sort((a, b) => a.keys - b.keys || a.stars - b.stars)) {
           const st = Number(c.stars) || 0, col = starColor(st);
-          diffs.append(h("div.wsi-diff", { style: `--c:${col}` },
+          const drow = h("div.wsi-diff", { style: `--c:${col}` },
             h("span.wsi-star", { text: "★ " + st.toFixed(2) }),
             h("div.wsi-diff-name", {}, h("b", { text: c.difficulty || "Chart" }), c.creator ? h("span", { text: "by " + c.creator }) : null),
             h("div.wsi-diff-facts", {},
@@ -1233,7 +1256,9 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
               h("span", { text: `${fmt0.format(c.notes || 0)} notes` }),
               c.nps ? h("span", { text: `${c.nps} NPS`, title: "Notes per second" }) : null,
               c.od != null ? h("span", { text: `OD ${c.od}`, title: "Overall difficulty: how tight the timing is" }) : null),
-            h("span.wsi-meter", { title: `${st.toFixed(2)} stars` }, h("span", { style: `width:${Math.min(100, st * 10)}%` }))));
+            h("span.wsi-meter", { title: `${st.toFixed(2)} stars` }, h("span", { style: `width:${Math.min(100, st * 10)}%` })));
+          diffs.append(drow);
+          if (it.verified && isSong) wsBoardToggle(drow, sg, c, c === hardest);
         }
       }
 
@@ -1370,6 +1395,267 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         s.reviews.length > shown ? h("button.btn.small.rv-show", { type: "button", onclick: () => { shown += 5; paintReviews(); } }, `Show more (${fmt0.format(s.reviews.length - shown)} left)`) : null);
     }
     paintCounts(); paintReviews(); load();
+  }
+
+
+  // ================================================================ 2.1.2 site additions
+  /** A small picture for any player: their ranking picture when they're ranked, else their first letter. */
+  function smallAvatar(id, name) {
+    const box = h("span.avatar", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial", { text: (name || "?").charAt(0).toUpperCase() }), h("span.dot", { hidden: true }));
+    const p = findPlayer(id);
+    if (p) setAvatar(box, p); else box.querySelector(".dot").remove();
+    return box;
+  }
+
+  // ---------------------------------------------------------------- Workshop chart leaderboards (the game's global boards)
+  const boardCache = new Map();
+  function boardKeyOf(sg, c) {
+    const set = Math.round(Number(sg.osuSet) || 0);
+    return `${set > 0 ? "osu-" + set : sg.songId}/${set > 0 && c.osuMd5 ? c.osuMd5 : c.chartId}`;
+  }
+  /** Click a difficulty to open (or close) its leaderboard under it; the hardest one starts open. */
+  function wsBoardToggle(row, sg, c, open) {
+    if (!sg || !c || !(c.chartId || c.osuMd5)) return;
+    const key = boardKeyOf(sg, c);
+    const panel = h("div.wsi-board", { hidden: true });
+    const hint = h("span.wsi-board-hint", { text: "Leaderboard ▾" });
+    row.append(hint);
+    row.classList.add("has-board");
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    row.setAttribute("aria-expanded", "false");
+    const toggle = () => {
+      const show = panel.hidden;
+      panel.hidden = !show;
+      row.setAttribute("aria-expanded", String(show));
+      hint.textContent = show ? "Leaderboard ▴" : "Leaderboard ▾";
+      if (show && !panel.dataset.loaded) { panel.dataset.loaded = "1"; fillBoard(panel, key); }
+    };
+    row.addEventListener("click", toggle);
+    row.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
+    row.after(panel);
+    if (open) toggle();
+  }
+  async function fillBoard(panel, key) {
+    panel.replaceChildren(h("p.empty", { text: "Loading the leaderboard…" }));
+    let d = boardCache.get(key);
+    if (!d) {
+      d = await fetch(`${worker}/scores/${key}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null);
+      if (d) boardCache.set(key, d);
+    }
+    const entries = (d && d.entries) || [];
+    if (!entries.length) { panel.replaceChildren(h("p.empty", { text: "No scores yet: be the first to set one in the game." })); return; }
+    let shown = 10;
+    const paint = () => {
+      const rows = entries.slice(0, shown).map((e) => h("a.wb-row", { href: "#/u/" + encodeURIComponent(e.playerId), "data-place": e.rank },
+        h("span.wb-rank", { text: "#" + e.rank }),
+        smallAvatar(e.playerId, e.name),
+        h("span.wb-name", {}, h("b", { text: e.name || "Player" }), e.mods ? h("span.wb-mods", { text: e.mods }) : null),
+        h("span.wb-score", { text: fmt0.format(e.score || 0) }),
+        h("span.wb-acc", { text: (Number(e.accuracy) || 0).toFixed(2) + "%" }),
+        h("span.wb-combo" + (e.fullCombo ? ".fc" : ""), { text: e.fullCombo ? "FC" : (e.maxCombo ? fmt0.format(e.maxCombo) + "x" : "") }),
+        h("span.wb-pr", { text: e.pp ? fmt0.format(Math.round(e.pp)) + " PR" : "" })));
+      panel.replaceChildren(
+        h("div.wb-head", {}, h("span", { text: "#" }), h("span"), h("span", { text: "Player" }), h("span", { text: "Score" }), h("span", { text: "Acc" }), h("span", { text: "Combo" }), h("span", { text: "PR" })),
+        ...rows,
+        entries.length > shown ? h("button.btn.small.wb-more", { type: "button", onclick: (ev) => { ev.stopPropagation(); shown = entries.length; paint(); } }, `Show all ${entries.length}`) : null);
+    };
+    paint();
+  }
+
+  // ---------------------------------------------------------------- Live on Twitch (home page strip)
+  /** The home page's strip of everyone streaming right now (hidden when nobody is). */
+  function paintLiveStrip() {
+    const el = document.querySelector(".hm-live");
+    if (!el) return;
+    const ids = Object.keys(LIVE_NOW || {});
+    el.hidden = !ids.length;
+    if (!ids.length) { el.replaceChildren(); return; }
+    const cards = ids.slice(0, 6).map((id) => {
+      const lv = LIVE_NOW[id] || {};
+      const p = findPlayer(id);
+      const name = (p && p.name) || lv.name || "Player";
+      const av = smallAvatar(id, name);
+      const dot = av.querySelector(".dot");
+      if (dot) { dot.hidden = false; dot.classList.add("live"); dot.innerHTML = LIVE_SVG; }
+      const mins = lv.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(lv.startedAt)) / 60000)) : null;
+      const since = mins == null ? "" : mins < 60 ? `${mins} min` : `${Math.floor(mins / 60)} h ${mins % 60} min`;
+      return h("article.live-card", {},
+        h("a.live-who", { href: "#/u/" + encodeURIComponent(id) }, av, h("span", {}, h("b", { text: name }), h("small", { text: [`${fmt0.format(lv.viewers || 0)} watching`, since && `live for ${since}`].filter(Boolean).join(" · ") }))),
+        h("p.live-title", { text: [lv.title, lv.game].filter(Boolean).join(" · ") || `twitch.tv/${lv.login}`, title: lv.title || "" }),
+        h("a.btn.small.live-watch", { href: `https://www.twitch.tv/${lv.login}`, target: "_blank", rel: "noopener" }, "Watch stream ▶"));
+    });
+    el.replaceChildren(h("div.section-head", {}, h("h2.section-title", {}, h("span.live-pulse"), `Live on Twitch now · ${ids.length}`)), h("div.live-row", {}, ...cards));
+  }
+
+  // ---------------------------------------------------------------- daily charts
+  const TIER_COLOR = { easy: "#4ad391", normal: "#4fd6e8", hard: "#f2c14e", extreme: "#ff5c8a" };
+  let dailyCache = null, dailyAt = 0;
+  async function loadDaily() {
+    if (dailyCache && Date.now() - dailyAt < 60_000) return dailyCache;
+    const d = await fetch(`${worker}/play/daily`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null);
+    if (d) { dailyCache = d; dailyAt = Date.now(); }
+    return d;
+  }
+  function untilText(iso) {
+    const ms = Math.max(0, Date.parse(iso) - Date.now());
+    const hh = Math.floor(ms / 3_600_000), mm = Math.floor(ms / 60_000) % 60, ss = Math.floor(ms / 1000) % 60;
+    return `${hh}h ${String(mm).padStart(2, "0")}m ${String(ss).padStart(2, "0")}s`;
+  }
+  /** The home page's row: today's four charts, small. */
+  function loadDailyRow(box) {
+    loadDaily().then((d) => {
+      if (!box.isConnected) return;
+      const tiers = (d && d.tiers) || [];
+      if (!tiers.length) { box.hidden = true; return; }
+      box.querySelector(".hm-daily-row").replaceChildren(...tiers.map((t) => {
+        const col = TIER_COLOR[t.tier] || "#b69bff";
+        const best = (t.top || [])[0];
+        return h("a.hd-card", { href: "#/daily", style: `--c:${col}` },
+          h("span.hd-pic", {}, t.preview ? h("img", { src: t.preview, alt: "", loading: "lazy", onerror: (e) => e.currentTarget.remove() }) : null, h("span.hd-tier", { text: t.name })),
+          h("span.hd-body", {},
+            h("b", { text: t.title, title: t.title }),
+            h("small", { text: `${t.difficulty} · ★ ${(t.stars || 0).toFixed(2)}` }),
+            h("small.hd-best", { text: best ? `Best: ${best.name} · ${best.acc.toFixed(2)}%` : "Nobody yet: be first" })));
+      }));
+    });
+  }
+  /** #/daily: today's charts, the scoring and every tier's board. */
+  function dailyPage() {
+    document.title = "Daily charts · OCTIVE";
+    const clock = h("span.dp-clock", { text: "…" });
+    const grid = h("div.dp-grid", {}, h("p.empty", { text: "Loading today's charts…" }));
+    app.replaceChildren(h("div.daily-page", {},
+      h("section.page-head", {}, h("h1", { text: "Daily charts" }),
+        h("p.sub", { text: "The same charts for everyone, new every day at midnight UTC. One attempt each and no mods: your accuracy, rounded down, is your points (halved on Easy, doubled on Hard, tripled on Extreme). Play them in the game: Play → Daily & Shop." }),
+        h("div.ph-chips", {}, h("span.ph-chip", {}, "New charts in ", clock))),
+      grid));
+    loadDaily().then((d) => {
+      if (!grid.isConnected) return;
+      if (!d || !(d.tiers || []).length) { grid.replaceChildren(h("p.empty", { text: "Today's charts can't be loaded right now." })); return; }
+      const tick = () => { if (!clock.isConnected) { clearInterval(iv); return; } clock.textContent = untilText(d.nextAt); };
+      const iv = setInterval(tick, 1000); tick();
+      grid.replaceChildren(...d.tiers.map((t) => {
+        const col = TIER_COLOR[t.tier] || "#b69bff";
+        const list = h("div.dp-board");
+        let shown = 10;
+        const paint = () => {
+          const top = t.top || [];
+          list.replaceChildren(
+            ...(top.length ? top.slice(0, shown).map((s, i) => h("a.dp-row", { href: "#/u/" + encodeURIComponent(s.id), "data-place": i + 1 },
+              h("span.wb-rank", { text: "#" + (i + 1) }), smallAvatar(s.id, s.name), h("b", { text: s.name || "Player" }),
+              h("span.dp-acc", { text: (Number(s.acc) || 0).toFixed(2) + "%" }), h("span.dp-pts", { text: fmt0.format(s.points || 0) + " pts" })))
+              : [h("p.empty", { text: "Nobody has played it yet today." })]),
+            top.length > shown ? h("button.btn.small", { type: "button", onclick: () => { shown = top.length; paint(); } }, `Show all ${top.length}`) : null);
+        };
+        paint();
+        return h("article.dp-card", { style: `--c:${col}` },
+          h("div.dp-pic", {}, t.preview ? h("img", { src: t.preview, alt: "", loading: "lazy", onerror: (e) => e.currentTarget.remove() }) : null,
+            h("span.dp-tier", { text: t.name }), h("span.dp-max", { text: `up to ${fmt0.format(t.maxPoints || 0)} pts` })),
+          h("div.dp-info", {},
+            h("h2", { text: t.title, title: t.title }),
+            h("p.dp-artist", { text: t.artist || "" }),
+            h("div.dp-facts", {},
+              h("span.dp-star", { text: "★ " + (t.stars || 0).toFixed(2), style: `--s:${starColor(t.stars || 0)}` }),
+              h("span", { text: t.difficulty || "" }), h("span", { text: `${t.keys || 4}K` }),
+              t.notes ? h("span", { text: `${fmt0.format(t.notes)} notes` }) : null,
+              t.durationUs ? h("span", { text: fmtLength(t.durationUs) }) : null),
+            h("div.dp-actions", {},
+              t.itemId ? h("a.btn.small", { href: "#/workshop/" + t.itemId }, "View chart") : null,
+              t.itemId ? h("a.btn.small.primary", { href: `octive://workshop/${t.itemId}`, onclick: () => openHint() }, "Open in OCTIVE") : null),
+            h("h3.dp-board-head", { text: `Today's scores · ${fmt0.format(t.players || 0)}` }),
+            list));
+      }));
+    });
+  }
+
+  // ---------------------------------------------------------------- profile progress: rank / PR / accuracy and skills
+  /** The profile's graph with tabs: global rank, PR and accuracy, day by day. */
+  function progressGraphs(days) {
+    const host = h("div.pf-graphs");
+    const tabs = h("div.pf-gtabs");
+    const metrics = [["Rank", 3], ["PR", 1], ["Accuracy", 2]];
+    let cur = 3;
+    const paint = () => {
+      tabs.replaceChildren(...metrics.map(([label, k]) => h("button" + (k === cur ? ".on" : ""), { type: "button", onclick: () => { cur = k; paint(); } }, label)));
+      host.replaceChildren(tabs, metricGraph(days, cur));
+    };
+    paint();
+    return host;
+  }
+  function metricGraph(days, k) {
+    const NS = "http://www.w3.org/2000/svg", W = 600, H = 80, pad = 6;
+    const vals = days.map((d) => Number(d[k]) || 0);
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    const up = k !== 3; // rank: smaller is better, drawn higher
+    const y = (v) => hi === lo ? H / 2 : up ? H - pad - (v - lo) / (hi - lo) * (H - pad * 2) : pad + (v - lo) / (hi - lo) * (H - pad * 2);
+    const x = (i) => i / (days.length - 1) * W;
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("preserveAspectRatio", "none"); svg.setAttribute("aria-hidden", "true");
+    const defs = document.createElementNS(NS, "defs");
+    defs.innerHTML = `<linearGradient id="pf-rank-line" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="${W}" y2="0"><stop offset="0" stop-color="#a764ff"/><stop offset=".5" stop-color="#ff4d9d"/><stop offset="1" stop-color="#ffd23f"/></linearGradient>`
+      + '<linearGradient id="pf-rank-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ff4d9d" stop-opacity=".3"/><stop offset="1" stop-color="#ff4d9d" stop-opacity="0"/></linearGradient>';
+    const pts = days.map((d, i) => `${x(i).toFixed(1)},${y(vals[i]).toFixed(1)}`).join(" ");
+    const area = document.createElementNS(NS, "polygon"); area.setAttribute("points", `0,${H} ${pts} ${W},${H}`);
+    const line = document.createElementNS(NS, "polyline"); line.setAttribute("points", pts); line.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.append(defs, area, line);
+    const dot = h("span.pf-dot", { hidden: true }), tip = h("span.pf-tip", { hidden: true });
+    const what = k === 3 ? "Global rank" : k === 1 ? "PR" : "Accuracy";
+    const box = h("div.pf-chart", { title: `${what}, day by day` }, svg, dot, tip);
+    const dayText = (s) => new Date(s + "T12:00:00Z").toLocaleDateString(undefined, { day: "numeric", month: "short" });
+    const valText = (d) => k === 3 ? `#${fmt0.format(d[3])}` : k === 1 ? `${fmt0.format(d[1])} PR` : `${(Number(d[2]) || 0).toFixed(2)}%`;
+    box.addEventListener("pointermove", (e) => {
+      const r = box.getBoundingClientRect();
+      const i = Math.max(0, Math.min(days.length - 1, Math.round((e.clientX - r.left) / r.width * (days.length - 1))));
+      const d = days[i], px = x(i) / W * r.width, py = y(vals[i]) / H * r.height;
+      dot.hidden = tip.hidden = false;
+      dot.style.left = px + "px"; dot.style.top = py + "px";
+      tip.textContent = `${valText(d)} · ${dayText(d[0])}`;
+      tip.style.left = Math.max(0, Math.min(r.width - tip.offsetWidth, px - tip.offsetWidth / 2)) + "px";
+    });
+    box.addEventListener("pointerleave", () => { dot.hidden = tip.hidden = true; });
+    return box;
+  }
+  /** The skill radar (the game's): a level for each kind of pattern, from the verified charts they played. */
+  function skillsSection(sk) {
+    const axes = sk.axes || [];
+    const NS = "http://www.w3.org/2000/svg", S = 260, C = S / 2, R = 92;
+    const levels = axes.map((a) => Number(a.level) || 0);
+    const top = Math.max(1, Math.ceil(Math.max(...levels, 1)));
+    // the scale starts a little under the weakest skill, so the differences show (not one full octagon)
+    const floor = Math.max(0, Math.min(top - 2, Math.floor(Math.min(...levels)) - 1));
+    const frac = (v) => Math.max(0.04, (v - floor) / (top - floor));
+    const ang = (i) => -Math.PI / 2 + i * 2 * Math.PI / axes.length;
+    const pt = (i, r) => [C + Math.cos(ang(i)) * r, C + Math.sin(ang(i)) * r];
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", `-56 -6 ${S + 112} ${S + 12}`); svg.setAttribute("class", "sk-radar"); svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Skills: " + axes.map((a) => `${a.name} ${(+a.level).toFixed(1)}`).join(", "));
+    let inner = `<defs><linearGradient id="sk-fill" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff4d9d" stop-opacity=".55"/><stop offset="1" stop-color="#a764ff" stop-opacity=".45"/></linearGradient></defs>`;
+    for (const f of [0.25, 0.5, 0.75, 1]) inner += `<polygon class="sk-ring" points="${axes.map((_, i) => pt(i, R * f).map((v) => v.toFixed(1)).join(",")).join(" ")}"/>`;
+    axes.forEach((_, i) => { const [x2, y2] = pt(i, R); inner += `<line class="sk-spoke" x1="${C}" y1="${C}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"/>`; });
+    inner += `<polygon class="sk-shape" points="${axes.map((a, i) => pt(i, R * frac(Number(a.level) || 0)).map((v) => v.toFixed(1)).join(",")).join(" ")}"/>`;
+    inner += `<text class="sk-scale" x="${C + 4}" y="${(C - R - 4).toFixed(1)}">${top}★</text><text class="sk-scale" x="${C + 4}" y="${(C - 4).toFixed(1)}">${floor}★</text>`;
+    axes.forEach((a, i) => {
+      const [lx, ly] = pt(i, R + 20);
+      const anchor = Math.abs(lx - C) < 8 ? "middle" : lx < C ? "end" : "start";
+      inner += `<text class="sk-label" x="${lx.toFixed(1)}" y="${(ly + 4).toFixed(1)}" text-anchor="${anchor}">${String(a.name).replace(/[<&]/g, "")}</text>`;
+    });
+    svg.innerHTML = inner;
+    const list = h("ul.sk-list", {}, ...axes.slice().sort((a, b) => b.level - a.level).map((a) => h("li", {},
+      h("span", { text: a.name }), h("span.sk-bar", {}, h("i", { style: `width:${Math.min(100, frac(Number(a.level) || 0) * 100)}%` })), h("b", { text: (Number(a.level) || 0).toFixed(1) }),
+      h("small", { text: `${fmt0.format(a.plays || 0)} play${a.plays === 1 ? "" : "s"}` }))));
+    return h("section.pf-skills", {},
+      h("h2", { text: "Skills" }),
+      h("p.sk-sub", { text: `Overall ${(Number(sk.overall) || 0).toFixed(2)}★ · from ${fmt0.format(sk.plays || 0)} plays on verified charts` }),
+      h("div.sk-grid", {}, svg, list));
+  }
+
+  // ---------------------------------------------------------------- Workshop search: players too
+  function playerChip(p) {
+    const a = h("a.ws-person", { href: "#/u/" + encodeURIComponent(p.id) },
+      smallAvatar(p.id, p.name),
+      h("span", {}, h("b", { text: p.name || "Player" }), h("small", { text: `#${fmt0.format(p.rank || 0)} · ${fmt0.format(Math.round(p.pp || 0))} PR` })));
+    return a;
   }
 
   const fmtLength = (us) => { const s = Math.round(us / 1e6); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
@@ -3209,6 +3495,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     else if (pg === "help") helpPage();
     else if (pg === "updates") updatesPage();
     else if (pg === "workshop") workshopPage();
+    else if (pg === "daily") dailyPage();
     else if (pg === "messages") messagesPage();
     else if (pg === "open") openPage();
     else if (pg === "crews" || pg === "crew") crewsPage();
