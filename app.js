@@ -1484,29 +1484,72 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   }
 
   // ---------------------------------------------------------------- Live on Twitch (home page strip)
-  /** The home page's strip of everyone streaming right now (hidden when nobody is). */
+  /** Everyone streaming right now, most viewers first. */
+  const liveIds = () => Object.keys(LIVE_NOW || {}).sort((x, y) => (LIVE_NOW[y].viewers || 0) - (LIVE_NOW[x].viewers || 0));
+  /** One stream: their picture with the play mark, name, viewers, how long, the title and Watch stream. */
+  function liveCard(id) {
+    const lv = LIVE_NOW[id] || {};
+    const p = findPlayer(id);
+    const name = (p && p.name) || lv.name || "Player";
+    const av = smallAvatar(id, name);
+    let dot = av.querySelector(".dot");
+    if (!dot) { dot = h("span.dot"); av.append(dot); }
+    dot.hidden = false; dot.classList.add("live"); dot.innerHTML = LIVE_SVG;
+    const mins = lv.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(lv.startedAt)) / 60000)) : null;
+    const since = mins == null ? "" : mins < 60 ? `${mins} min` : `${Math.floor(mins / 60)} h ${mins % 60} min`;
+    return h("article.live-card", {},
+      h("a.live-who", { href: "#/u/" + encodeURIComponent(id) }, av, h("span", {}, h("b", { text: name }), h("small", { text: [`${fmt0.format(lv.viewers || 0)} watching`, since && `live for ${since}`].filter(Boolean).join(" · ") }))),
+      h("p.live-title", { text: [lv.title, lv.game].filter(Boolean).join(" · ") || `twitch.tv/${lv.login}`, title: lv.title || "" }),
+      h("a.btn.small.live-watch", { href: `https://www.twitch.tv/${lv.login}`, target: "_blank", rel: "noopener" }, "Watch stream ▶"));
+  }
+  /** The home page's strip (one row of streams, "Watch more →" when there are more than fit) and the #/live page. */
   function paintLiveStrip() {
+    const ids = liveIds();
     const el = document.querySelector(".hm-live");
-    if (!el) return;
-    const ids = Object.keys(LIVE_NOW || {});
-    el.hidden = !ids.length;
-    if (!ids.length) { el.replaceChildren(); return; }
-    const cards = ids.slice(0, 12).map((id) => {
-      const lv = LIVE_NOW[id] || {};
-      const p = findPlayer(id);
-      const name = (p && p.name) || lv.name || "Player";
-      const av = smallAvatar(id, name);
-      const dot = av.querySelector(".dot");
-      if (dot) { dot.hidden = false; dot.classList.add("live"); dot.innerHTML = LIVE_SVG; }
-      const mins = lv.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(lv.startedAt)) / 60000)) : null;
-      const since = mins == null ? "" : mins < 60 ? `${mins} min` : `${Math.floor(mins / 60)} h ${mins % 60} min`;
-      return h("article.live-card", {},
-        h("a.live-who", { href: "#/u/" + encodeURIComponent(id) }, av, h("span", {}, h("b", { text: name }), h("small", { text: [`${fmt0.format(lv.viewers || 0)} watching`, since && `live for ${since}`].filter(Boolean).join(" · ") }))),
-        h("p.live-title", { text: [lv.title, lv.game].filter(Boolean).join(" · ") || `twitch.tv/${lv.login}`, title: lv.title || "" }),
-        h("a.btn.small.live-watch", { href: `https://www.twitch.tv/${lv.login}`, target: "_blank", rel: "noopener" }, "Watch stream ▶"));
-    });
-    el.replaceChildren(h("div.section-head", {}, h("h2.section-title", {}, h("span.live-pulse"), `Live on Twitch now · ${ids.length}`)), h("div.live-row", {}, ...cards),
-      ids.length > 12 ? h("p.live-more", { text: `and ${ids.length - 12} more: look for the purple play mark on the rankings` }) : null);
+    if (el) {
+      el.hidden = !ids.length;
+      if (!ids.length) el.replaceChildren();
+      else {
+        const more = h("a.btn.small.live-more-btn", { href: "#/live", hidden: true }, "Watch more →");
+        const row = h("div.live-row.one-row", {}, ...ids.map(liveCard));
+        el.replaceChildren(h("div.section-head", {}, h("h2.section-title", {}, h("span.live-pulse"), `Live on Twitch now · ${ids.length}`), more), row);
+        fitLiveRow();
+      }
+    }
+    const page = document.querySelector(".live-page .live-row");
+    if (page) {
+      const head = document.querySelector(".live-page .live-count");
+      if (head) head.textContent = ids.length ? `${ids.length} streaming now` : "Nobody is streaming right now";
+      page.replaceChildren(...(ids.length ? ids.map(liveCard)
+        : [h("p.empty", { text: "Nobody is live right now. Players who link Twitch in the game (Settings → Account → Twitch) show up here while they stream." })]));
+    }
+  }
+  /** Only the first row shows on the home page: Watch more appears when some streams didn't fit. */
+  function fitLiveRow() {
+    const row = document.querySelector(".hm-live .live-row");
+    const more = document.querySelector(".hm-live .live-more-btn");
+    if (!row || !more) return;
+    const cards = [...row.children];
+    cards.forEach((c) => { c.hidden = false; });   // measure them all, then hide the ones past the first row
+    const first = cards[0] ? cards[0].offsetTop : 0;
+    const past = cards.filter((c) => c.offsetTop > first + 4);
+    past.forEach((c) => { c.hidden = true; });
+    const hidden = past.length;
+    more.hidden = hidden === 0;
+    more.textContent = hidden ? `Watch more (${hidden}) →` : "Watch more →";
+  }
+  let liveFitT = null;
+  window.addEventListener("resize", () => { clearTimeout(liveFitT); liveFitT = setTimeout(fitLiveRow, 120); });
+  /** #/live: every stream right now (refreshed every minute with the rest of the site). */
+  function livePage() {
+    document.title = "Live now · OCTIVE";
+    app.replaceChildren(h("div.live-page", {},
+      h("a.back", { href: "#/" }, "← Home"),
+      h("section.page-head", {}, h("h1", {}, h("span.live-pulse"), " Live on Twitch"),
+        h("p.sub", { text: "OCTIVE players streaming right now, most viewers first. Link your own Twitch in the game (Settings → Account → Twitch) to show up here while you're live." }),
+        h("div.ph-chips", {}, h("span.ph-chip.live-count", { text: "…" }))),
+      h("div.live-row")));
+    paintLiveStrip();
   }
 
   // ---------------------------------------------------------------- daily charts
@@ -3517,6 +3560,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     else if (pg === "updates") updatesPage();
     else if (pg === "workshop") workshopPage();
     else if (pg === "daily") dailyPage();
+    else if (pg === "live") livePage();
     else if (pg === "messages") messagesPage();
     else if (pg === "open") openPage();
     else if (pg === "crews" || pg === "crew") crewsPage();

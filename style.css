@@ -2141,3 +2141,12 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .wsi-diff.on-board { border-color: color-mix(in srgb, var(--c) 60%, transparent); box-shadow: inset 3px 0 0 var(--c); }
 .wsi-board-hint { display: none; }
 .live-more { margin: 10px 0 0; color: var(--dim); font-size: 13px; }
+
+/* ---- 2.1.2: the home page shows one row of streams; the rest are a click away (#/live) */
+.live-card[hidden] { display: none; }
+.hm-live .section-head { align-items: center; }
+.live-more-btn { margin-left: auto; background: #9146ff26; border-color: #9146ff88; color: #e4d6ff; white-space: nowrap; }
+.live-more-btn:hover { background: #9146ff44; }
+.live-page .page-head h1 { display: flex; align-items: center; gap: 12px; }
+.live-page .page-head .live-pulse { width: 14px; height: 14px; }
+.live-page .live-row { margin-top: 18px; }
