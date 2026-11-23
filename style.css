@@ -1943,4 +1943,11 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .pf-liveslot .pf-live-mark { width: 30px; height: 30px; }
 .pf-liveslot .pf-live-watch { padding: 7px 11px; font-size: 12px; }
 .pf-liveslot .pf-live-text small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-@media (max-width: 760px) { .pf-side { margin-left: 0; flex-basis: 100%; padding-top: 0; align-items: flex-start; } .pf-liveslot { justify-content: flex-start; } }
+/* a narrow head (tablets, phones, a small window): live and Discord drop to their own row under the name */
+.pf-head { container: pfhead / inline-size; }
+@container pfhead (max-width: 900px) {
+  .pf-id { flex-wrap: wrap; }
+  .pf-side { flex: none; width: 100%; margin-left: 0; padding-top: 0; align-self: auto; flex-direction: row; flex-wrap: wrap; justify-content: space-between; align-items: center; }
+  .pf-liveslot { width: auto; flex: 0 1 340px; justify-content: flex-start; }
+  .pf-liveslot .pf-live { max-width: 340px; }
+}
