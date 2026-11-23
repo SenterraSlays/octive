@@ -1935,11 +1935,12 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 @media (max-width: 760px) { .pf-discord { margin-left: 0; align-self: flex-start; } }
 
 /* ---- 2.1.1: a right column in the profile head: live on Twitch at the top, the linked Discord at the bottom */
-.pf-side { margin-left: auto; align-self: stretch; flex: 0 1 340px; min-width: 0; display: flex; flex-direction: column; justify-content: space-between; align-items: flex-end; gap: 10px; padding-top: 72px; } /* the head sits 60px up into the banner */
+.pf-side { margin-left: auto; align-self: stretch; flex: 0 1 310px; min-width: 0; display: flex; flex-direction: column; justify-content: space-between; align-items: flex-end; gap: 10px; padding-top: 72px; } /* the head sits 60px up into the banner */
 .pf-side .pf-discord { margin-left: 0; }
 .pf-liveslot { width: 100%; display: flex; justify-content: flex-end; }
 .pf-liveslot:empty { display: none; }
-.pf-liveslot .pf-live { margin-top: 0; width: 100%; max-width: 340px; padding: 10px 12px; gap: 10px; }
+.pf-liveslot .pf-live { margin-top: 0; width: 100%; max-width: 310px; padding: 10px 12px; gap: 10px; }
 .pf-liveslot .pf-live-mark { width: 30px; height: 30px; }
 .pf-liveslot .pf-live-watch { padding: 7px 11px; font-size: 12px; }
+.pf-liveslot .pf-live-text small { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @media (max-width: 760px) { .pf-side { margin-left: 0; flex-basis: 100%; padding-top: 0; align-items: flex-start; } .pf-liveslot { justify-content: flex-start; } }
