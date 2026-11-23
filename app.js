@@ -737,10 +737,6 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       renderBio(text, p.bio);
       overview.append(h("section.bio", {}, h("h2", { text: "About me" }), text));
     }
-    if ((p.badges || []).includes("CREATOR") && p.socials) {
-      const links = h("div.social-links");
-      if (renderSocials(links, p.socials) > 0) overview.append(h("section.socials", {}, h("h2", { text: "Socials" }), links));
-    }
     // the title bought in the points shop (under the name) and the showcase
     const showcase = h("section.showcase", { hidden: true }, h("h2", { text: "Showcase" }), h("div.sc-row"));
     overview.append(showcase);
@@ -1639,7 +1635,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function socialsPanel() {
     const inputs = {};
     const hints = { youtube: "@handle or channel link", tiktok: "@username", x: "@username", instagram: "username", bluesky: "name.bsky.social", discord: "invite link (https://discord.gg/…)", website: "https://…" };
-    const rows = SOCIALS.map(([id, name]) => {
+    const rows = SOCIALS.filter(([id]) => id !== "discord" || me.playerId === ROLE_OWNER).map(([id, name]) => {
       const i = h("input", { type: "text", maxlength: 200, placeholder: hints[id], spellcheck: "false" });
       i.value = (me.socials && me.socials[id]) || "";
       inputs[id] = i;
@@ -2106,6 +2102,25 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     card.querySelector(".pf-idtext")?.append(box);
   }
 
+  // (2.1.1) profile links as small chips: the platform's logo and its name (the link is on hover and click)
+  const SOCIAL_ICONS = { twitch: "icons/twitch.png", youtube: "icons/youtube.png", tiktok: "icons/tiktok.png", x: "icons/x.png",
+    instagram: "icons/instagram.svg", bluesky: "icons/bluesky.svg", website: "icons/website.png", discord: "discord.png" };
+  function socialChip(id, name, url, title) {
+    return h(`a.fc-social.fc-${id}`, { href: url, target: "_blank", rel: "noopener noreferrer", title: title || url },
+      h("img", { src: SOCIAL_ICONS[id], alt: "" }), h("b", { text: name }));
+  }
+  /** A content creator's links (YouTube, TikTok…), as chips. The Discord server link is the official server's only. */
+  function creatorChips(p) {
+    if (!(p.badges || []).includes("CREATOR") || !p.socials) return [];
+    const out = [];
+    for (const [id, name, format] of SOCIALS) {
+      if (id === "discord" && p.id !== ROLE_OWNER) continue;
+      const url = socialUrl(format, p.socials[id]);
+      if (url) out.push(socialChip(id, id === "discord" ? "Discord server" : name, url));
+    }
+    return out;
+  }
+
   function socialRow(p, onSocial) {
     const followers = h("b", { text: "…" }), following = h("b", { text: "…" });
     const followBtn = h("button.btn", { type: "button", hidden: true });
@@ -2136,6 +2151,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const gift = h("a.btn.gift", { href: "#/supporter?gift=" + encodeURIComponent(p.id), hidden: !!(me && me.playerId === p.id) || !!(p.supporter && p.supporter.lifetime) }, "♥ Gift supporter");
     const friends = h("b", { text: "…" });
     let row;
+    // their links: the creator's socials now, their Discord and Twitch once the profile loads
+    const links = h("div.fc-links", {}, creatorChips(p));
     const open = (k) => row.dispatchEvent(new CustomEvent("open-list", { detail: k }));
     const icon = (paths) => { const s = document.createElement("span"); s.className = "fc-icon"; s.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${paths}</svg>`; return s; };
     const tile = (k, count, label, title, paths) => h("button.follow-count", { type: "button", onclick: () => open(k), title },
@@ -2145,7 +2162,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         tile("followers", followers, "Followers", "See who follows " + (p.name || "them"), '<path d="M16 19v-1a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v1"/><circle cx="9" cy="8" r="3.5"/><path d="M22 19v-1a4 4 0 0 0-3-3.9M16 4.2a3.5 3.5 0 0 1 0 6.6"/>'),
         tile("following", following, "Following", "See who " + (p.name || "they") + " follows", '<path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/>'),
         tile("friends", friends, "Friends", "See " + (p.name || "their") + "'s friends", '<circle cx="12" cy="8" r="4"/><path d="M4 20c0-3.3 3.6-6 8-6s8 2.7 8 6"/>')),
-      h("div.fc-actions", {}, out, msgBtn, followBtn, gift));
+      h("div.fc-actions", {}, out, msgBtn, followBtn, gift),
+      links);
     paint();
     (async () => {
       try {
@@ -2169,13 +2187,11 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
             catch { chip.querySelector(".dc-copy").textContent = user; }
             setTimeout(() => { chip.querySelector(".dc-copy").textContent = "Copy"; }, 1800);
           });
-          row.append(chip);
+          links.prepend(chip);
         }
         // (2.1.1) their Twitch channel, linked by signing in with Twitch (so it's really theirs)
         if (s.twitch && /^[a-z0-9_]{1,25}$/.test(s.twitch.login || "")) {
-          const tw = h("a.fc-twitch", { href: `https://www.twitch.tv/${s.twitch.login}`, target: "_blank", rel: "noopener", title: "Linked with Twitch · open their channel" },
-            h("span.tw-logo", { text: "twitch" }), h("b", { text: `twitch.tv/${s.twitch.login}` }), h("span.tw-check", { text: "✓" }));
-          row.append(tw);
+          links.prepend(socialChip("twitch", "Twitch", `https://www.twitch.tv/${s.twitch.login}`, `twitch.tv/${s.twitch.login} · linked with Twitch`));
         }
       } catch { followers.textContent = "—"; following.textContent = "—"; }
     })();

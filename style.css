@@ -1909,3 +1909,20 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .tw-row a { color: #e6d9ff; font-weight: 700; text-decoration: none; }
 .tw-row .tw-logo, .fc-twitch .tw-logo { background: #9146ff; color: #fff; font-weight: 700; font-size: 12px; padding: 1px 6px; border-radius: 6px; }
 .btn.tw-link { background: #9146ff; border-color: #9146ff; }
+
+/* ---- 2.1.1: profile links as logo chips (no Socials section) */
+.fc-links { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; width: 100%; margin-top: 10px; }
+.fc-links:empty { display: none; }
+.fc-links .fc-discord { margin-top: 0; }
+.fc-social { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px 6px 9px; border-radius: 999px; text-decoration: none; color: #eef0ff; font-size: 13px;
+  background: rgba(255, 255, 255, .05); border: 1px solid rgba(255, 255, 255, .14); transition: background .15s, transform .15s, border-color .15s; }
+.fc-social img { width: 18px; height: 18px; object-fit: contain; flex: none; }
+.fc-social b { font-weight: 700; }
+.fc-twitch.fc-social { background: rgba(145, 70, 255, .16); border-color: rgba(145, 70, 255, .55); }
+.fc-youtube { border-color: rgba(255, 0, 0, .45); }
+.fc-tiktok { border-color: rgba(37, 244, 238, .45); }
+.fc-x { border-color: rgba(29, 161, 242, .5); }
+.fc-instagram { border-color: rgba(221, 42, 123, .5); }
+.fc-bluesky { border-color: rgba(17, 133, 254, .5); }
+.fc-discord.fc-social { background: rgba(88, 101, 242, .16); border-color: rgba(88, 101, 242, .5); }
+@media (hover: hover) and (prefers-reduced-motion: no-preference) { .fc-social:hover { background: rgba(255, 255, 255, .11); transform: translateY(-1px); } }

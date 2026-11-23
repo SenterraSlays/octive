@@ -59,10 +59,14 @@ function badgesOf(id) {
 }
 
 /** A content creator's links from their card: known platforms, short strings only (the site builds the URLs). */
-function socialsOf(card) {
+function socialsOf(card, playerId) {
   const out = {};
   const s = card && typeof card.socials === "object" && card.socials ? card.socials : {};
-  for (const k of SOCIAL_KEYS) if (typeof s[k] === "string" && s[k].length > 0 && s[k].length <= 200) out[k] = s[k];
+  for (const k of SOCIAL_KEYS) {
+    // (2.1.1) a Discord server link is the official OCTIVE server's only (players link their own Discord account)
+    if (k === "discord" && playerId !== "PlwcYVKV9y7NBFWfUaC263XpCFbE") continue;
+    if (typeof s[k] === "string" && s[k].length > 0 && s[k].length <= 200) out[k] = s[k];
+  }
   return out;
 }
 
@@ -1066,7 +1070,7 @@ async function buildBoard(env) {
       devFriend: !!card.devFriend,
       role: DEVELOPERS.includes(e.playerId) ? "DEV" : (badgesOf(e.playerId)[0] || moderation.roles[e.playerId] || null),
       badges: badgesOf(e.playerId), check: checkOf(e.playerId),
-      socials: badgesOf(e.playerId).includes("CREATOR") ? socialsOf(card) : {},
+      socials: badgesOf(e.playerId).includes("CREATOR") ? socialsOf(card, e.playerId) : {},
       online: seen > 0 && now - seen < ONLINE_MS,
       lastSeen: seen > 0 ? new Date(seen).toISOString() : null,
       platform: c.platform || "",
@@ -1688,7 +1692,7 @@ async function me(env, who) {
       maxCombo: card.maxCombo ?? 0, playTimeMs: card.playTimeMs ?? 0, rank: card.rank ?? 0, version: card.version || "",
     } : null,
     bio: typeof card?.bio === "string" ? card.bio : "",
-    socials: socialsOf(card),
+    socials: socialsOf(card, who.playerId),
     avatarHash: ov.avatar === "default" ? "" : ov.avatar ? "mod-" + Date.parse(ov.at) : (card?.avatar || ""),
     avatarLocked: !!ov.avatar,
     nameLocked: !!ov.name,
@@ -1764,6 +1768,7 @@ async function account(request, env, route) {
         for (const [k, v] of Object.entries(b.socials || {})) {
           if (typeof v !== "string" || !v.trim()) continue;
           if (k === "twitch") continue; // linked, not typed (older pages and games still send it)
+          if (k === "discord" && who.playerId !== OWNER) continue; // the official server's link only
           if (!socialOk(k, v)) fail(400, `Check your ${k} link (a handle like @name, or a full https:// link).`);
           clean[k] = v.trim();
         }
@@ -1985,7 +1990,7 @@ async function account(request, env, route) {
         name, pp: pub.pp, accuracy: pub.accuracy, level: pub.level, levelProgress: pub.levelProgress, avatar: avatarHash, country,
         totalScore: pub.totalScore, xp: pub.xp, playCount: pub.playCount, fullCombos: pub.fullCombos, maxCombo: pub.maxCombo,
         playTimeMs: pub.playTimeMs, bio: cleanBio(b.bio), devFriend: await isDevFriend(env, id).catch(() => false), rank: 0,
-        socials: badgesOf(id).includes("CREATOR") ? socialsOf({ socials: b.socials }) : {},
+        socials: badgesOf(id).includes("CREATOR") ? socialsOf({ socials: b.socials }, id) : {},
         version: typeof b.version === "string" && /^\d{1,3}\.\d{1,3}\.\d{1,4}$/.test(b.version) ? b.version : "",
         ppVersion: pub.ppVersion,
         // (2.0.1) only the achievements the server can see were earned (see checkAchievements); achV marks a checked card
@@ -9908,10 +9913,12 @@ async function workshopRoutes(request, env, url, ctx) {
     const out = { creators: creators.length, removed: [] };
     for (const id of creators) {
       const card = (await publicItems(cfg, id, ["card"]).catch(() => ({}))).card;
-      if (!card || !card.socials || typeof card.socials !== "object" || !("twitch" in card.socials)) continue;
-      out.removed.push({ id, was: String(card.socials.twitch).slice(0, 60) });
+      if (!card || !card.socials || typeof card.socials !== "object") continue;
+      const drop = ["twitch", ...(id === OWNER ? [] : ["discord"])].filter((k) => k in card.socials);
+      if (!drop.length) continue;
+      out.removed.push({ id, was: drop.map((k) => `${k}: ${String(card.socials[k]).slice(0, 60)}`).join(", ") });
       if (dry) continue;
-      delete card.socials.twitch;
+      for (const k of drop) delete card.socials[k];
       await serverWrite(() => saveItem(env, id, "card", safeCard(card), true));
       cards.delete(id);
     }
