@@ -4181,6 +4181,8 @@ h1{font-size:22px;margin:0 0 8px}p{color:#b9bdd6;margin:0}</style></head><body><
     return page("Twitch linked!", `${esc(rec.twitch.name)} is now linked to your OCTIVE account. You can close this tab and go back to the game.`, true);
   }
   // following
+  // (2.1.2) everyone streaming on Twitch right now, for the live marks on online dots in the game and on the site
+  if (path === "/social/live") return reply({ live: await twitchLiveAll(env) }, 200);
   m = path.match(/^\/social\/([A-Za-z0-9_-]{1,64})$/);
   if (m) {
     const id = m[1];
@@ -5853,6 +5855,82 @@ async function twitchLiveOf(env, twitchId) {
   twitchLiveCache.set(twitchId, { at: Date.now(), stream });
   if (twitchLiveCache.size > 2000) twitchLiveCache.delete(twitchLiveCache.keys().next().value);
   return stream;
+}
+
+/** (2.1.2) Every linked player who is live on Twitch: { playerId: { login, name, title, game, viewers, startedAt } }.
+ *  One Twitch call per 100 linked channels, cached a minute; never throws. */
+let twitchLiveAllCache = null;
+async function twitchLiveAll(env) {
+  if (twitchLiveAllCache && Date.now() - twitchLiveAllCache.at < 60_000) return twitchLiveAllCache.map;
+  const map = {};
+  if (!env.TWITCH_CLIENT_ID || !env.TWITCH_CLIENT_SECRET) return map;
+  try {
+    const ids = []; let cursor;
+    do {
+      const l = await env.RELEASES.list({ prefix: "twitch/", cursor });
+      for (const o of l.objects) { const mm = o.key.match(/^twitch\/(\d+)\.json$/); if (mm) ids.push(mm[1]); }
+      cursor = l.truncated ? l.cursor : undefined;
+    } while (cursor);
+    let token = await twitchAppToken(env);
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      const url = "https://api.twitch.tv/helix/streams?first=100&" + chunk.map((x) => "user_id=" + encodeURIComponent(x)).join("&");
+      let res = await fetch(url, { headers: { Authorization: "Bearer " + token, "Client-Id": env.TWITCH_CLIENT_ID } });
+      if (res.status === 401) { twitchApp = null; token = await twitchAppToken(env); res = await fetch(url, { headers: { Authorization: "Bearer " + token, "Client-Id": env.TWITCH_CLIENT_ID } }); }
+      const d = await res.json();
+      const live = new Map();
+      for (const st of (d && Array.isArray(d.data) ? d.data : [])) if (st.type === "live")
+        live.set(String(st.user_id), { title: String(st.title || "").slice(0, 140), game: String(st.game_name || "").slice(0, 60), viewers: Number(st.viewer_count) || 0, startedAt: st.started_at || null });
+      for (const tid of chunk) {
+        const stream = live.get(tid) || null;
+        twitchLiveCache.set(tid, { at: Date.now(), stream }); // the profile's /social reply uses the same answer
+        if (!stream) continue;
+        const link = await r2json(env, `twitch/${tid}.json`, null).catch(() => null);
+        if (!link || !link.playerId) continue;
+        const rec = await record(env, link.playerId).catch(() => null);
+        if (!rec || !rec.twitch || rec.twitch.id !== tid || (rec.twitchPrefs && rec.twitchPrefs.show === false)) continue;
+        map[link.playerId] = { login: rec.twitch.login, name: rec.twitch.name || rec.twitch.login, ...stream };
+      }
+    }
+  } catch (e) { console.log("twitch live all", e && e.message); if (twitchLiveAllCache) return twitchLiveAllCache.map; }
+  twitchLiveAllCache = { at: Date.now(), map };
+  await twitchAnnounce(env, map).catch((e) => console.log("twitch announce", e && e.message));
+  return map;
+}
+
+/**
+ * (2.1.2) Someone just went live on Twitch: their friends and followers get a notice and it goes in their friends feed,
+ * once per stream (keyed by when it started, kept in R2 so every Worker copy agrees).
+ */
+async function twitchAnnounce(env, map) {
+  const fresh = [];
+  await r2update(env, "twitch/announced.json", () => ({ live: {} }), (d) => {
+    fresh.length = 0;
+    const was = d.live || {}, next = {};
+    for (const [id, st] of Object.entries(map)) {
+      const key = String(st.startedAt || "?");
+      next[id] = key;
+      if (was[id] === key) continue;
+      // found long after it started (the server was down, or this just shipped): no alert for an old stream
+      if (st.startedAt && Date.now() - Date.parse(st.startedAt) > 2 * 3_600_000) continue;
+      fresh.push(id);
+    }
+    if (JSON.stringify(was) === JSON.stringify(next)) return false;
+    d.live = next;
+  });
+  for (const id of fresh) {
+    const st = map[id];
+    if (!st || isOfficial(id) || moderation.bans[id]) continue;
+    const name = await rkName(env, id).catch(() => "Player");
+    const info = { login: st.login, title: String(st.title || "").slice(0, 140), game: String(st.game || "").slice(0, 60) };
+    await addFeed(env, id, { kind: "live", ...info }).catch(() => {});
+    // friends (the message server's list) and followers, each once
+    const to = new Set();
+    try { for (const f of ((await r2json(env, dmInboxKey(id), null)) || {}).friends || []) if (f && okPlayerId(f.id)) to.add(f.id); } catch { /* none */ }
+    try { for (const f of (await r2json(env, `followers/${id}.json`, { followers: [] })).followers || []) if (okPlayerId(f)) to.add(f); } catch { /* none */ }
+    to.delete(id);
+    for (const f of [...to].slice(0, 500)) await addNotice(env, f, { kind: "live", from: id, fromName: name, ...info }).catch(() => {});
+  }
 }
 
 let modChannel = null, modChannelAt = 0;
@@ -7963,10 +8041,12 @@ async function missionEvent(env, id, ev) {
 }
 
 /** Four new shop items every Ranked season, for sale only while it runs (owners keep them). */
+// Season n is month RK_SEASON0_MONTH + n (Season 0 = November 2026), so the list runs Nov, Dec, Jan... (2.1.2: Glacier moved
+// to December for the winter season, Cinder to June)
 const SEASON_THEMES = [
-  ["Borealis", "Chaser", "#3FE0C5", "#8A5CFF"], ["Cinder", "Heart", "#FF6A3D", "#FFC94D"], ["Tidal", "Rider", "#2E7BFF", "#3FE0C5"],
+  ["Borealis", "Chaser", "#3FE0C5", "#8A5CFF"], ["Glacier", "Soul", "#B9F2FF", "#3FA9FF"], ["Tidal", "Rider", "#2E7BFF", "#3FE0C5"],
   ["Bloom", "Dancer", "#FF8AD8", "#FFF06B"], ["Storm", "Caller", "#8FA8FF", "#FFFFFF"], ["Venom", "Fang", "#7CFF3D", "#1B1F5E"],
-  ["Dusk", "Walker", "#FF4FA3", "#2F5BFF"], ["Glacier", "Soul", "#B9F2FF", "#3FA9FF"], ["Solar", "Flare", "#FFC94D", "#FF2E00"],
+  ["Dusk", "Walker", "#FF4FA3", "#2F5BFF"], ["Cinder", "Heart", "#FF6A3D", "#FFC94D"], ["Solar", "Flare", "#FFC94D", "#FF2E00"],
   ["Nebula", "Drifter", "#A77BFF", "#FF6FB5"], ["Jade", "Spirit", "#1FCB76", "#FFF8E7"], ["Scarlet", "Tide", "#E0193A", "#FFB38A"],
 ];
 function seasonCollection(n) {
@@ -8026,7 +8106,15 @@ async function eventAdmin(env, who, b) {
     return `${r.name} (${when}): ${r.songs.length} songs, ${r.keys.length} charts.` + (r.songs.some((s) => !s.verified) ? " Some songs aren't verified: their plays aren't judged, so they don't count." : "");
   };
   if (action === "start") {
-    const name = cleanText(b.name, 40);
+    // (2.1.2) "2026-12-01 Winter Festival" sets it up to begin that day (midnight UTC) instead of now
+    let startAt = now, rawName = String(b.name || "");
+    const dated = /^\s*(\d{4}-\d{2}-\d{2})\s+(.+)$/.exec(rawName);
+    if (dated) {
+      const t = Date.parse(dated[1] + "T00:00:00Z");
+      if (!(t > now - 86_400_000 && t < now + 60 * 86_400_000)) fail(400, "The start date must be within the next 60 days (YYYY-MM-DD before the name).");
+      startAt = Math.max(now, t); rawName = dated[2];
+    }
+    const name = cleanText(rawName, 40);
     if (name.length < 3) fail(400, "Give the event a name (3 to 40 letters).");
     const days = Math.round(Number(b.days) || 0);
     if (!(days >= 1 && days <= 60)) fail(400, "An event runs 1 to 60 days.");
@@ -8034,12 +8122,13 @@ async function eventAdmin(env, who, b) {
     const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || "event";
     const pick = EVENT_COLORS[[...slug].reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) >>> 0, 7) % EVENT_COLORS.length];
     const color = /^#[0-9A-Fa-f]{6}$/.test(String(b.color || "")) ? String(b.color).toUpperCase() : pick[0];
-    ec = { id: `${slug}-${new Date(now).toISOString().slice(0, 10).replace(/-/g, "")}`, name, color, color2: color === pick[0] ? pick[1] : "#FFFFFF",
-      starts: new Date(now).toISOString(), ends: new Date(now + days * 86_400_000).toISOString(), items: [], by: who.playerId, at: new Date(now).toISOString() };
+    ec = { id: `${slug}-${new Date(startAt).toISOString().slice(0, 10).replace(/-/g, "")}`, name, color, color2: color === pick[0] ? pick[1] : "#FFFFFF",
+      starts: new Date(startAt).toISOString(), ends: new Date(startAt + days * 86_400_000).toISOString(), items: [], by: who.playerId, at: new Date(now).toISOString() };
     await save();
     await r2update(env, EVENT_ITEMS_KEY, () => ({ items: [] }), (d) => { d.items ||= []; const have = new Set(d.items.map((x) => x.id)); for (const x of eventRewardItems(ec)) if (!have.has(x.id)) d.items.push(x); });
     eventItemsAt = 0;
-    return { ok: true, text: `${name} started: ${days} days. Add its songs with /event add <Workshop link or id>, then /event announce.` };
+    const when = startAt > now + 60_000 ? `set to start ${new Date(startAt).toISOString().slice(0, 10)}` : "started";
+    return { ok: true, text: `${name} ${when}: ${days} days. Add its songs with /event add <Workshop link or id>, then /event announce.` };
   }
   if (!ec) fail(404, "There's no event. Start one: /event start <days> <name>");
   if (action === "add" || action === "remove") {

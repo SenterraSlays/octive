@@ -1951,3 +1951,7 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
   .pf-liveslot { width: auto; flex: 0 1 340px; justify-content: flex-start; }
   .pf-liveslot .pf-live { max-width: 340px; }
 }
+
+/* ---- 2.1.2: the live mark on every online dot (lists, rankings, podiums, crews) */
+.avatar .dot.live { width: 17px; height: 17px; right: -5px; bottom: -5px; }
+.lb-pod .avatar .dot.live { width: 22px; height: 22px; right: -6px; bottom: -6px; }

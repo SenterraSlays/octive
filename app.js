@@ -107,8 +107,32 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       dot.classList.toggle("on", !!p.online);
       dot.title = statusText(p);
       dot.classList.toggle("site", !!p.online && p.status === "site");
+      liveDots.set(dot, p);
+      paintLiveDot(dot, p);
     }
   }
+
+  // (2.1.2) who's live on Twitch right now: the play mark stands in for their online dot everywhere (checked every minute)
+  let LIVE_NOW = {};
+  const liveDots = new Map(); // dot -> its player (dots that left the page are dropped on the next check)
+  function paintLiveDot(dot, p) {
+    const lv = p && LIVE_NOW[p.id];
+    if (lv) {
+      dot.hidden = false; dot.classList.add("live"); dot.innerHTML = LIVE_SVG;
+      dot.title = "Live on Twitch" + (lv.title ? ": " + lv.title : "");
+    } else if (dot.classList.contains("live") && !dot.dataset.profileLive) {
+      dot.classList.remove("live"); dot.innerHTML = ""; dot.title = statusText(p);
+    }
+  }
+  async function loadLiveNow() {
+    try {
+      const r = await fetch(WORKER_URL.replace(/\/+$/, "") + "/social/live");
+      if (r.ok) LIVE_NOW = (await r.json()).live || {};
+    } catch { /* keep the last answer */ }
+    for (const [dot, p] of liveDots) { if (!dot.isConnected) { liveDots.delete(dot); continue; } paintLiveDot(dot, p); }
+  }
+  loadLiveNow();
+  setInterval(loadLiveNow, 60_000);
 
   function roleOf(p) {
     if (ROLES[p.id]) return { ...ROLES[p.id], cls: "dev" };
@@ -2092,7 +2116,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function markLive(card, avatar, tw) {
     if (!tw || !tw.live || !card.isConnected) return;
     const dot = avatar.querySelector(".dot");
-    if (dot) { dot.hidden = false; dot.classList.add("live"); dot.innerHTML = LIVE_SVG; dot.title = "Live on Twitch"; }
+    if (dot) { dot.hidden = false; dot.classList.add("live"); dot.innerHTML = LIVE_SVG; dot.title = "Live on Twitch"; dot.dataset.profileLive = "1"; }
     const url = `https://www.twitch.tv/${tw.login}`;
     const mins = tw.live.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(tw.live.startedAt)) / 60000)) : null;
     const since = mins == null ? "" : mins < 60 ? `${mins} min` : `${Math.floor(mins / 60)} h ${mins % 60} min`;
