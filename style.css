@@ -1955,3 +1955,49 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 /* ---- 2.1.2: the live mark on every online dot (lists, rankings, podiums, crews) */
 .avatar .dot.live { width: 17px; height: 17px; right: -5px; bottom: -5px; }
 .lb-pod .avatar .dot.live { width: 22px; height: 22px; right: -6px; bottom: -6px; }
+
+/* ---- 2.1.2: Workshop likes and reviews (same data as the game) */
+.btn.ws-like { display: inline-flex; align-items: center; gap: 7px; }
+.btn.ws-like svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; }
+.btn.ws-like.on { color: #fff; background: linear-gradient(135deg, #ff4d9d, #ff7ab8); border-color: transparent; box-shadow: 0 8px 22px -10px #ff4d9d; }
+.btn.ws-like.on svg { fill: #fff; stroke: #fff; }
+@media (hover: hover) and (prefers-reduced-motion: no-preference) { .btn.ws-like:active svg { transform: scale(1.25); } .btn.ws-like svg { transition: transform .15s; } }
+.wsi-chip.likes { --c: var(--pink, #ff6fae); } .wsi-chip.revs { --c: var(--purple); }
+.wsi-reviews h2 { margin: 0; }
+.rv-signin { margin: 0; color: var(--dim); }
+.rv-form { display: flex; flex-direction: column; gap: 8px; }
+.rv-text { width: 100%; resize: vertical; min-height: 72px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: #0000002e; color: inherit; font: inherit; }
+.rv-text:focus { outline: 2px solid #ff4d9d66; border-color: transparent; }
+.rv-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rv-grow { flex: 1; }
+.rv-left, .rv-when { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.rv-msg { color: #ff7a8a; font-size: 13px; }
+.rv-pick { display: inline-flex; gap: 2px; }
+.rv-pick button { background: none; border: 0; padding: 0 2px; font-size: 20px; line-height: 1; cursor: pointer; color: #ffffff2e; transition: color .12s, transform .12s; }
+.rv-pick button.on { color: var(--yellow, #f2c14e); }
+@media (hover: hover) { .rv-pick button:hover { transform: scale(1.15); } }
+.rv-list { display: flex; flex-direction: column; gap: 10px; }
+.rv-card { padding: 12px 14px; border-radius: 12px; background: #ffffff07; border: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+.rv-card.mine { border-color: #ff4d9d55; background: linear-gradient(90deg, #ff4d9d10, transparent 60%), #ffffff07; }
+.rv-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rv-name { font-weight: 700; color: inherit; }
+.rv-stars { color: var(--yellow, #f2c14e); letter-spacing: 1px; font-size: 13px; }
+.rv-stars i { font-style: normal; color: #ffffff26; }
+.rv-body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text, #e8e6f5); }
+.rv-body.clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.rv-more { align-self: flex-start; background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font: inherit; font-size: 13px; }
+.rv-show { align-self: center; }
+/* home: Most liked charts (in Top players' place) */
+.hm-liked a { grid-template-columns: 38px 44px minmax(0, 1fr) auto; }
+.hm-cover { width: 44px; height: 32px; border-radius: 6px; overflow: hidden; background: #ffffff10; display: block; }
+.hm-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.hm-liked .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 700; }
+.hm-by { flex: 0 0 100%; color: var(--faint); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hm-likes { color: var(--pink, #ff6fae); }
+.site-toast { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); z-index: 60; padding: 10px 18px; border-radius: 999px; background: #1d1a2e; border: 1px solid #ff4d9d66; color: #fff; font-weight: 600; box-shadow: 0 12px 30px -12px #000; transition: opacity .4s, transform .4s; }
+.site-toast.out { opacity: 0; transform: translate(-50%, 8px); }
+.rv-head { flex-wrap: nowrap; min-width: 0; }
+.rv-head .rv-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex-shrink: 1; }
+.rv-head .rv-when { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex-shrink: 2; }
+.rv-head .rv-stars, .rv-head .rv-del { flex-shrink: 0; }
+.rv-head .rv-name { flex-shrink: 0; max-width: 55%; }

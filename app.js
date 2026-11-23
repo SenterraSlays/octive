@@ -926,20 +926,26 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("div.section-head", {}, h("h2.section-title", { text: "New in the Workshop" }), h("a.more", { href: "#/workshop" }, "See all")),
       shelf);
 
-    const top = h("ol.hm-top", {}, players.slice(0, 8).map((p) => {
-      const a = h("a", { href: "#/u/" + encodeURIComponent(p.id), "data-place": p.rank },
-        h("span.hm-rank", { text: "#" + p.rank }),
-        h("span.avatar", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial"), h("span.dot", { hidden: true })),
-        h("span.hm-who", {}, h("span.name", { text: p.name || "Player" }), h("span.badge", { hidden: true })),
-        h("span.hm-pr", { text: fmt0.format(p.pp || 0) + " PR" }));
-      setAvatar(a.querySelector(".avatar"), p);
-      setRole(a, a.querySelector(".badge"), p);
-      addLbIcon(a.querySelector(".name"), p.id);
-      return h("li", {}, a);
-    }));
+    // (2.1.2) the charts players like most (the same likes as the game's Workshop), where Top players used to be
+    const liked = h("ol.hm-top.hm-liked", {}, h("p.empty", { text: "Loading…" }));
     const board = h("div.hm-col", {},
-      h("div.section-head", {}, h("h2.section-title", { text: "Top players" }), h("a.more", { href: "#/rankings" }, "Full ranking")),
-      players.length ? top : h("p.empty", { text: data ? "Nobody is ranked yet." : "Loading the ranking…" }));
+      h("div.section-head", {}, h("h2.section-title", { text: "Most liked charts" }), h("a.more", { href: "#/workshop?sort=liked" }, "Workshop")),
+      liked);
+    fetch(worker + "/api/items?type=charts&sort=liked", { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+      if (!liked.isConnected) return;
+      const items = ((d && d.items) || []).filter((x) => (x.likes || 0) > 0).slice(0, 8);
+      if (!items.length) { liked.replaceChildren(h("p.empty", { text: "No likes yet: like a chart in the Workshop, here or in the game." })); return; }
+      liked.replaceChildren(...items.map((x, i) => {
+        const pic = h("span.hm-cover");
+        if (x.preview) { const img = h("img", { src: x.preview, alt: "", loading: "lazy" }); img.onerror = () => img.remove(); pic.append(img); }
+        return h("li", {}, h("a", { href: "#/workshop/" + x.id, "data-place": i + 1 },
+          h("span.hm-rank", { text: "#" + (i + 1) }),
+          pic,
+          h("span.hm-who", {}, h("span.name", { text: x.title, title: x.title }),
+            h("span.hm-by", { text: [x.creator ? "by " + x.creator : "", x.topStars > 0 ? "★ " + x.topStars.toFixed(2) : "", x.verified ? "✓ verified" : ""].filter(Boolean).join(" · ") })),
+          h("span.hm-pr.hm-likes", { title: `${fmt0.format(x.likes)} like${x.likes === 1 ? "" : "s"}` }, "♥ " + fmt0.format(x.likes))));
+      }));
+    });
     const about = h("div.hm-col", {},
       h("div.section-head", {}, h("h2.section-title", { text: "What's in the game" })),
       h("dl.hm-list", {}, ABOUT.map(([t, d]) => h("div", {}, h("dt", { text: t }), h("dd", { text: d })))));
@@ -1027,7 +1033,9 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           (it.keys || []).length ? h("span", { text: (it.topPR > 0 ? " · " : "") + it.keys.map((k) => k + "K").join(" ") }) : null) : null,
         wsTagChips(it),
         h("p.ws-desc", { text: it.description || "", title: it.description || undefined }),
-        h("span.ws-meta", { text: `${kb.toFixed(kb < 1 ? 2 : 1)} MB · ${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"} · ${new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })}` }),
+        h("span.ws-meta", { text: [`${kb.toFixed(kb < 1 ? 2 : 1)} MB`, `${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"}`,
+          it.likes ? `♥ ${fmt0.format(it.likes)}` : "", it.reviews ? `${fmt0.format(it.reviews)} review${it.reviews === 1 ? "" : "s"}` : "",
+          new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })].filter(Boolean).join(" · ") }),
         h("div.ws-actions", {},
           h("a.btn.primary.small", { href: `${worker}/api/download/${it.id}?redirect=1` }, "Download"),
           h("a.btn.small.ws-open", { href: `octive://workshop/${it.id}`, title: "Opens OCTIVE (starting it if it's closed), goes to the Workshop and gets this", onclick: () => openHint() }, "Open in OCTIVE"))));
@@ -1069,12 +1077,15 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function workshopPage() {
     const one = (location.hash.match(/^#\/workshop\/([a-z0-9]{16,40})/) || [])[1];
     if (one) { workshopItemPage(one); return; }
+    // #/workshop?sort=liked (the home page's Most liked charts link)
+    const wantSort = new URLSearchParams((location.hash.split("?")[1] || "")).get("sort");
+    if (wantSort && /^(new|popular|liked|hardest|easiest|pr|title|oldest)$/.test(wantSort)) { wsSort = wantSort; wsType = "charts"; }
     document.title = "Workshop · OCTIVE";
     const tabs = h("div.ws-tabs");
     const grid = h("div.ws-grid", {}, h("p.empty", { text: "Loading…" }));
     const status = h("p.ws-status");
     const search = h("input.help-search.ws-search", { type: "search", placeholder: "Search titles and creators…", value: wsQuery });
-    const sort = h("select.ws-sort", {}, h("option", { value: "new", text: "Newest" }), h("option", { value: "popular", text: "Most downloaded" }),
+    const sort = h("select.ws-sort", {}, h("option", { value: "new", text: "Newest" }), h("option", { value: "popular", text: "Most downloaded" }), h("option", { value: "liked", text: "Most liked" }),
       h("option", { value: "hardest", text: "Stars: highest" }), h("option", { value: "easiest", text: "Stars: lowest" }), h("option", { value: "pr", text: "Most PR" }),
       h("option", { value: "title", text: "Title (A–Z)" }), h("option", { value: "oldest", text: "Oldest" }));
     sort.value = wsSort;
@@ -1169,6 +1180,11 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const keys = [...new Set(charts.map((c) => c.keys).filter(Boolean))].sort((a, b) => a - b);
       const date = (t) => new Date(t).toLocaleDateString(undefined, { dateStyle: "medium" });
       const isSong = it.type === "charts";
+      // (2.1.2) likes and reviews: the same data the game shows (/api/items/<id>/reviews, like, review, unreview)
+      const social = { likes: it.likes || 0, liked: false, reviews: [], count: it.reviews || 0, mine: null, loaded: false };
+      const likeChip = h("span.wsi-chip.likes", { title: "Likes" });
+      const revChip = h("span.wsi-chip.revs", { title: "Reviews" });
+      const likeBtn = h("button.btn.ws-like", { type: "button" });
 
       // the banner: the picture sharp on the left and blurred behind everything
       const pic = h("div.wsi-pic" + (it.type === "skins" || it.type === "styles" ? ".contain" : ""));
@@ -1184,6 +1200,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         songs.length === 1 && sg0.durationUs ? chip(fmtLength(sg0.durationUs), "Length", "len") : null,
         songs.length > 1 ? chip(`${songs.length} songs`, "A pack", "len") : null,
         chip(`${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"}`, "Downloads", "dl"),
+        likeChip, revChip,
         chip(`${kb.toFixed(kb < 1 ? 2 : 1)} MB`, "Size", "size"));
       const tagList = [...new Set([...(it.tags || []), ...charts.flatMap((c) => c.autoTags || [])])];
       const own = new Set(it.tags || []);
@@ -1197,6 +1214,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           stats, tags,
           h("div.wsi-actions", {},
             h("a.btn.primary", { href: `octive://workshop/${it.id}`, onclick: () => openHint() }, "Open in OCTIVE"),
+            likeBtn,
             h("a.btn", { href: `${worker}/api/download/${it.id}?redirect=1` }, (it.fileNames || []).length > 1 ? "Download (first song)" : "Download"),
             it.discord ? h("a.btn.discord", { href: it.discord, target: "_blank", rel: "noopener" }, h("img", { src: "discord.png", alt: "" }), "On Discord") : null)));
 
@@ -1235,11 +1253,123 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           osuSet ? row("osu!", h("a", { href: `https://osu.ppy.sh/beatmapsets/${osuSet}`, target: "_blank", rel: "noopener" }, "Beatmap page ↗")) : null,
           it.type === "skins" || it.type === "styles" ? row("Editing", it.customizable ? "Customizable in the skin maker" : "🔒 Only its maker") : null));
 
+      const reviews = h("section.panel.wsi-reviews", {});
       box.replaceChildren(hero,
         h("div.wsi-grid", {},
-          h("div.wsi-main", {}, it.description ? h("section.panel.wsi-about", {}, h("h2", { text: "About" }), h("p", { text: it.description })) : null, songs.length ? diffs : null),
+          h("div.wsi-main", {}, it.description ? h("section.panel.wsi-about", {}, h("h2", { text: "About" }), h("p", { text: it.description })) : null, songs.length ? diffs : null, reviews),
           info));
+      wsSocial(it, social, { likeBtn, likeChip, revChip, reviews, date });
     });
+  }
+
+  /** A short message at the bottom of the screen (review posted, something went wrong). */
+  function toast(text) {
+    document.querySelector(".site-toast")?.remove();
+    const t = h("div.site-toast", { role: "status", text });
+    document.body.append(t);
+    setTimeout(() => t.classList.add("out"), 2600);
+    setTimeout(() => t.remove(), 3100);
+  }
+
+  const HEART_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 4.5 6.7 4.5c2.1 0 3.6 1.1 4.3 2.4.7-1.3 2.2-2.4 4.3-2.4 3.7 0 5.8 3.9 4.3 7.3C19.5 16.4 12 21 12 21z"/></svg>';
+  const signedInHere = () => !!(store.get("octive.token", true) || store.get("octive.session"));
+  /** The signed-in player (loaded once), for "your review" and the moderator's remove button. */
+  async function meNow() {
+    if (me || !signedInHere()) return me;
+    try { if (!store.get("octive.token", true)) await refreshSession(); me = await callApi("me", undefined, true); updateAccountNav(); } catch { /* signed out */ }
+    return me;
+  }
+  /** Senterra, the official account and moderators may remove anyone's review (the server checks it too). */
+  const canModerate = (m) => !!m && (m.playerId === ROLE_OWNER || m.playerId === OFFICIAL_ID || findPlayer(m.playerId)?.role === "MOD");
+
+  /** An upload's Like button and Reviews panel, kept in step with the game's (same server data). */
+  function wsSocial(it, s, ui) {
+    const { likeBtn, likeChip, revChip, reviews, date } = ui;
+    let shown = 5, busy = false;
+    const paintCounts = () => {
+      likeChip.textContent = `♥ ${fmt0.format(s.likes)} like${s.likes === 1 ? "" : "s"}`;
+      revChip.textContent = `${fmt0.format(s.count)} review${s.count === 1 ? "" : "s"}`;
+      likeBtn.innerHTML = HEART_SVG;
+      likeBtn.append(` ${s.liked ? "Liked" : "Like"} · ${fmt0.format(s.likes)}`);
+      likeBtn.classList.toggle("on", s.liked);
+      likeBtn.title = !signedInHere() ? "Sign in to like it" : s.liked ? "You like this. Press again to take it back." : "Like it (the uploader is told once)";
+    };
+    likeBtn.addEventListener("click", async () => {
+      if (!signedInHere()) { location.hash = "#/account"; return; }
+      if (busy) return;
+      busy = true;
+      const was = { likes: s.likes, liked: s.liked };
+      s.liked = !s.liked; s.likes = Math.max(0, s.likes + (s.liked ? 1 : -1)); paintCounts();   // answer at once, fix it after
+      try { const r = await callApi(`/api/items/${it.id}/like`, { like: s.liked }, true); s.likes = r.likes ?? s.likes; s.liked = r.liked ?? s.liked; }
+      catch (e) { Object.assign(s, was); toast(e.message); }
+      busy = false; paintCounts();
+    });
+    const load = async () => {
+      let r = null;
+      try { r = await callApi(`/api/items/${it.id}/reviews`, undefined, signedInHere()); }
+      catch { try { r = await callApi(`/api/items/${it.id}/reviews`); } catch { /* offline */ } }
+      if (r) Object.assign(s, { likes: r.likes || 0, liked: !!r.liked, reviews: r.reviews || [], count: r.count || 0, mine: r.mine || null, loaded: true });
+      await meNow();
+      paintCounts(); paintReviews();
+    };
+    const stars = (n) => h("span.rv-stars", { title: `${n} star${n === 1 ? "" : "s"}` }, "★".repeat(n), h("i", { text: "★".repeat(5 - n) }));
+    function form() {
+      if (!signedInHere()) return h("p.rv-signin", {}, h("a", { href: "#/account" }, "Sign in"), " to like it and write a review.");
+      let rating = s.mine?.rating || 0;
+      const text = h("textarea.rv-text", { maxlength: 300, rows: 3, placeholder: s.mine ? "Change your review" : "A short review (up to 300 letters)" });
+      text.value = s.mine?.text || "";
+      const left = h("span.rv-left");
+      const paintLeft = () => { left.textContent = `${text.value.length}/300`; };
+      text.addEventListener("input", paintLeft); paintLeft();
+      const pick = h("span.rv-pick", { title: "Stars (optional): press the same star again to clear them" });
+      const paintPick = () => pick.replaceChildren(...[1, 2, 3, 4, 5].map((i) => h("button" + (i <= rating ? ".on" : ""), { type: "button", "aria-label": `${i} star${i === 1 ? "" : "s"}`, onclick: () => { rating = rating === i ? 0 : i; paintPick(); } }, "★")));
+      paintPick();
+      const msg = h("span.rv-msg");
+      const post = h("button.btn.primary.small", { type: "button" }, s.mine ? "Update" : "Post");
+      post.addEventListener("click", async () => {
+        if (!text.value.trim()) { msg.textContent = "Write something first."; return; }
+        post.disabled = true; msg.textContent = "";
+        try {
+          const body = { text: text.value };
+          if (rating > 0) body.rating = rating;
+          await callApi(`/api/items/${it.id}/review`, body, true);
+          toast("Review posted.");
+          await load();
+        } catch (e) { msg.textContent = e.message; post.disabled = false; }
+      });
+      const del = s.mine ? h("button.btn.ghost.small", { type: "button" }, "Delete mine") : null;
+      if (del) del.addEventListener("click", () => remove(s.mine.by, del));
+      return h("div.rv-form", {}, text, h("div.rv-row", {}, pick, left, h("span.rv-grow"), msg, del, post));
+    }
+    async function remove(by, btn) {
+      const own = me && by === me.playerId;
+      if (!confirm(own ? "Delete your review?" : "Remove this review? (moderator)")) return;
+      if (btn) btn.disabled = true;
+      try { await callApi(`/api/items/${it.id}/unreview`, { by }, true); await load(); }
+      catch (e) { toast(e.message); if (btn) btn.disabled = false; }
+    }
+    function card(r) {
+      const own = me && r.by === me.playerId;
+      const long = (r.text || "").length > 220;
+      const body = h("p.rv-body" + (long ? ".clamp" : ""), { text: r.text || "" });
+      const head = h("div.rv-head", {},
+        h("a.rv-name", { href: "#/u/" + encodeURIComponent(r.by || ""), text: r.name || "Player" }),
+        r.rating ? stars(r.rating) : null,
+        h("span.rv-when", { text: date(r.at) + (r.edited ? " · edited" : "") }),
+        h("span.rv-grow"),
+        own || canModerate(me) ? h("button.btn.ghost.small.rv-del", { type: "button", title: own ? "Delete your review" : "Remove this review (moderator)", onclick: (e) => remove(r.by, e.currentTarget) }, own ? "Delete" : "Remove") : null);
+      const more = long ? h("button.rv-more", { type: "button", onclick: (e) => { body.classList.remove("clamp"); e.currentTarget.remove(); } }, "Read all") : null;
+      return h("article.rv-card" + (own ? ".mine" : ""), {}, head, body, more);
+    }
+    function paintReviews() {
+      const list = s.reviews.slice(0, shown);
+      reviews.replaceChildren(
+        h("h2", { text: s.count ? `Reviews · ${fmt0.format(s.count)}` : "Reviews" }),
+        form(),
+        !s.loaded ? h("p.empty", { text: "Loading reviews…" }) : !s.reviews.length ? h("p.empty", { text: "No reviews yet: be the first." }) : h("div.rv-list", {}, list.map(card)),
+        s.reviews.length > shown ? h("button.btn.small.rv-show", { type: "button", onclick: () => { shown += 5; paintReviews(); } }, `Show more (${fmt0.format(s.reviews.length - shown)} left)`) : null);
+    }
+    paintCounts(); paintReviews(); load();
   }
 
   const fmtLength = (us) => { const s = Math.round(us / 1e6); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
