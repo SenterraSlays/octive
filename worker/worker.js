@@ -3083,6 +3083,16 @@ const BOARD_SIZE = 100;
 const SCORE_MAX = 2_000_000_000; // 2.1.1: points per judgement, no cap (350 a note at most)
 // ---- 2.1.1 scores: points per judgement. Saves from older games (no scoreVersion) are worked out again on read.
 const SCORE_POINTS_W = [350, 300, 250, 200, 100, 0];
+/** (2.1.2) Showcase plays saved before the 2.1.1 score change hold the old 0-1,000,000 score: shown in the new points,
+ *  worked out from their hit counts (pv marks ones already in points). */
+function showcasePoints(list) {
+  if (!Array.isArray(list)) return list;
+  return list.map((x) => {
+    if (!x || x.kind !== "song" || Number(x.pv) >= 1) return x;
+    const pts = pointsOf(x.counts);
+    return pts == null ? x : { ...x, score: pts, pv: 1 };
+  });
+}
 function pointsOf(counts) {
   if (!Array.isArray(counts)) return null;
   let s = 0, n = 0;
@@ -6328,7 +6338,7 @@ async function walletUpdate(env, id, change) {
 const remember = (w, entry) => { w.history = [{ ...entry, at: new Date().toISOString() }, ...(w.history || [])].slice(0, 60); };
 const infinitePoints = (id) => id === OWNER || isOfficial(id);
 function walletPublic(w, id) {
-  return { infinite: id ? infinitePoints(id) || undefined : undefined, balance: w.balance, earned: w.earned, streak: w.streak, bestStreak: w.bestStreak, lastDay: w.lastDay, freezes: w.freezes, owned: w.owned, equipped: w.equipped, showcase: w.showcase, dans: w.dans, history: (w.history || []).slice(0, 30) };
+  return { infinite: id ? infinitePoints(id) || undefined : undefined, balance: w.balance, earned: w.earned, streak: w.streak, bestStreak: w.bestStreak, lastDay: w.lastDay, freezes: w.freezes, owned: w.owned, equipped: w.equipped, showcase: showcasePoints(w.showcase), dans: w.dans, history: (w.history || []).slice(0, 30) };
 }
 
 let cosmeticsCache = null, cosmeticsAt = 0;
@@ -6353,7 +6363,7 @@ async function writeCosmetics(env, id, w) {
   const hd = highestDanClear(w);
   const best = hd ? DAN_LEVELS.indexOf(hd.level) : -1;
   const e = { title: w.equipped.title || undefined, frame: w.equipped.frame || undefined, icon: w.equipped.icon || undefined, titleColor: w.equipped.titleColor || undefined, iconColor: w.equipped.iconColor || undefined, iconsV2: w.iconsV2 || undefined, hasShowcase: (w.owned || []).includes("showcase") || undefined,
-    showcase: (w.showcase || []).length ? w.showcase : undefined, dan: best >= 0 ? DAN_LEVELS[best] : undefined, danClear: hd ? danClearPublic(hd.d) : undefined, dans: Object.keys(w.dans || {}).length || undefined,
+    showcase: (w.showcase || []).length ? showcasePoints(w.showcase) : undefined, dan: best >= 0 ? DAN_LEVELS[best] : undefined, danClear: hd ? danClearPublic(hd.d) : undefined, dans: Object.keys(w.dans || {}).length || undefined,
     crew: w.crew && w.crew.id ? { id: w.crew.id, tag: w.crew.tag, color: w.crew.color } : undefined };
   const empty = Object.values(e).every((v) => v === undefined);
   await r2update(env, COSMETICS_KEY, () => ({ players: {} }), (d) => { d.players ||= {}; if (empty) delete d.players[id]; else d.players[id] = e; });
@@ -9289,8 +9299,11 @@ async function playRoutes(request, env, url) {
         const c = scores[`${songId}/${chartId}`];
         if (!c) fail(400, "That song isn't in your synced scores yet. Wait a moment for the sync and try again.");
         // the score they picked, from their own synced plays (its details are copied from there, not from the request)
+        // (2.1.2) found by its date: picks saved before the 2.1.1 score change still send their old 0-1,000,000 score,
+        // which never matched the converted synced plays (so no showcase could be changed); the score only breaks a tie
         const date = String(p.date || ""), want = Math.round(Number(p.score) || 0);
-        const play = (Array.isArray(c.top) ? c.top : []).find((x) => x && String(x.date) === date && Math.round(Number(x.score) || 0) === want);
+        const same = (Array.isArray(c.top) ? c.top : []).filter((x) => x && String(x.date) === date);
+        const play = same.find((x) => Math.round(Number(x.score) || 0) === want) || same[0];
         if (!play) fail(400, "That score isn't in your synced scores yet. Wait a moment for the sync and try again.");
         const num = (v, lo, hi) => { const n = Number(v); return Number.isFinite(n) && n >= lo && n <= hi ? n : 0; };
         const r2 = (n) => Math.round(n * 100) / 100;
@@ -9304,7 +9317,7 @@ async function playRoutes(request, env, url) {
           keys: num(c.keyCount || play.keyCount, 0, 20), score: Math.round(num(play.score, 0, SCORE_MAX)), acc: r2(num(play.accuracy, 0, 100)), grade: String(play.grade || "").replace(/[^A-Z+]/g, "").slice(0, 3),
           maxCombo: Math.round(num(play.maxCombo, 0, V.maxCombo)), fullCombo: !!play.fullCombo,
           counts: Array.isArray(play.counts) ? play.counts.slice(0, 6).map((n) => Math.round(num(n, 0, 1_000_000))) : [],
-          mods: String(play.mods || "").replace(/[^A-Za-z0-9. ]/g, "").slice(0, 40), pp: r2(num(play.pp, 0, playPRMax(V.maxStars))), stars: r2(num(play.stars || c.stars, 0, V.maxStars)), date: date.slice(0, 40),
+          mods: String(play.mods || "").replace(/[^A-Za-z0-9. ]/g, "").slice(0, 40), pp: r2(num(play.pp, 0, playPRMax(V.maxStars))), stars: r2(num(play.stars || c.stars, 0, V.maxStars)), date: date.slice(0, 40), pv: 1,
           workshopId: ws ? ws.id : undefined, osuSet: osuSet || undefined,
           cover: ws && ws.preview ? `${WORKER_BASE}/api/preview/${ws.id}` : osuSet ? `https://assets.ppy.sh/beatmaps/${osuSet}/covers/card.jpg` : undefined,
         });
@@ -9325,7 +9338,7 @@ async function playRoutes(request, env, url) {
       let doc = await r2json(env, COSMETICS_KEY, { players: {} });
       if (!doc.danClears) doc = await backfillDanClears(env, doc).catch((err) => { console.log("dan clears", err && err.message); return doc; });
       const raw = doc.players || {};
-      cosmeticsCache = Object.fromEntries(Object.entries(raw).map(([k, e]) => [k, iconsV2Entry(e)]));
+      cosmeticsCache = Object.fromEntries(Object.entries(raw).map(([k, e]) => { const x = iconsV2Entry(e); return [k, x && x.showcase ? { ...x, showcase: showcasePoints(x.showcase) } : x]; }));
       cosmeticsAt = Date.now();
     }
     return reply({ players: cosmeticsCache });
