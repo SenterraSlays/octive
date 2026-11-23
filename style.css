@@ -1878,3 +1878,28 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
   .update::before { left: -26px; }
   .update.latest::before { left: -28px; }
 }
+
+/* ---- 2.1.1: a linked Twitch channel on profiles */
+.fc-twitch { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 12px; text-decoration: none; color: #e6d9ff;
+  background: rgba(145, 70, 255, .16); border: 1px solid rgba(145, 70, 255, .55); font-size: 13px; transition: background .15s, transform .15s; }
+.fc-twitch .tw-logo { background: #9146ff; color: #fff; font-weight: 700; font-size: 12px; padding: 1px 6px; border-radius: 6px; }
+.fc-twitch .tw-check { color: #b38bff; font-weight: 700; }
+@media (hover: hover) and (prefers-reduced-motion: no-preference) { .fc-twitch:hover { background: rgba(145, 70, 255, .3); transform: translateY(-1px); } }
+
+/* ---- 2.1.1: streaming on Twitch right now */
+.dot.live { background: transparent; border: 0; padding: 0; overflow: visible; }
+.dot.live svg { width: 100%; height: 100%; display: block; filter: drop-shadow(0 0 3px rgba(0, 0, 0, .6)); }
+.card-avatar .dot.live { width: 30px; height: 30px; right: -9px; bottom: -9px; }
+.pf-live { display: flex; align-items: center; gap: 12px; margin-top: 10px; padding: 10px 14px; border-radius: 14px; text-decoration: none; color: #fff; max-width: 560px;
+  background: linear-gradient(90deg, rgba(106, 51, 153, .55), rgba(145, 70, 255, .22)); border: 1px solid rgba(170, 110, 255, .7); transition: transform .15s, box-shadow .15s; }
+.pf-live-mark { width: 34px; height: 34px; flex: none; animation: pf-live-pulse 1.6s ease-in-out infinite; }
+.pf-live-mark svg { width: 100%; height: 100%; display: block; }
+.pf-live-text { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.pf-live-text b { font-size: 13px; letter-spacing: 1.5px; color: #e9dcff; }
+.pf-live-text span { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pf-live-text small { font-size: 12px; color: #cdb8f5; }
+.pf-live-watch { flex: none; padding: 8px 14px; border-radius: 10px; background: #9146ff; font-weight: 700; font-size: 13px; }
+@keyframes pf-live-pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.08); } }
+@media (hover: hover) and (prefers-reduced-motion: no-preference) { .pf-live:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(145, 70, 255, .35); } }
+@media (prefers-reduced-motion: reduce) { .pf-live-mark { animation: none; } }
+@media (max-width: 600px) { .pf-live { flex-wrap: wrap; } .pf-live-watch { width: 100%; text-align: center; } }

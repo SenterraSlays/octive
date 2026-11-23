@@ -2212,6 +2212,19 @@ async function account(request, env, route) {
       verIdx = null; danIdx = null; // the verified-copy check, dans and dailies read the uploads' verified flag
       return reply({ ok: true, verified: on, count: Object.keys(out?.songs || {}).length });
     }
+    case "mod/unlink-twitch": {
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      await modGate(env, who, String(b.playerId || ""));
+      const id = String(b.playerId || "");
+      if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
+      const rec = await record(env, id);
+      if (!rec.twitch?.id) fail(400, "They haven't linked a Twitch.");
+      await env.RELEASES.delete(`twitch/${rec.twitch.id}.json`);
+      delete rec.twitch; delete rec.twitchPrefs;
+      await saveRecord(env, id, rec);
+      return reply({ ok: true });
+    }
     case "mod/unlink-discord": {
       const b = await bodyOf(request);
       const who = await signedIn(request, env);
@@ -2290,6 +2303,40 @@ async function account(request, env, route) {
       rec.discordPrefs = p;
       await saveRecord(env, who.playerId, rec);
       return reply({ ok: true, prefs: { dmAlerts: !!p.dmAlerts, updates: !!p.updates, show: !!p.show, streak: p.streak !== false }, note });
+    }
+    // ---- (2.1.1) Twitch: linked with Twitch's own sign-in (not typed in), so the channel is really the player's
+    case "twitch/start": {
+      await bodyOf(request);
+      const who = await signedIn(request, env);
+      if (!env.TWITCH_CLIENT_ID || !env.TWITCH_CLIENT_SECRET) fail(503, "Twitch linking isn't set up on the server yet.");
+      const state = [...crypto.getRandomValues(new Uint8Array(20))].map((x) => x.toString(16).padStart(2, "0")).join("");
+      await r2put(env, `twitch/state/${state}.json`, { playerId: who.playerId, exp: Date.now() + 15 * 60_000 });
+      const q = new URLSearchParams({ response_type: "code", client_id: env.TWITCH_CLIENT_ID, redirect_uri: twitchRedirect(request), scope: "", state, force_verify: "true" });
+      return reply({ url: "https://id.twitch.tv/oauth2/authorize?" + q.toString() });
+    }
+    case "twitch/status": {
+      await bodyOf(request);
+      const who = await signedIn(request, env);
+      const rec = await record(env, who.playerId);
+      return reply({ linked: rec.twitch?.id ? { login: rec.twitch.login, name: rec.twitch.name || rec.twitch.login, at: rec.twitch.at } : null, show: rec.twitchPrefs?.show !== false, ready: !!(env.TWITCH_CLIENT_ID && env.TWITCH_CLIENT_SECRET) });
+    }
+    case "twitch/prefs": {
+      const b = await bodyOf(request);
+      const who = await signedIn(request, env);
+      const rec = await record(env, who.playerId);
+      if (!rec.twitch?.id) fail(400, "Link your Twitch first.");
+      rec.twitchPrefs = { ...(rec.twitchPrefs || {}), show: b.show !== false };
+      await saveRecord(env, who.playerId, rec);
+      return reply({ ok: true, show: rec.twitchPrefs.show });
+    }
+    case "twitch/unlink": {
+      await bodyOf(request);
+      const who = await signedIn(request, env);
+      const rec = await record(env, who.playerId);
+      if (rec.twitch?.id) await env.RELEASES.delete(`twitch/${rec.twitch.id}.json`);
+      delete rec.twitch; delete rec.twitchPrefs;
+      await saveRecord(env, who.playerId, rec);
+      return reply({ ok: true });
     }
     case "discord/unlink": {
       await bodyOf(request);
@@ -4086,6 +4133,45 @@ h1{margin:0 0 10px;font-size:30px}p{margin:0;color:#aab0c4;line-height:1.55}.s{m
     if (h.startsWith("Bearer ")) { try { const who = await signedIn(request, env); mine = who.playerId === id; } catch { /* signed out */ } }
     return reply({ kind, players, mine });
   }
+  // (2.1.1) Twitch's sign-in comes back here: the code is swapped for the player's Twitch account, which is linked
+  if (path === "/twitch/callback") {
+    const page = (title, text, ok) => new Response(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OCTIVE · Twitch</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b0c14;color:#fff;font:16px/1.5 system-ui,sans-serif}
+.c{max-width:460px;padding:32px;border-radius:20px;background:#151726;border:1px solid ${ok ? "#9146ff" : "#ff4d6d"};text-align:center}
+h1{font-size:22px;margin:0 0 8px}p{color:#b9bdd6;margin:0}</style></head><body><div class="c"><h1>${title}</h1><p>${text}</p></div></body></html>`,
+      { status: ok ? 200 : 400, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+    const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    const state = String(url.searchParams.get("state") || "");
+    if (url.searchParams.get("error")) return page("Not linked", "Twitch sign-in was cancelled. You can close this tab and try again from OCTIVE.", false);
+    if (!/^[0-9a-f]{40}$/.test(state)) return page("Not linked", "That link isn't valid. Start again from OCTIVE (Settings → Account → Twitch).", false);
+    const st = await r2json(env, `twitch/state/${state}.json`, null);
+    await env.RELEASES.delete(`twitch/state/${state}.json`).catch(() => {});
+    if (!st || st.exp < Date.now()) return page("Link expired", "That link ran out. Start again from OCTIVE (Settings → Account → Twitch).", false);
+    const code = String(url.searchParams.get("code") || "");
+    if (!code || !env.TWITCH_CLIENT_ID || !env.TWITCH_CLIENT_SECRET) return page("Not linked", "Twitch didn't send a sign-in code. Try again from OCTIVE.", false);
+    let user = null;
+    try {
+      const tok = await fetch("https://id.twitch.tv/oauth2/token", {
+        method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ client_id: env.TWITCH_CLIENT_ID, client_secret: env.TWITCH_CLIENT_SECRET, code, grant_type: "authorization_code", redirect_uri: twitchRedirect(request) }),
+      }).then((r) => r.json());
+      if (!tok || !tok.access_token) throw new Error("no token");
+      const u = await fetch("https://api.twitch.tv/helix/users", { headers: { Authorization: "Bearer " + tok.access_token, "Client-Id": env.TWITCH_CLIENT_ID } }).then((r) => r.json());
+      user = u && Array.isArray(u.data) ? u.data[0] : null;
+      // the token is only needed to know who they are: given back to Twitch at once
+      fetch("https://id.twitch.tv/oauth2/revoke", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: env.TWITCH_CLIENT_ID, token: tok.access_token }) }).catch(() => {});
+    } catch (e) { console.log("twitch link", e && e.message); }
+    if (!user || !user.id || !user.login) return page("Not linked", "Twitch didn't confirm your account. Try again from OCTIVE.", false);
+    const owner = await r2json(env, `twitch/${user.id}.json`, null);
+    if (owner && owner.playerId && owner.playerId !== st.playerId) return page("Already linked", `The Twitch channel ${esc(user.display_name || user.login)} is linked to another OCTIVE account. Unlink it there first.`, false);
+    const rec = await record(env, st.playerId);
+    if (rec.twitch?.id && rec.twitch.id !== user.id) await env.RELEASES.delete(`twitch/${rec.twitch.id}.json`).catch(() => {});
+    rec.twitch = { id: user.id, login: String(user.login).toLowerCase(), name: String(user.display_name || user.login).slice(0, 40), at: new Date().toISOString() };
+    rec.twitchPrefs ||= { show: true };
+    await saveRecord(env, st.playerId, rec);
+    await r2put(env, `twitch/${user.id}.json`, { playerId: st.playerId, at: rec.twitch.at });
+    return page("Twitch linked!", `${esc(rec.twitch.name)} is now linked to your OCTIVE account. You can close this tab and go back to the game.`, true);
+  }
   // following
   m = path.match(/^\/social\/([A-Za-z0-9_-]{1,64})$/);
   if (m) {
@@ -4096,9 +4182,10 @@ h1{margin:0 0 10px;font-size:30px}p{margin:0;color:#aab0c4;line-height:1.55}.s{m
     if (h.startsWith("Bearer ")) { try { const who = await signedIn(request, env); youFollow = (await followingOf(env, who.playerId)).includes(id); } catch { /* signed out */ } }
     let friends = null;
     try { friends = ((await r2json(env, dmInboxKey(id), dmEmptyInbox())).friends || []).length; } catch { /* none */ }
-    let discord = null, discordUser = null;
+    let discord = null, discordUser = null, twitch = null;
     try {
       const rec = await record(env, id);
+      if (rec.twitch?.id && rec.twitchPrefs?.show !== false) twitch = { login: rec.twitch.login, name: rec.twitch.name || rec.twitch.login, live: await twitchLiveOf(env, rec.twitch.id) };
       if (rec.discord?.id && rec.discordPrefs?.show) {
         discord = rec.discord.name || null;
         // the username (what people type to add them); links made before 1.5 get it from Discord once
@@ -4108,7 +4195,7 @@ h1{margin:0 0 10px;font-size:30px}p{margin:0;color:#aab0c4;line-height:1.55}.s{m
         discordUser = rec.discord.username || null;
       }
     } catch { /* none */ }
-    return reply({ following, followers, friends, youFollow, owner: OWNER, discord, discordUser });
+    return reply({ following, followers, friends, youFollow, owner: OWNER, discord, discordUser, twitch });
   }
   if (path === "/follow") {
     const b = await bodyOf(request);
@@ -5722,6 +5809,42 @@ async function anticheatBan(env, playerId, name, reason) {
   await serverWrite(() => saveItem(env, OWNER, "moderation-mods", JSON.stringify(list), true));
   await loadModeration(cfg); moderationAt = Date.now();
   cards.delete(playerId);
+}
+
+/** Where Twitch sends players back after signing in (must match the Twitch app's OAuth Redirect URL exactly). */
+const twitchRedirect = (request) => new URL(request.url).origin + "/twitch/callback";
+
+// (2.1.1) is a linked channel streaming right now? Twitch's app token (client credentials) and each channel's answer
+// are kept a while, so profiles stay quick and Twitch isn't asked on every view.
+let twitchApp = null;
+const twitchLiveCache = new Map(); // twitch user id -> { at, stream }
+async function twitchAppToken(env) {
+  if (twitchApp && twitchApp.exp > Date.now() + 60_000) return twitchApp.token;
+  const r = await fetch("https://id.twitch.tv/oauth2/token", {
+    method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: env.TWITCH_CLIENT_ID, client_secret: env.TWITCH_CLIENT_SECRET, grant_type: "client_credentials" }),
+  }).then((x) => x.json());
+  if (!r || !r.access_token) throw new Error("no Twitch app token");
+  twitchApp = { token: r.access_token, exp: Date.now() + (Number(r.expires_in) || 3600) * 1000 };
+  return twitchApp.token;
+}
+/** The channel's live stream ({ title, game, viewers, startedAt }) or null; never throws. */
+async function twitchLiveOf(env, twitchId) {
+  if (!twitchId || !env.TWITCH_CLIENT_ID || !env.TWITCH_CLIENT_SECRET) return null;
+  const c = twitchLiveCache.get(twitchId);
+  if (c && Date.now() - c.at < 60_000) return c.stream;
+  let stream = null;
+  try {
+    let token = await twitchAppToken(env);
+    let res = await fetch(`https://api.twitch.tv/helix/streams?user_id=${encodeURIComponent(twitchId)}`, { headers: { Authorization: "Bearer " + token, "Client-Id": env.TWITCH_CLIENT_ID } });
+    if (res.status === 401) { twitchApp = null; token = await twitchAppToken(env); res = await fetch(`https://api.twitch.tv/helix/streams?user_id=${encodeURIComponent(twitchId)}`, { headers: { Authorization: "Bearer " + token, "Client-Id": env.TWITCH_CLIENT_ID } }); }
+    const d = await res.json();
+    const st = d && Array.isArray(d.data) ? d.data.find((x) => x.type === "live") : null;
+    if (st) stream = { title: String(st.title || "").slice(0, 140), game: String(st.game_name || "").slice(0, 60), viewers: Number(st.viewer_count) || 0, startedAt: st.started_at || null };
+  } catch (e) { console.log("twitch live", e && e.message); return c ? c.stream : null; }
+  twitchLiveCache.set(twitchId, { at: Date.now(), stream });
+  if (twitchLiveCache.size > 2000) twitchLiveCache.delete(twitchLiveCache.keys().next().value);
+  return stream;
 }
 
 let modChannel = null, modChannelAt = 0;
@@ -10929,7 +11052,7 @@ export default {
       try { return await activityToken(request, env); }
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
-    if (/^\/(support\/|stripe\/webhook$|looks\/|social\/|follow$)/.test(url.pathname)) {
+    if (/^\/(support\/|stripe\/webhook$|looks\/|social\/|follow$|twitch\/callback$)/.test(url.pathname)) {
       try { const r = await supportRoutes(request, env, url, ctx); if (r) return r; }
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }

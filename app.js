@@ -726,7 +726,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const level = h("div.pf-level", { title: official ? "Max level" : `${fmt0.format(toNext)} xp to level ${lv + 1}` },
       h("div.pf-lvbar", {}, h("div.pf-lvfill", { style: `width:${Math.round(prog * 100)}%` }), h("span", { text: Math.round(prog * 100) + "%" })),
       h("div.pf-oct", {}, h("span", { text: String(lv) })));
-    const social = socialRow(p);
+    const social = socialRow(p, (s) => markLive(card, avatar, s.twitch));
     const bar = h("section.pf-bar", {}, social, level);
 
     // everything else, in sections
@@ -2040,7 +2040,28 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   const dmNames = {};
 
   /** Followers / following, a Follow button and Gift supporter. */
-  function socialRow(p) {
+  // (2.1.1) the purple play mark of a player streaming on Twitch (their status dot turns into it)
+  const LIVE_SVG = '<svg viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="50" fill="#6a3399"/><circle cx="50" cy="50" r="39" fill="none" stroke="#fff" stroke-width="7"/><path d="M40 30 L70 50 L40 70 Z" fill="#fff"/></svg>';
+
+  /** A player streaming on Twitch right now: the play mark on their picture and a "live" box under their name. */
+  function markLive(card, avatar, tw) {
+    if (!tw || !tw.live || !card.isConnected) return;
+    const dot = avatar.querySelector(".dot");
+    if (dot) { dot.hidden = false; dot.classList.add("live"); dot.innerHTML = LIVE_SVG; dot.title = "Live on Twitch"; }
+    const url = `https://www.twitch.tv/${tw.login}`;
+    const mins = tw.live.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(tw.live.startedAt)) / 60000)) : null;
+    const since = mins == null ? "" : mins < 60 ? `${mins} min` : `${Math.floor(mins / 60)} h ${mins % 60} min`;
+    const box = h("a.pf-live", { href: url, target: "_blank", rel: "noopener", title: "Watch on Twitch" },
+      (() => { const m = h("span.pf-live-mark"); m.innerHTML = LIVE_SVG; return m; })(),
+      h("div.pf-live-text", {},
+        h("b", { text: "LIVE on Twitch" }),
+        h("span", { text: [tw.live.title, tw.live.game].filter(Boolean).join(" · ") || `twitch.tv/${tw.login}` }),
+        h("small", { text: [`${fmt0.format(tw.live.viewers || 0)} watching`, since && `live for ${since}`].filter(Boolean).join(" · ") })),
+      h("span.pf-live-watch", { text: "Watch stream ▶" }));
+    card.querySelector(".pf-idtext")?.append(box);
+  }
+
+  function socialRow(p, onSocial) {
     const followers = h("b", { text: "…" }), following = h("b", { text: "…" });
     const followBtn = h("button.btn", { type: "button", hidden: true });
     const out = h("span.social-msg");
@@ -2091,6 +2112,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         friends.textContent = s.friends != null ? fmtCount(s.friends) : "—";
         youFollow = isOwner || s.youFollow === true;
         paint();
+        if (onSocial) { try { onSocial(s); } catch { /* the rest still shows */ } }
         // their Discord, when they chose to show it (Settings → Profile → Discord in the game)
         if (s.discord || s.discordUser) {
           // shows their Discord name; copies the username (what you type to add them)
@@ -2103,6 +2125,12 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
             setTimeout(() => { chip.querySelector(".dc-copy").textContent = "Copy"; }, 1800);
           });
           row.append(chip);
+        }
+        // (2.1.1) their Twitch channel, linked by signing in with Twitch (so it's really theirs)
+        if (s.twitch && /^[a-z0-9_]{1,25}$/.test(s.twitch.login || "")) {
+          const tw = h("a.fc-twitch", { href: `https://www.twitch.tv/${s.twitch.login}`, target: "_blank", rel: "noopener", title: "Linked with Twitch · open their channel" },
+            h("span.tw-logo", { text: "twitch" }), h("b", { text: `twitch.tv/${s.twitch.login}` }), h("span.tw-check", { text: "✓" }));
+          row.append(tw);
         }
       } catch { followers.textContent = "—"; following.textContent = "—"; }
     })();
