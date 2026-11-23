@@ -1933,3 +1933,8 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .pf-discord:empty { display: none; }
 .pf-discord .fc-discord { margin-top: 0; }
 @media (max-width: 760px) { .pf-discord { margin-left: 0; align-self: flex-start; } }
+
+/* ---- 2.1.1: the live box is a full-width strip under the profile head */
+.pf-head > .pf-live { max-width: none; margin: 0 28px 18px; padding: 12px 16px; }
+.pf-head > .pf-live .pf-live-text span { white-space: nowrap; }
+@media (max-width: 600px) { .pf-head > .pf-live { margin: 0 14px 14px; } }
