@@ -1519,7 +1519,7 @@ async function privateItems(env, playerId, keys) {
   for (const it of body?.results ?? []) {
     let v = it.value;
     if (typeof v === "string") { try { v = JSON.parse(v); } catch { /* keep */ } }
-    out[it.key] = v;
+    out[it.key] = it.key === "scores" ? scoresToPoints(v) : v; // older games scores in 2.1.1 points
   }
   return out;
 }
@@ -3026,7 +3026,45 @@ async function discordInteraction(request, env, ctx) {
 // best. The game submits a play with the player's Unity token (checked like the website's sign-in);
 // the board lives in R2 at scores/<songId>/<chartId>.json and is cached for a few seconds.
 const BOARD_SIZE = 100;
-const SCORE_MAX = 1_000_000;
+const SCORE_MAX = 2_000_000_000; // 2.1.1: points per judgement, no cap (350 a note at most)
+// ---- 2.1.1 scores: points per judgement. Saves from older games (no scoreVersion) are worked out again on read.
+const SCORE_POINTS_W = [350, 300, 250, 200, 100, 0];
+function pointsOf(counts) {
+  if (!Array.isArray(counts)) return null;
+  let s = 0, n = 0;
+  for (let i = 0; i < 6; i++) { const c = Math.max(0, Math.round(Number(counts[i]) || 0)); s += SCORE_POINTS_W[i] * c; n += c; }
+  return n > 0 ? s : null;
+}
+function pointsFromOld(old, targets) { return Math.round(Math.max(0, Number(old) || 0) / 1_000_000 * 350 * Math.max(0, Number(targets) || 0)); }
+/** A player's synced scores (Cloud Save "scores") from a game before 2.1.1, in the new points. */
+function scoresToPoints(d) {
+  if (!d || typeof d !== "object" || Number(d.scoreVersion) >= 1) return d;
+  let oldSum = 0, newSum = 0;
+  const seen = new Set();
+  const conv = (p, targets) => {
+    if (!p || typeof p !== "object" || seen.has(p)) return;
+    seen.add(p);
+    const old = Number(p.score) || 0;
+    const pts = pointsOf(p.counts);
+    p.score = pts ?? pointsFromOld(old, Number(p.notes) || targets);
+    if (!p.failed && old > 0) { oldSum += old; newSum += p.score; }
+  };
+  const charts = d.charts && typeof d.charts === "object" ? d.charts : {};
+  for (const c of Object.values(charts)) {
+    if (!c || typeof c !== "object") continue;
+    const bestPts = pointsOf(c.bestCounts);
+    let targets = Array.isArray(c.bestCounts) ? c.bestCounts.reduce((a, x) => a + (Number(x) || 0), 0) : 0;
+    if (!targets && Array.isArray(c.top)) for (const t of c.top) targets = Math.max(targets, Array.isArray(t?.counts) ? t.counts.reduce((a, x) => a + (Number(x) || 0), 0) : Number(t?.notes) || 0);
+    if (Array.isArray(c.top)) { for (const t of c.top) conv(t, targets); c.top.sort((a, b) => (Number(b?.score) || 0) - (Number(a?.score) || 0)); }
+    let best = bestPts ?? pointsFromOld(c.bestScore, targets);
+    if (Array.isArray(c.top) && c.top.length) best = Math.max(best, Number(c.top[0]?.score) || 0);
+    c.bestScore = best;
+  }
+  if (Array.isArray(d.recent)) for (const p of d.recent) conv(p, 0);
+  d.totalScore = oldSum > 0 ? Math.round((Number(d.totalScore) || 0) * newSum / oldSum) : 0;
+  d.scoreVersion = 1;
+  return d;
+}
 const boards = new Map(); // key -> { data, at }
 
 const officialSong = (id) => /^octive-[a-z0-9-]{1,80}$/.test(id || "");
@@ -3194,6 +3232,7 @@ async function chartScores(request, env, url) {
       mods: boardMods(replay.mods),
       rc: 1,
       judged: JUDGE_VERSION,
+      pts: 1, // 2.1.1 points
     };
     // a verified chart's stars are known here: the PR on its board is never more than they give at that accuracy
     try {
@@ -5605,7 +5644,8 @@ function cheatSigns(result, claimed) {
   const signs = [];
   if (claimed) {
     const s = Number(claimed.score), a = Number(claimed.accuracy);
-    if ((Number.isFinite(s) && s > result.score + 5000) || (Number.isFinite(a) && a > result.accuracy + 0.5))
+    // games before 2.1.1 send the old score out of 1,000,000: it's checked against that one
+    if ((Number.isFinite(s) && s > Math.max(result.score, result.oldScore || 0) + 5000) || (Number.isFinite(a) && a > result.accuracy + 0.5))
       signs.push({ id: "numbers", strong: true, text: `the game sent ${Number.isFinite(s) ? Math.round(s) + " / " : ""}${Number.isFinite(a) ? a.toFixed(2) + "%" : "?"}, its replay gives ${result.score} / ${result.accuracy.toFixed(2)}%` });
   }
   if (result.hits >= 100 && result.stdMs < 3)
@@ -5627,27 +5667,34 @@ function cheatSigns(result, claimed) {
 async function judgeFlags(env, playerId, what, result, claimed) {
   const signs = cheatSigns(result, claimed);
   if (!signs.length) return;
-  for (const s of signs) await flagPlayer(env, playerId, `${what}: ${s.text}`);
   const [cfg, trustedDoc] = await Promise.all([r2json(env, AC_CONFIG, { bans: false }), r2json(env, AC_TRUSTED, { players: {} })]);
   const trusted = !!(trustedDoc.players || {})[playerId];
   // strong signs are counted per player: the same one on a third play is proof
   const strong = signs.filter((s) => s.strong);
-  let counts = {};
+  let counts = {}, repeat = false, quiet = false;
   try {
+    const now = Date.now(), sigIds = signs.map((s) => s.id).join(",");
     const rec = await r2update(env, acPlayerKey(playerId), () => ({ counts: {}, plays: [] }), (d) => {
       d.counts ||= {}; d.plays ||= [];
+      // (2.1.1) the same play sent again (a retry, or a board and a sync at once): counted and posted once, not each time
+      repeat = d.plays.some((x) => x.what === what && x.signs?.join(",") === sigIds && now - Date.parse(x.at) < 30 * 60_000);
+      if (repeat) return false;
       for (const s of strong) d.counts[s.id] = (d.counts[s.id] || 0) + 1;
-      d.plays.push({ at: new Date().toISOString(), what, signs: signs.map((s) => s.id) });
+      // and at most 6 posts a player an hour: the rest are kept in the record without filling #moderator-only
+      quiet = d.plays.filter((x) => now - Date.parse(x.at) < 3_600_000 && x.posted).length >= 6;
+      d.plays.push({ at: new Date(now).toISOString(), what, signs: signs.map((s) => s.id), posted: !quiet || undefined });
       if (d.plays.length > 30) d.plays = d.plays.slice(-30);
     });
     counts = rec.counts || {};
   } catch (e) { console.log("anti-cheat record", e && e.message); }
+  if (repeat) return;
+  for (const s of signs) await flagPlayer(env, playerId, `${what}: ${s.text}`);
   const repeated = strong.find((s) => (counts[s.id] || 0) >= 3);
   const proof = strong.length >= 2 || !!repeated;
   const live = cfg.bans === true && !trusted;
   const name = await displayName(env, playerId).catch(() => playerId);
   const verdict = proof ? (live ? "Banned" : "Would ban") : (live ? "Play held back" : "Would hold the play back");
-  await modPost(env, {
+  if (!quiet || live) await modPost(env, {
     title: `Anti-cheat: ${verdict}${trusted ? " (trusted player: nothing done)" : ""}`,
     color: proof ? 0xFF4D6D : 0xF2C14E,
     description: cfg.bans === true ? "Bans are on." : "Watching only: nothing was done to the player or the play.",
@@ -9720,6 +9767,56 @@ async function workshopRoutes(request, env, url, ctx) {
   // refused like any other) and the judged numbers replace different ones; { drop: true } also takes off scores that
   // can't be judged (no replay, an unreadable one, someone else's, autoplay). A few scores per call: pass "after" back
   // until "left" is 0 (Tools/board_rejudge.py does).
+  // ---- 2.1.1 scores: every chart board in points per judgement (Marvelous 350 … Miss 0, no cap) instead of out of
+  // 1,000,000. Each entry's score comes from its judgement counts; an entry without counts is scaled by the board's
+  // note count (another entry's counts on the same chart). Every board is copied to backups/score-points/ first.
+  // A batch of boards per call: pass "after" back until "left" is 0. {dry:true} only counts.
+  if (path === "/api/admin/score-points" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 20_000).catch(() => ({}));
+    const dry = b.dry === true;
+    const limit = Math.max(1, Math.min(300, Number(b.limit) || 120));
+    const keys = [];
+    let cursor;
+    do {
+      const list = await env.RELEASES.list({ prefix: "scores/", cursor });
+      for (const o of list.objects) if (o.key.endsWith(".json")) keys.push(o.key);
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
+    keys.sort();
+    const after = String(b.after || "");
+    const out = { boards: 0, entries: 0, converted: 0, scaled: 0, unknown: [] };
+    let last = null, done = 0;
+    for (const key of keys) {
+      if (after && key <= after) continue;
+      if (done >= limit) break;
+      done++; last = key;
+      const data = await r2json(env, key, null);
+      if (!data || !Array.isArray(data.entries) || !data.entries.some((e) => e && e.pts !== 1)) continue;
+      out.boards++;
+      const targetsOf = (e) => Array.isArray(e?.counts) ? e.counts.slice(0, 6).reduce((a, x) => a + (Number(x) || 0), 0) : 0;
+      const known = data.entries.map(targetsOf).filter((n) => n > 0);
+      const boardTargets = known.length ? Math.max(...known) : 0;
+      const convert = (x) => {
+        for (const e of x.entries || []) {
+          if (!e || e.pts === 1) continue;
+          out.entries++;
+          const pts = pointsOf(e.counts);
+          if (pts != null) { e.score = pts; out.converted++; }
+          else if (boardTargets > 0) { e.score = pointsFromOld(e.score, boardTargets); out.scaled++; }
+          else { out.unknown.push(`${key.slice(7, -5)} ${e.name || e.playerId}`); continue; }
+          e.pts = 1;
+        }
+        x.entries.sort((a, c) => c.score - a.score || c.accuracy - a.accuracy || Date.parse(a.date) - Date.parse(c.date));
+      };
+      if (dry) { convert(JSON.parse(JSON.stringify(data))); continue; }
+      if (!(await env.RELEASES.head(`backups/score-points/${key}`))) await env.RELEASES.put(`backups/score-points/${key}`, JSON.stringify(data));
+      await r2update(env, key, () => ({ entries: [] }), (x) => { convert(x); });
+      boards.delete(key);
+    }
+    const left = last ? keys.filter((k) => k > last).length : 0;
+    return reply({ ok: true, dry, ...out, after: last, left });
+  }
   if (path === "/api/admin/board-rejudge" && request.method === "POST") {
     if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
     const b = await bodyOf(request, 20_000).catch(() => ({}));

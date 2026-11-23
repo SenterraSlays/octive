@@ -109,7 +109,11 @@ export function windowsFor(mods) {
 
 // OCTIVE Standard (the only scoring rule): accuracy and score weight per judgement, misses and bads break combo
 const ACC_W = [100, 98, 70, 40, 10, 0];
-const SCORE_W = [1.0, 0.98, 0.70, 0.40, 0.10, 0];
+// 2.1.1: no score cap, points per judgement (Marvelous 350, Perfect 300, Great 250, Good 200, Bad 100, Miss 0)
+export const SCORE_POINTS = [350, 300, 250, 200, 100, 0];
+const SCORE_W = SCORE_POINTS;
+// the old score out of 1,000,000 (games before 2.1.1 still send it)
+const OLD_SCORE_W = [1.0, 0.98, 0.70, 0.40, 0.10, 0];
 export const MAX_SCORE = 1_000_000;
 
 /** Grades.Of: by accuracy rounded to two decimals. */
@@ -735,7 +739,13 @@ export class ScoreState {
     }
   }
   get accuracy() { return this.judged === 0 ? 100 : this.accSum / this.judged; }
-  get score() { return this.total === 0 ? 0 : toLong(roundEven(MAX_SCORE * this.scoreSum / this.total)); }
+  get score() { return toLong(roundEven(this.scoreSum)); }
+  /** The score as games before 2.1.1 worked it out (out of 1,000,000). */
+  get oldScore() {
+    if (this.total === 0) return 0;
+    let s = 0; for (let j = 0; j < 6; j++) s += OLD_SCORE_W[j] * this.counts[j];
+    return toLong(roundEven(MAX_SCORE * s / this.total));
+  }
   get fullCombo() { return this.judged > 0 && this.counts[MISS] === 0 && this.counts[BAD] === 0; }
   get perfectPlay() { return this.fullCombo && this.counts[GREAT] === 0 && this.counts[GOOD] === 0; }
   get grade() { return this.judged === 0 ? "D" : gradeOf(this.accuracy); }
@@ -749,7 +759,7 @@ export class ScoreState {
   /** What the game shows and keeps (ReplayResult.From). */
   result() {
     return {
-      score: this.score, accuracy: this.accuracy, maxCombo: this.maxCombo, counts: this.counts.slice(), grade: this.grade,
+      score: this.score, oldScore: this.oldScore, accuracy: this.accuracy, maxCombo: this.maxCombo, counts: this.counts.slice(), grade: this.grade,
       fullCombo: this.fullCombo, perfectPlay: this.perfectPlay, early: this.early, late: this.late, judged: this.judged, targets: this.total,
     };
   }
