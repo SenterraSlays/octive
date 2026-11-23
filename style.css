@@ -2126,3 +2126,18 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 /* 2.1.2 narrow screens: the skills list goes under the radar; the supporter months row wraps */
 @media (max-width: 900px) { .sk-grid { grid-template-columns: minmax(0, 1fr); justify-items: center; } .sk-list { width: 100%; } }
 @media (max-width: 600px) { .months-row { flex-wrap: wrap; } .months-row > input[type="range"] { flex: 1 1 100%; min-width: 0; } }
+
+/* ---- 2.1.2: the Leaderboard box (apart from the difficulties) */
+.wsi-lb-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.wsi-lb-head h2 { margin: 0; }
+.wsi-lb-sub { color: var(--faint); font-size: 12px; }
+.wb-tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.wb-tabs button { --c: #b69bff; display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px 5px 6px; border-radius: 999px; border: 1px solid var(--line); background: #ffffff08; color: var(--dim); font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; max-width: 100%; }
+.wb-tabs button b { padding: 1px 7px; border-radius: 999px; background: var(--c); color: #0d0b14; font-size: 11px; flex: none; }
+.wb-tabs button span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wb-tabs button.on { color: #fff; border-color: color-mix(in srgb, var(--c) 70%, transparent); background: color-mix(in srgb, var(--c) 16%, transparent); }
+.wsi-lb .wsi-board { margin: 0; padding: 0; background: none; border: 0; }
+.wsi-diff.has-board { cursor: pointer; }
+.wsi-diff.on-board { border-color: color-mix(in srgb, var(--c) 60%, transparent); box-shadow: inset 3px 0 0 var(--c); }
+.wsi-board-hint { display: none; }
+.live-more { margin: 10px 0 0; color: var(--dim); font-size: 13px; }

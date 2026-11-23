@@ -1241,7 +1241,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
       // every difficulty: a coloured star tile, its name and charter, its numbers and a bar for how hard it is
       const diffs = h("section.panel.wsi-diffs", {}, h("h2", { text: charts.length ? `Difficulties · ${charts.length}` : "Difficulties" }),
-        it.verified && isSong ? h("p.wsi-board-note", { text: "Verified: every difficulty has a global leaderboard. Click one to see it." }) : null);
+        it.verified && isSong ? h("p.wsi-board-note", { text: "Verified: every difficulty has a global leaderboard. Click one to see it in the Leaderboard below." }) : null);
+      const boardPicks = [];
       const hardest = charts.reduce((m, c) => (!m || (Number(c.stars) || 0) > (Number(m.stars) || 0)) ? c : m, null);
       for (const sg of songs) {
         diffs.append(h("div.wsi-song", {}, h("b", { text: `${sg.artist} - ${sg.title}` }),
@@ -1258,7 +1259,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
               c.od != null ? h("span", { text: `OD ${c.od}`, title: "Overall difficulty: how tight the timing is" }) : null),
             h("span.wsi-meter", { title: `${st.toFixed(2)} stars` }, h("span", { style: `width:${Math.min(100, st * 10)}%` })));
           diffs.append(drow);
-          if (it.verified && isSong) wsBoardToggle(drow, sg, c, c === hardest);
+          if (it.verified && isSong && (c.chartId || c.osuMd5)) boardPicks.push({ sg, c, row: drow });
         }
       }
 
@@ -1281,7 +1282,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const reviews = h("section.panel.wsi-reviews", {});
       box.replaceChildren(hero,
         h("div.wsi-grid", {},
-          h("div.wsi-main", {}, it.description ? h("section.panel.wsi-about", {}, h("h2", { text: "About" }), h("p", { text: it.description })) : null, songs.length ? diffs : null, reviews),
+          h("div.wsi-main", {}, it.description ? h("section.panel.wsi-about", {}, h("h2", { text: "About" }), h("p", { text: it.description })) : null, songs.length ? diffs : null,
+            boardPicks.length ? wsBoardBox(boardPicks, hardest) : null, reviews),
           info));
       wsSocial(it, social, { likeBtn, likeChip, revChip, reviews, date });
     });
@@ -1400,10 +1402,18 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   // ================================================================ 2.1.2 site additions
   /** A small picture for any player: their ranking picture when they're ranked, else their first letter. */
-  function smallAvatar(id, name) {
+  function smallAvatar(id, name, avatarHash) {
     const box = h("span.avatar", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial", { text: (name || "?").charAt(0).toUpperCase() }), h("span.dot", { hidden: true }));
     const p = findPlayer(id);
-    if (p) setAvatar(box, p); else box.querySelector(".dot").remove();
+    if (p) { setAvatar(box, p); return box; }
+    box.querySelector(".dot").remove();
+    // not in the loaded ranking (yet): their picture straight from the server, the first letter if there's none
+    if (worker && id) {
+      const img = box.querySelector("img"), initial = box.querySelector(".initial");
+      img.onload = () => { img.hidden = false; initial.hidden = true; };
+      img.onerror = () => img.remove();
+      img.src = `${worker}/avatar/${encodeURIComponent(id)}` + (avatarHash ? `?v=${encodeURIComponent(avatarHash)}` : "");
+    }
     return box;
   }
 
@@ -1413,28 +1423,38 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const set = Math.round(Number(sg.osuSet) || 0);
     return `${set > 0 ? "osu-" + set : sg.songId}/${set > 0 && c.osuMd5 ? c.osuMd5 : c.chartId}`;
   }
-  /** Click a difficulty to open (or close) its leaderboard under it; the hardest one starts open. */
-  function wsBoardToggle(row, sg, c, open) {
-    if (!sg || !c || !(c.chartId || c.osuMd5)) return;
-    const key = boardKeyOf(sg, c);
-    const panel = h("div.wsi-board", { hidden: true });
-    const hint = h("span.wsi-board-hint", { text: "Leaderboard ▾" });
-    row.append(hint);
-    row.classList.add("has-board");
-    row.tabIndex = 0;
-    row.setAttribute("role", "button");
-    row.setAttribute("aria-expanded", "false");
-    const toggle = () => {
-      const show = panel.hidden;
-      panel.hidden = !show;
-      row.setAttribute("aria-expanded", String(show));
-      hint.textContent = show ? "Leaderboard ▴" : "Leaderboard ▾";
-      if (show && !panel.dataset.loaded) { panel.dataset.loaded = "1"; fillBoard(panel, key); }
-    };
-    row.addEventListener("click", toggle);
-    row.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } });
-    row.after(panel);
-    if (open) toggle();
+  /** The Leaderboard box: a button per difficulty on top, that difficulty's global board under it. Clicking a
+   *  difficulty in the Difficulties box picks it here too (and scrolls down to it). The hardest one shows first. */
+  function wsBoardBox(picks, hardest) {
+    const content = h("div.wsi-board");
+    const tabs = h("div.wb-tabs", { role: "tablist" });
+    const multiKeys = new Set(picks.map((p) => p.c.keys)).size > 1;
+    const multiSongs = new Set(picks.map((p) => p.sg)).size > 1;
+    const box = h("section.panel.wsi-lb", {},
+      h("div.wsi-lb-head", {}, h("h2", { text: "Leaderboard" }), h("span.wsi-lb-sub", { text: "Global scores, checked from each play's replay" })),
+      tabs, content);
+    const buttons = picks.map((p) => {
+      const st = Number(p.c.stars) || 0;
+      return h("button", { type: "button", role: "tab", style: `--c:${starColor(st)}`, onclick: () => select(p, false) },
+        h("b", { text: "★ " + st.toFixed(2) }),
+        h("span", { text: (multiSongs ? (p.sg.title || "") + " · " : "") + (p.c.difficulty || "Chart") + (multiKeys ? ` · ${p.c.keys}K` : "") }));
+    });
+    tabs.append(...buttons);
+    function select(p, scroll) {
+      buttons.forEach((b, i) => { const on = picks[i] === p; b.classList.toggle("on", on); b.setAttribute("aria-selected", String(on)); });
+      picks.forEach((x) => x.row.classList.toggle("on-board", x === p));
+      fillBoard(content, boardKeyOf(p.sg, p.c));
+      if (scroll) box.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    for (const p of picks) {
+      p.row.classList.add("has-board");
+      p.row.title = "See its leaderboard";
+      p.row.tabIndex = 0;
+      p.row.addEventListener("click", () => select(p, true));
+      p.row.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); select(p, true); } });
+    }
+    select(picks.find((p) => p.c === hardest) || picks[picks.length - 1], false);
+    return box;
   }
   async function fillBoard(panel, key) {
     panel.replaceChildren(h("p.empty", { text: "Loading the leaderboard…" }));
@@ -1449,7 +1469,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const paint = () => {
       const rows = entries.slice(0, shown).map((e) => h("a.wb-row", { href: "#/u/" + encodeURIComponent(e.playerId), "data-place": e.rank },
         h("span.wb-rank", { text: "#" + e.rank }),
-        smallAvatar(e.playerId, e.name),
+        smallAvatar(e.playerId, e.name, e.avatarHash),
         h("span.wb-name", {}, h("b", { text: e.name || "Player" }), e.mods ? h("span.wb-mods", { text: e.mods }) : null),
         h("span.wb-score", { text: fmt0.format(e.score || 0) }),
         h("span.wb-acc", { text: (Number(e.accuracy) || 0).toFixed(2) + "%" }),
@@ -1471,7 +1491,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const ids = Object.keys(LIVE_NOW || {});
     el.hidden = !ids.length;
     if (!ids.length) { el.replaceChildren(); return; }
-    const cards = ids.slice(0, 6).map((id) => {
+    const cards = ids.slice(0, 12).map((id) => {
       const lv = LIVE_NOW[id] || {};
       const p = findPlayer(id);
       const name = (p && p.name) || lv.name || "Player";
@@ -1485,7 +1505,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("p.live-title", { text: [lv.title, lv.game].filter(Boolean).join(" · ") || `twitch.tv/${lv.login}`, title: lv.title || "" }),
         h("a.btn.small.live-watch", { href: `https://www.twitch.tv/${lv.login}`, target: "_blank", rel: "noopener" }, "Watch stream ▶"));
     });
-    el.replaceChildren(h("div.section-head", {}, h("h2.section-title", {}, h("span.live-pulse"), `Live on Twitch now · ${ids.length}`)), h("div.live-row", {}, ...cards));
+    el.replaceChildren(h("div.section-head", {}, h("h2.section-title", {}, h("span.live-pulse"), `Live on Twitch now · ${ids.length}`)), h("div.live-row", {}, ...cards),
+      ids.length > 12 ? h("p.live-more", { text: `and ${ids.length - 12} more: look for the purple play mark on the rankings` }) : null);
   }
 
   // ---------------------------------------------------------------- daily charts
