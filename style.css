@@ -1926,3 +1926,10 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .fc-bluesky { border-color: rgba(17, 133, 254, .5); }
 .fc-discord.fc-social { background: rgba(88, 101, 242, .16); border-color: rgba(88, 101, 242, .5); }
 @media (hover: hover) and (prefers-reduced-motion: no-preference) { .fc-social:hover { background: rgba(255, 255, 255, .11); transform: translateY(-1px); } }
+
+/* ---- 2.1.1: the linked Discord at the bottom right of the profile head */
+.pf-id { position: relative; }
+.pf-discord { margin-left: auto; align-self: flex-end; flex: none; }
+.pf-discord:empty { display: none; }
+.pf-discord .fc-discord { margin-top: 0; }
+@media (max-width: 760px) { .pf-discord { margin-left: 0; align-self: flex-start; } }

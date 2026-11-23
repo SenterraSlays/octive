@@ -726,7 +726,10 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const level = h("div.pf-level", { title: official ? "Max level" : `${fmt0.format(toNext)} xp to level ${lv + 1}` },
       h("div.pf-lvbar", {}, h("div.pf-lvfill", { style: `width:${Math.round(prog * 100)}%` }), h("span", { text: Math.round(prog * 100) + "%" })),
       h("div.pf-oct", {}, h("span", { text: String(lv) })));
-    const social = socialRow(p, (s) => markLive(card, avatar, s.twitch));
+    // their linked Discord sits at the bottom right of the head
+    const dcSlot = h("div.pf-discord");
+    card.querySelector(".pf-id").append(dcSlot);
+    const social = socialRow(p, (s) => markLive(card, avatar, s.twitch), dcSlot);
     const bar = h("section.pf-bar", {}, social, level);
 
     // everything else, in sections
@@ -2121,7 +2124,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     return out;
   }
 
-  function socialRow(p, onSocial) {
+  function socialRow(p, onSocial, discordSlot) {
     const followers = h("b", { text: "…" }), following = h("b", { text: "…" });
     const followBtn = h("button.btn", { type: "button", hidden: true });
     const out = h("span.social-msg");
@@ -2187,7 +2190,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
             catch { chip.querySelector(".dc-copy").textContent = user; }
             setTimeout(() => { chip.querySelector(".dc-copy").textContent = "Copy"; }, 1800);
           });
-          links.prepend(chip);
+          if (discordSlot) discordSlot.append(chip); else links.prepend(chip); // the profile head's bottom right
         }
         // (2.1.1) their Twitch channel, linked by signing in with Twitch (so it's really theirs)
         if (s.twitch && /^[a-z0-9_]{1,25}$/.test(s.twitch.login || "")) {
