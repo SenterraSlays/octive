@@ -727,8 +727,9 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("div.pf-lvbar", {}, h("div.pf-lvfill", { style: `width:${Math.round(prog * 100)}%` }), h("span", { text: Math.round(prog * 100) + "%" })),
       h("div.pf-oct", {}, h("span", { text: String(lv) })));
     // their linked Discord sits at the bottom right of the head
+    // and a live-on-Twitch box at the top right, above it
     const dcSlot = h("div.pf-discord");
-    card.querySelector(".pf-id").append(dcSlot);
+    card.querySelector(".pf-id").append(h("div.pf-side", {}, h("div.pf-liveslot"), dcSlot));
     const social = socialRow(p, (s) => markLive(card, avatar, s.twitch), dcSlot);
     const bar = h("section.pf-bar", {}, social, level);
 
@@ -2102,7 +2103,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("span", { text: [tw.live.title, tw.live.game].filter(Boolean).join(" · ") || `twitch.tv/${tw.login}` }),
         h("small", { text: [`${fmt0.format(tw.live.viewers || 0)} watching`, since && `live for ${since}`].filter(Boolean).join(" · ") })),
       h("span.pf-live-watch", { text: "Watch stream ▶" }));
-    card.querySelector(".pf-id")?.after(box); // a strip across the head, under the picture and name
+    card.querySelector(".pf-liveslot")?.append(box); // the head's top right
   }
 
   // (2.1.1) profile links as small chips: the platform's logo and its name (the link is on hover and click)
