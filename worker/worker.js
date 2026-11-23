@@ -39,7 +39,8 @@ const cards = new Map();           // playerId -> { card, seen, at }
 const avatars = new Map();         // playerId:hash -> Uint8Array
 let moderation = { bans: {}, overrides: {}, roles: {}, badges: {} };
 const BADGE_ORDER = ["DEV", "MOD", "CREATOR", "CHARTER", "VIP", "TESTER"];
-const SOCIAL_KEYS = ["youtube", "twitch", "tiktok", "x", "instagram", "bluesky", "discord", "website"];
+// (2.1.1) no typed Twitch: a Twitch channel is linked with Twitch's own sign-in (Settings → Account → Twitch)
+const SOCIAL_KEYS = ["youtube", "tiktok", "x", "instagram", "bluesky", "discord", "website"];
 
 /** Every badge of a player, most important first (DEV is built in; others come from the developers' list). */
 /** The check beside a name: "official" (OCTIVE's own accounts), "verified" (known people) or null. */
@@ -1649,7 +1650,7 @@ ${text.split("\n\n").map((p) => `<p style="font-size:15px;line-height:1.5;margin
 // ---- social links (the same rules as the game's SocialLinks)
 
 const SOCIAL_RULES = {
-  youtube: "https://www.youtube.com/@{0}", twitch: "https://www.twitch.tv/{0}", tiktok: "https://www.tiktok.com/@{0}",
+  youtube: "https://www.youtube.com/@{0}", tiktok: "https://www.tiktok.com/@{0}",
   x: "https://x.com/{0}", instagram: "https://www.instagram.com/{0}", bluesky: "https://bsky.app/profile/{0}", discord: null, website: null,
 };
 function socialOk(id, value) {
@@ -1762,6 +1763,7 @@ async function account(request, env, route) {
         const clean = {};
         for (const [k, v] of Object.entries(b.socials || {})) {
           if (typeof v !== "string" || !v.trim()) continue;
+          if (k === "twitch") continue; // linked, not typed (older pages and games still send it)
           if (!socialOk(k, v)) fail(400, `Check your ${k} link (a handle like @name, or a full https:// link).`);
           clean[k] = v.trim();
         }
@@ -2306,11 +2308,11 @@ async function account(request, env, route) {
     }
     // ---- (2.1.1) Twitch: linked with Twitch's own sign-in (not typed in), so the channel is really the player's
     case "twitch/start": {
-      await bodyOf(request);
       const who = await signedIn(request, env);
       if (!env.TWITCH_CLIENT_ID || !env.TWITCH_CLIENT_SECRET) fail(503, "Twitch linking isn't set up on the server yet.");
       const state = [...crypto.getRandomValues(new Uint8Array(20))].map((x) => x.toString(16).padStart(2, "0")).join("");
-      await r2put(env, `twitch/state/${state}.json`, { playerId: who.playerId, exp: Date.now() + 15 * 60_000 });
+      const b0 = await bodyOf(request).catch(() => ({}));
+      await r2put(env, `twitch/state/${state}.json`, { playerId: who.playerId, exp: Date.now() + 15 * 60_000, site: b0 && b0.from === "site" });
       const q = new URLSearchParams({ response_type: "code", client_id: env.TWITCH_CLIENT_ID, redirect_uri: twitchRedirect(request), scope: "", state, force_verify: "true" });
       return reply({ url: "https://id.twitch.tv/oauth2/authorize?" + q.toString() });
     }
@@ -4170,6 +4172,7 @@ h1{font-size:22px;margin:0 0 8px}p{color:#b9bdd6;margin:0}</style></head><body><
     rec.twitchPrefs ||= { show: true };
     await saveRecord(env, st.playerId, rec);
     await r2put(env, `twitch/${user.id}.json`, { playerId: st.playerId, at: rec.twitch.at });
+    if (st.site) return Response.redirect(SITE + "?twitch=linked#/account", 302);
     return page("Twitch linked!", `${esc(rec.twitch.name)} is now linked to your OCTIVE account. You can close this tab and go back to the game.`, true);
   }
   // following
@@ -9894,6 +9897,26 @@ async function workshopRoutes(request, env, url, ctx) {
   // 1,000,000. Each entry's score comes from its judgement counts; an entry without counts is scaled by the board's
   // note count (another entry's counts on the same chart). Every board is copied to backups/score-points/ first.
   // A batch of boards per call: pass "after" back until "left" is 0. {dry:true} only counts.
+  // (2.1.1) typed Twitch names out of every content creator's card (Twitch is linked with its sign-in now)
+  if (path === "/api/admin/strip-twitch-socials" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 2000).catch(() => ({}));
+    const dry = b.dry === true;
+    const cfg = config(env);
+    await loadModeration(cfg);
+    const creators = Object.keys(moderation.badges || {}).filter((id) => badgesOf(id).includes("CREATOR"));
+    const out = { creators: creators.length, removed: [] };
+    for (const id of creators) {
+      const card = (await publicItems(cfg, id, ["card"]).catch(() => ({}))).card;
+      if (!card || !card.socials || typeof card.socials !== "object" || !("twitch" in card.socials)) continue;
+      out.removed.push({ id, was: String(card.socials.twitch).slice(0, 60) });
+      if (dry) continue;
+      delete card.socials.twitch;
+      await serverWrite(() => saveItem(env, id, "card", safeCard(card), true));
+      cards.delete(id);
+    }
+    return reply({ ok: true, dry, ...out });
+  }
   if (path === "/api/admin/score-points" && request.method === "POST") {
     if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
     const b = await bodyOf(request, 20_000).catch(() => ({}));

@@ -1903,3 +1903,9 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 @media (hover: hover) and (prefers-reduced-motion: no-preference) { .pf-live:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(145, 70, 255, .35); } }
 @media (prefers-reduced-motion: reduce) { .pf-live-mark { animation: none; } }
 @media (max-width: 600px) { .pf-live { flex-wrap: wrap; } .pf-live-watch { width: 100%; text-align: center; } }
+
+/* ---- 2.1.1: linking Twitch on the Account page */
+.tw-row { background: rgba(145, 70, 255, .1); border-color: rgba(145, 70, 255, .45); }
+.tw-row a { color: #e6d9ff; font-weight: 700; text-decoration: none; }
+.tw-row .tw-logo, .fc-twitch .tw-logo { background: #9146ff; color: #fff; font-weight: 700; font-size: 12px; padding: 1px 6px; border-radius: 6px; }
+.btn.tw-link { background: #9146ff; border-color: #9146ff; }

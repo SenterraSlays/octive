@@ -137,7 +137,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   // ---------------------------------------------------------------- content creators' socials (same rules as the game)
   const SOCIALS = [
-    ["youtube", "YouTube", "https://www.youtube.com/@{0}"], ["twitch", "Twitch", "https://www.twitch.tv/{0}"],
+    ["youtube", "YouTube", "https://www.youtube.com/@{0}"],
     ["tiktok", "TikTok", "https://www.tiktok.com/@{0}"], ["x", "X (Twitter)", "https://x.com/{0}"],
     ["instagram", "Instagram", "https://www.instagram.com/{0}"], ["bluesky", "Bluesky", "https://bsky.app/profile/{0}"],
     ["discord", "Discord", null], ["website", "Website", null],
@@ -1638,7 +1638,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   function socialsPanel() {
     const inputs = {};
-    const hints = { youtube: "@handle or channel link", twitch: "username", tiktok: "@username", x: "@username", instagram: "username", bluesky: "name.bsky.social", discord: "invite link (https://discord.gg/…)", website: "https://…" };
+    const hints = { youtube: "@handle or channel link", tiktok: "@username", x: "@username", instagram: "username", bluesky: "name.bsky.social", discord: "invite link (https://discord.gg/…)", website: "https://…" };
     const rows = SOCIALS.map(([id, name]) => {
       const i = h("input", { type: "text", maxlength: 200, placeholder: hints[id], spellcheck: "false" });
       i.value = (me.socials && me.socials[id]) || "";
@@ -1722,17 +1722,62 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     return section("Discord", "Link your Discord: you get a code here, then use /link in the OCTIVE Discord.", me.discord ? null : h("div.dc-why", {}, h("div.dc-why-head", {}, h("img.dc-logo", { src: "discord.png", alt: "" }), h("b", { text: "What you get when you link" })), perks), box, out);
   }
 
-  /** Preferences: connections (Discord) and shortcuts; the game's own options are in its Settings → Profile. */
+  /** (2.1.1) Twitch: linked by signing in with Twitch (not typed), so the channel on a profile is really theirs. */
+  function twitchPanel() {
+    const out = msg();
+    const box = h("div", {}, h("p.field-hint", { text: "Checking your Twitch link…" }));
+    // back from Twitch's sign-in
+    const q = new URLSearchParams(location.search);
+    if (q.get("twitch") === "linked") {
+      setMsg(out, "Twitch linked! Your channel shows on your profile now.", true);
+      history.replaceState(null, "", location.pathname + location.hash);
+    }
+    const render = (st) => {
+      box.textContent = "";
+      if (!st.linked) {
+        const link = h("button.btn.primary.tw-link", { type: "button", onclick: () => busy(link, async () => {
+          try { const r = await callApi("twitch/start", { from: "site" }, true); location.href = r.url; }
+          catch (e) { setMsg(out, e.message); }
+        }) }, "Link Twitch");
+        if (st.ready === false) { link.disabled = true; setMsg(out, "Twitch linking isn't set up on the server yet."); }
+        box.append(h("div.panel-actions", { style: "justify-content:flex-start" }, link));
+        return;
+      }
+      const un = h("button.btn.ghost", { type: "button", onclick: () => {
+        if (!confirm("Unlink Twitch? Your channel won't show on your profile any more.")) return;
+        busy(un, async () => { try { await callApi("twitch/unlink", {}, true); setMsg(out, "Twitch unlinked.", true); load(); } catch (e) { setMsg(out, e.message); } });
+      } }, "Unlink");
+      box.append(h("div.email-row.tw-row", {},
+        h("span.tw-logo", { text: "twitch" }),
+        h("a", { href: `https://www.twitch.tv/${encodeURIComponent(st.linked.login)}`, target: "_blank", rel: "noopener", text: `twitch.tv/${st.linked.login}` }),
+        h("span.field-hint", { text: "Linked with Twitch" }), un));
+      const cb = h("input", { type: "checkbox" }); cb.checked = st.show !== false;
+      cb.addEventListener("change", async () => {
+        cb.disabled = true;
+        try { await callApi("twitch/prefs", { show: cb.checked }, true); setMsg(out, cb.checked ? "Your Twitch shows on your profile." : "Your Twitch is hidden from your profile.", true); }
+        catch (e) { cb.checked = !cb.checked; setMsg(out, e.message); }
+        cb.disabled = false;
+      });
+      box.append(h("div.dc-opts", {}, h("label.dc-opt", {}, cb, h("span", {}, h("b", { text: "Show my Twitch on my profile" }),
+        h("span.field-hint", { text: "Players see your channel on your profile, in the game and here. While you're live, your profile shows it with a Watch stream button." })))));
+    };
+    const load = () => callApi("twitch/status", {}, true).then(render).catch((e) => { box.replaceChildren(h("p.field-hint", { text: "Couldn't check your Twitch link: " + e.message })); });
+    load();
+    return section("Twitch", "Link your Twitch channel by signing in with Twitch: it shows on your profile with a check mark, and players see when you're live.", box, out);
+  }
+
+  /** Preferences: connections (Discord, Twitch) and shortcuts; the game's own options are in its Settings → Profile. */
   function preferencesPanel() {
     const conn = discordPanel();
     const boost = h("p.field-hint", { text: "Boosting the OCTIVE Discord server with your Discord linked makes you a supporter for as long as the boost lasts (any paid supporter time is paused meanwhile and continues after)." });
     conn.append(boost);
+    const tw = twitchPanel();
     const more = section("Messages and friends", "Read and send messages to your friends, see who follows you, and manage who you follow.",
       h("div.panel-actions", { style: "justify-content:flex-start;gap:10px;flex-wrap:wrap" },
         h("a.btn.primary", { href: "#/messages" }, "Open messages"),
         h("a.btn", { href: "#/u/" + encodeURIComponent(me.playerId) }, "My public profile")));
     const game = section("In the game", "Discord status, appearing offline, who can watch you play and notifications are set in OCTIVE: Settings → Profile.");
-    return h("div", {}, conn, more, game);
+    return h("div", {}, conn, tw, more, game);
   }
 
   function emailPanel() {
