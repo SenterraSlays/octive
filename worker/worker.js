@@ -828,7 +828,7 @@ async function chartShapeIndex(env) {
       for (const c of sg.charts || []) {
         const ch = set > 0 && c.osuMd5 ? c.osuMd5 : c.chartId;
         if (!ch || !(Number(c.stars) > 0)) continue;
-        out.set(`${board}/${ch}`, { stars: Number(c.stars), keys: Number(c.keys) || 0, tags: [...new Set([...(c.autoTags || []), ...(it.tags || [])].map(String))] });
+        out.set(`${board}/${ch}`, { stars: Number(c.stars), keys: Number(c.keys) || 0, tags: [...new Set([...(c.autoTags || []), ...(it.tags || [])].map(String))], mc: chartIsModchart(c) || (it.tags || []).includes("modchart") });
       }
     }
   }
@@ -853,17 +853,40 @@ const SKILL_AXES = [
  * A player's skill on each pattern, in stars: each judged play is a level (its stars × an accuracy factor, the same
  * rule as Ranked placement), and an axis is the average of its 3 best levels on charts with those tags.
  */
+/**
+ * (2.1.2) How much of a chart's stars a play shows you can handle: all of it only at 98%+ (that's "can play it" in
+ * mania; 95% used to count fully, which put players a star or more above what they can really play), then less
+ * quickly as accuracy drops.
+ */
+function skillFactor(acc) {
+  const pts = [[100, 1], [98, 1], [96, 0.93], [94, 0.86], [92, 0.79], [90, 0.72], [85, 0.58], [80, 0.45], [70, 0.3], [0, 0.15]];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [a1, v1] = pts[i], [a0, v0] = pts[i + 1];
+    if (acc >= a0) return v0 + (v1 - v0) * (acc - a0) / (a1 - a0);
+  }
+  return 0.15;
+}
+/**
+ * The skill radar. (2.1.2) A comfortable level, not a best-ever one: the middle of your best plays (20 overall, 5 per
+ * pattern), with full credit only at 98%+. Modcharts are left out: their stars are mostly how hard the effects are to
+ * read, not the notes (a few OCTIVE Remixes put players well above what they can play).
+ */
 function skillsFrom(plays, idx) {
   const levels = SKILL_AXES.map(() => []), all = [];
   for (const [k, p] of plays) {
     const sh = idx.get(k);
-    if (!sh) continue;
-    const lv = rkLevel(sh.stars, Number(p.acc) || 0, false, !!p.fc);
+    if (!sh || sh.mc) continue;
+    const lv = sh.stars * skillFactor(Number(p.acc) || 0);
     all.push(lv);
     SKILL_AXES.forEach(([, , tags], i) => { if (sh.tags.some((t) => tags.includes(t))) levels[i].push(lv); });
   }
-  const top = (a, n) => { const s = [...a].sort((x, y) => y - x).slice(0, n); return s.length ? round2(s.reduce((x, y) => x + y, 0) / s.length) : 0; };
-  return { overall: top(all, 5), plays: all.length, axes: SKILL_AXES.map(([key, name], i) => ({ key, name, level: top(levels[i], 3), plays: levels[i].length })) };
+  const middle = (a, n) => {
+    const s = [...a].sort((x, y) => y - x).slice(0, n);
+    if (!s.length) return 0;
+    const m = s.length >> 1;
+    return round2(s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2);
+  };
+  return { overall: middle(all, 20), plays: all.length, axes: SKILL_AXES.map(([key, name], i) => ({ key, name, level: middle(levels[i], 5), plays: levels[i].length })) };
 }
 
 /** What a profile's Progress shows: the kept days, the rebuilt weeks before them, and the skill radar. */
