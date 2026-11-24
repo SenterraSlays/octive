@@ -17,7 +17,7 @@
 // pictures, badges) is read here too, so banned players disappear from the site as well.
 
 // the game's judge, so plays are judged again from their replays (board scores, daily charts, dans): deploy judge.js with this file
-import { JUDGE_VERSION, JudgeDataError, loadChart, compileChart, packCompiled, unpackCompiled, readReplay, judgeReplay, parseMods, rateOf, signatureMatch, REPLAY_VERSION, chartStats, seededRandom, botPlay, starRating, playPR, gradeOf } from "./judge.js";
+import { JUDGE_VERSION, JudgeDataError, loadChart, compileChart, packCompiled, unpackCompiled, readReplay, judgeReplay, parseMods, rateOf, signatureMatch, REPLAY_VERSION, chartStats, seededRandom, botPlay, starRating, playPR, gradeOf, ppAccuracy, STAR_VERSION } from "./judge.js";
 /**
  * The oldest replay version whose plays still count (boards, dailies, dans). 3 = 2.0 and newer (no early misses), raised
  * when 2.0 came out (2026-11-17): plays from 1.x get "Update the game and play it again".
@@ -31,7 +31,7 @@ const CARD_TTL = 3 * 60_000;       // public card + online status refresh
 const CARD_FETCH_BUDGET = 40;      // cards fetched per request (Cloudflare free plan: 50 subrequests)
 const ONLINE_MS = 5 * 60_000;
 const PP_VERSION = 3;              // the PP rework (1.3.3): totals from older formulas are listed after, as "before rework"
-const PP_LATEST = 4;               // the game's newest PP formula (Performance.Version; 4 = 1.6.0's osu! accuracy)
+const PP_LATEST = 5;               // the game's newest PP formula (Performance.Version; 4 = 1.6.0's osu! accuracy; 5 = 2.1.3's star rating v5 and accuracy curve)
 const DEVELOPERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE"]; // same list as the game's PlayerRoles
 
 let board = null, boardAt = 0, boardBuildingAt = 0;
@@ -100,8 +100,14 @@ const round2 = (x) => Math.round(x * 100) / 100;
 function playPRMax(stars, acc = 100) {
   const s = Math.min(V.maxStars, Math.max(0, stars));
   const a = Math.max(0, Math.min(1, acc / 100));
-  return 8 * Math.pow(Math.max(s - 0.15, 0.05), 2.2) * Math.max(0, 5 * a - 4) * 1.1 * 1.0005 + 0.02;
+  return 8 * Math.pow(Math.max(s - 0.15, 0.05), 2.2) * accCurve(a) * 1.1 * 1.0005 + 0.02;
 }
+/** How much of a chart's PR a play's accuracy (osu!mania accuracy, 0..1) gives: (2.1.3) each 1% lost costs 3%. */
+const accCurve = (a) => Math.max(0, 1 - 3 * (1 - a));
+/** The same before 2.1.3 (5 x accuracy - 4: 80% gave nothing), for moving PR worked out with it. */
+const accCurveOld = (a) => Math.max(0, 5 * a - 4);
+/** The game's rough osu!mania accuracy from its shown accuracy (Performance.PPAccuracyFromShown), 0..1. */
+const ppAccFromShown = (shown) => Math.max(0, 100 - (100 - shown) * 1.35) / 100;
 /** Total PR from the best play per chart: the best counts fully, the next 95%, … plus the plays bonus (Performance.Total). */
 function totalPR(best) {
   const sorted = [...best].sort((a, b) => b - a);
@@ -262,11 +268,14 @@ async function rankFromPlays(env, cfg, playerId) {
   // (their board scores); the numbers the game syncs don't count for them (if they can't be read, this fails: better
   // no update than a ranking of 0)
   const judged = await judgedPlays(env, playerId, charts);
+  // (2.1.3) what counts per chart, for the game to show (and to send better plays the server hasn't got)
+  const byChart = { verified: {}, unverified: [] };
   for (const [k, p] of Object.entries(judged.charts || {})) {
     if (!p || !isNum(p.pp, 0, V.maxTotalPR) || !(p.pp > 0) || !isNum(p.acc, 0, 100)) continue;
     if (!(await boardSong(env, k.split("/")[0]).catch(() => false))) continue; // no longer verified
     if (resetAt && !(Date.parse(p.at) > resetAt)) continue; // from before the player's reset
     plays.push({ pp: round2(p.pp), acc: p.acc });
+    byChart.verified[k] = round2(p.pp);
   }
   // 2.0.1: every other chart (not verified) gives a third of its PR, only from plays the server judged itself from the
   // chart and replay the game sent (see unverifiedPlay): the numbers the game syncs never count. Plays from before 2.0.1
@@ -278,6 +287,7 @@ async function rankFromPlays(env, cfg, playerId) {
     if (p.song && (await boardSong(env, p.song).catch(() => false))) continue; // its song got verified: its board play counts
     const play = { pp: round2(p.pp * UNVERIFIED_SHARE), acc: p.acc };
     plays.push(play);
+    if (byChart.unverified.length < 300) byChart.unverified.push({ song: p.song || null, d: p.d || null, pp: round2(p.pp), counted: play.pp, stv: p.stv || 3 });
     if (p.old && nowMs < RESTORE_UNTIL && nowMs - Date.parse(p.at) < 86_400_000) restoring.add(play);
   }
   // totals: after a reset the device must have started over; numbers from before don't count
@@ -293,8 +303,9 @@ async function rankFromPlays(env, cfg, playerId) {
     playTimeMs: fresh ? 0 : cleanInt(data.playTimeMs, 0, V.maxPlayTimeMs, 0),
     fullCombos, maxCombo: bestCombo,
     // the formula the game worked the plays out with (1.6 games show anything older than theirs as out of date)
-    ppVersion: isInt(data.ppVersion, 0, 100) && data.ppVersion >= PP_VERSION ? Math.min(data.ppVersion, PP_LATEST) : 2,
-    counted: plays.length, problems,
+    // (2.1.3) the PR comes from the server's own numbers now (v5 stars, the new accuracy curve), whatever the game
+    ppVersion: isInt(data.ppVersion, 0, 100) && data.ppVersion >= PP_VERSION ? PP_LATEST : 2,
+    counted: plays.length, problems, byChart,
     charts, resetAt,
     // (2.0.1) the total without earlier plays sent again today (the pace check), and the synced numbers (achievements)
     pacePP: restoring.size ? totalPR(plays.filter((p) => !restoring.has(p)).map((p) => p.pp)) : undefined,
@@ -370,12 +381,20 @@ function mergeJudged(cur, nw, forAch) {
  * Keeps a judged board play: its PR for the ranking (the best per board), what achievements read from it (see
  * mergeJudged, playFacts), and the play counted toward the totals the server follows.
  */
+/** (2.1.4) A judged play in the player's recent plays (newest first, 30 kept): what their website profile shows. */
+function pushRecent(d, play) {
+  d.recent = [play, ...(Array.isArray(d.recent) ? d.recent : [])].slice(0, RECENT_KEEP);
+}
+const RECENT_KEEP = 30;
+
 async function rememberJudged(env, playerId, songId, chartId, entry, extra = {}) {
   if (!entry) return;
   const pp = isNum(entry.pp, 0, V.maxTotalPR) ? entry.pp : 0;
   await r2update(env, judgedKey(playerId), () => ({ v: 1, charts: {} }), (d) => {
     d.charts ||= {};
     const k = `${songId}/${chartId}`;
+    pushRecent(d, { k, v: 1, pp, acc: entry.accuracy, g: entry.grade, fc: !!entry.fullCombo, m: entry.mods || undefined,
+      at: entry.date || new Date().toISOString(), st: extra.stars, keys: extra.keys, d: extra.difficulty });
     d.charts[k] = mergeJudged(d.charts[k], {
       pp, acc: entry.accuracy, fc: !!entry.fullCombo, combo: entry.maxCombo || 0, g: entry.grade, pf: allPerfect(entry.counts),
       at: entry.date || new Date().toISOString(), m: entry.mods || undefined, st: extra.stars, k: extra.keys, d: extra.difficulty,
@@ -502,7 +521,7 @@ async function boardChartInfo(env) {
       for (const c of sg.charts || []) {
         const ch = set > 0 && c.osuMd5 ? c.osuMd5 : c.chartId;
         if (!ch || charts.has(`${board}/${ch}`)) continue;
-        charts.set(`${board}/${ch}`, { stars: Number(c.stars) || 0, keys: Number(c.keys) || 0, difficulty: String(c.difficulty || ""), title: String(sg.title || "") });
+        charts.set(`${board}/${ch}`, { stars: Number(c.stars) || 0, stv: Number(c.stv) || 3, stars3: Number(c.stars3 ?? c.stars) || 0, keys: Number(c.keys) || 0, difficulty: String(c.difficulty || ""), title: String(sg.title || "") });
       }
     }
   }
@@ -887,6 +906,49 @@ function skillsFrom(plays, idx) {
     return round2(s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2);
   };
   return { overall: middle(all, 20), plays: all.length, axes: SKILL_AXES.map(([key, name], i) => ({ key, name, level: middle(levels[i], 5), plays: levels[i].length })) };
+}
+
+/**
+ * (2.1.4) What a website profile's Top plays and Recent plays show. Top plays: every chart the ranking counts (verified
+ * ones fully, the rest a third), best first, 100 at most, each with its place's weight (100%, 95%, ...). Recent plays: the
+ * plays the server judged, newest first; until it has kept a few, their best plays fill in by date.
+ */
+async function playsOf(env, id) {
+  const [judged, reset] = await Promise.all([r2json(env, judgedKey(id), null), r2json(env, `rank/reset/${id}.json`, null)]);
+  const info = (await boardChartInfo(env).catch(() => null))?.charts || new Map();
+  const resetAt = reset ? Date.parse(reset.at) || 0 : 0;
+  const after = (at) => !resetAt || Date.parse(at) > resetAt;
+  const verified = (await verifiedSongs(env).catch(() => ({ songs: {} }))).songs || {};
+  const onBoard = (k) => { const sid = k.split("/")[0]; return officialSong(sid) || !!verified[sid]; };
+  const show = (k, p, v) => {
+    const i = v ? info.get(k) : null;
+    return {
+      title: (i && i.title) || p.title || p.t || "Unknown song", difficulty: (i && i.difficulty) || p.d || "", keys: (i && i.keys) || p.k || p.keys || 0,
+      stars: round2((i && i.stars) || p.st || 0), pp: round2(v ? p.pp : (p.counted ?? p.pp * UNVERIFIED_SHARE)), acc: round2(p.acc || 0),
+      grade: p.g || null, fc: !!p.fc, mods: p.m || "", at: p.at || null, verified: !!v, board: v ? k : null,
+    };
+  };
+  const top = [];
+  for (const [k, p] of Object.entries((judged && judged.charts) || {}))
+    if (p && p.pp > 0 && after(p.at) && onBoard(k)) top.push(show(k, p, true));
+  for (const p of Object.values((judged && judged.unverified) || {}))
+    if (p && p.pp > 0 && after(p.at) && !(p.song && onBoard(p.song))) top.push(show(null, { ...p, counted: p.pp * UNVERIFIED_SHARE }, false));
+  top.sort((a, c) => c.pp - a.pp);
+  let w = 1;
+  for (const t of top) { t.weight = round2(w * 100); t.weighted = round2(t.pp * w); w *= 0.95; }
+  // recent: what the server kept, then their best plays by date
+  const recent = [];
+  for (const r of Array.isArray(judged && judged.recent) ? judged.recent : []) {
+    if (!r || !after(r.at)) continue;
+    if (r.v) recent.push(show(r.k, r, true));
+    else recent.push(show(null, { ...r, counted: r.pp }, false));
+  }
+  if (recent.length < 20) {
+    const seen = new Set(recent.map((r) => r.title + "|" + r.difficulty + "|" + r.at));
+    const older = top.filter((t) => t.at && !seen.has(t.title + "|" + t.difficulty + "|" + t.at)).sort((a, c) => Date.parse(c.at) - Date.parse(a.at));
+    for (const t of older) { if (recent.length >= 20) break; recent.push({ ...t, best: true }); }
+  }
+  return { top: top.slice(0, 100), recent: recent.slice(0, 20), total: top.length };
 }
 
 /** What a profile's Progress shows: the kept days, the rebuilt weeks before them, and the skill radar. */
@@ -2048,7 +2110,7 @@ async function account(request, env, route) {
       // the profile's progress graphs (what the ranking shows today), and their crew's score
       if (!official) await rememberDay(env, id, pub.pp, pub.accuracy, rank, pub.level).catch((e) => console.log("progress day", e && e.message));
       if (!official) await crewTouch(env, id, pub.pp).catch((e) => console.log("crew", e && e.message));
-      return reply({ ok: true, pp: pub.pp, level: pub.level, rank, held, leftOut: r.problems.length, counted: r.counted, country });
+      return reply({ ok: true, pp: pub.pp, level: pub.level, rank, held, leftOut: r.problems.length, counted: r.counted, country, plays: r.byChart, starVersion: STAR_VERSION });
     }
     case "rank/seen": {
       // the online heartbeat (written by the server: nobody can make anyone else look online)
@@ -3321,12 +3383,18 @@ async function chartScores(request, env, url) {
       judged: JUDGE_VERSION,
       pts: 1, // 2.1.1 points
     };
-    // a verified chart's stars are known here: the PR on its board is never more than they give at that accuracy
-    try {
-      const kn = findVerified(await verifiedIndex(env), where.songId, where.difficulty, null);
-      const ks = kn ? Number(kn.chart.stars) : 0;
-      if (ks > 0) entry.pp = Math.min(entry.pp, round2(playPRMax(ks + 0.15, entry.accuracy) * 1.03 + 0.5));
-    } catch { /* as sent, within the limits above */ }
+    // (2.1.3) the PR is worked out here from the judged hits when the server has rated the chart (v5) and it was played at
+    // normal speed: what the game sent doesn't count (older games work it out with the old stars and curve)
+    const info5 = (await boardChartInfo(env).catch(() => null))?.charts.get(`${songId}/${chartId}`) || null;
+    if (info5 && info5.stv === STAR_VERSION && info5.stars > 0 && rateOf(replay.mods) === 1)
+      entry.pp = playPR(info5.stars, result.counts, where.compiled.time.length, replay.result?.failed === true, replay.mods);
+    else
+      // a verified chart's stars are known here: the PR on its board is never more than they give at that accuracy
+      try {
+        const kn = findVerified(await verifiedIndex(env), where.songId, where.difficulty, null);
+        const ks = kn ? Number(kn.chart.stars) : 0;
+        if (ks > 0) entry.pp = Math.min(entry.pp, round2(playPRMax(ks + 0.15, entry.accuracy) * 1.03 + 0.5));
+      } catch { /* as sent, within the limits above */ }
     // the server-made ranking: this judged play's PR counts (its best per board), whether or not it beats their board score
     // (2.0.1) with what achievements read from it: the chart's stars and keys, its difficulty, Hidden / Hard Rock / speed plays
     {
@@ -3449,6 +3517,35 @@ async function sentChartText(b64) {
   return new TextDecoder().decode(all);
 }
 
+/**
+ * (2.1.3) Stars for charts by hash: { charts: [{ h, gz? }] } (h: SHA-256 of the chart's text; gz: that text, gzip, base64).
+ * Known hashes answer from stars/v<version>/<h>; a few sent charts per call are rated here (and kept). Gives
+ * { version, stars: { h: stars }, unknown: [h] } (unknown: not rated yet, send it with its text).
+ */
+async function starsByHash(request, env) {
+  const b = await bodyOf(request, 8_000_000);
+  const list = Array.isArray(b.charts) ? b.charts.slice(0, 40) : [];
+  const stars = {}, unknown = [];
+  let rated = 0;
+  for (const c of list) {
+    const h = String((c && c.h) || "").toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(h) || h in stars) continue;
+    const key = `stars/v${STAR_VERSION}/${h}.json`;
+    const have = await r2json(env, key, null);
+    if (have && isNum(have.s, 0, V.maxStars)) { stars[h] = have.s; continue; }
+    if (typeof c.gz !== "string" || rated >= 8) { unknown.push(h); continue; }
+    rated++;
+    let text;
+    try { text = await sentChartText(c.gz); } catch { unknown.push(h); continue; }
+    if ((await sha256Hex(text)) !== h) { unknown.push(h); continue; }
+    let s = 0;
+    try { s = Math.min(V.maxStars, starRating(text, 1)); } catch { s = 0; }
+    await r2put(env, key, { s, at: new Date().toISOString() });
+    stars[h] = s;
+  }
+  return reply({ version: STAR_VERSION, stars, unknown });
+}
+
 /** A chart by its notes, what's judged (the same for a renamed song or chart, different for any changed note). */
 async function chartNotesHash(c) {
   return (await sha256Hex([c.keyCount, Array.from(c.time).join(","), Array.from(c.lane).join(","), Array.from(c.kind).join(",")].join("|"))).slice(0, 32);
@@ -3494,10 +3591,13 @@ async function unverifiedPlay(request, env) {
   const hash = await chartNotesHash(compiled);
   const sig = result.signature ? (await sha256Hex(result.signature)).slice(0, 16) : "";
   const have = ((await r2json(env, judgedKey(who.playerId), null)) || {}).unverified?.[hash];
-  if (have && sig && have.sig === sig) return reply({ ok: true, same: true, pp: have.pp || 0, counted: round2((have.pp || 0) * UNVERIFIED_SHARE) });
+  // (2.1.3) the same play sent again is worked out again when it was rated with older stars (the server doesn't keep the
+  // chart, so the game sends its best plays again after a star rating change)
+  const again = !!(have && sig && have.sig === sig);
+  if (again && have.stv === STAR_VERSION) return reply({ ok: true, same: true, pp: have.pp || 0, counted: round2((have.pp || 0) * UNVERIFIED_SHARE) });
   // a replay counts once: not another player's passed on, and not yours again on an edited copy of the chart
   await refuseCopies(env, `unverified|${hash}`, who, result);
-  await refuseCopies(env, `unverified-mine|${who.playerId}`, who, result, false);
+  if (!again) await refuseCopies(env, `unverified-mine|${who.playerId}`, who, result, false);
   const title = cleanText(b.title || replay.title, 120), difficulty = cleanText(b.difficulty || replay.difficulty, 60);
   // the same anti-cheat as board scores (without comparing numbers: an edited chart judges differently from the game)
   await judgeFlags(env, who.playerId, `unverified ${title || songId}${difficulty ? ` [${difficulty}]` : ""}`, result, null);
@@ -3518,12 +3618,15 @@ async function unverifiedPlay(request, env) {
   await r2update(env, judgedKey(who.playerId), () => ({ v: 1, charts: {} }), (d) => {
     d.unverified ||= {};
     const cur = d.unverified[hash];
-    improved = !cur || pp > (cur.pp || 0);
-    const next = mergeJudged(cur, entry, !failed && rate >= 1);
-    if (improved) { next.sig = sig; if (old) next.old = true; else delete next.old; }
+    const redo = !!(cur && sig && cur.sig === sig); // the same play again (new stars): its PR is replaced, not compared
+    improved = !cur || redo || pp > (cur.pp || 0);
+    const next = mergeJudged(redo ? { ...cur, pp: 0 } : cur, entry, !failed && rate >= 1);
+    if (improved) { next.sig = sig; next.stv = STAR_VERSION; if (old) next.old = true; else delete next.old; }
     d.unverified[hash] = next;
+    if (!redo) pushRecent(d, { h: hash, v: 0, pp: round2(pp * UNVERIFIED_SHARE), raw: pp, acc: entry.acc, g: entry.g, fc: entry.fc, m: entry.m,
+      at: entry.at, st: entry.st, keys: entry.k, d: entry.d, t: entry.title, song: entry.song });
     noteFacts(d, playFacts(result, replay, stars));
-    if (!old) countPlay(d, result, chartMs(compiled) / rate); // (earlier plays are in the totals the server started from)
+    if (!old && !redo) countPlay(d, result, chartMs(compiled) / rate); // (earlier plays are in the totals the server started from)
     const keys = Object.keys(d.unverified);
     if (keys.length > UNVERIFIED_KEEP)
       for (const k of keys.sort((a, c) => (d.unverified[a].pp || 0) - (d.unverified[c].pp || 0)).slice(0, keys.length - UNVERIFIED_KEEP)) delete d.unverified[k];
@@ -5700,6 +5803,54 @@ async function fillModchartFlags(env, maxItems = 6) {
   return { uploads: todo.length, charts: found.length, modcharts: found.filter((x) => x[3]).length, left: Math.max(0, all.length - todo.length) };
 }
 
+/**
+ * (2.1.3) Star rating v5 for every Workshop chart, worked out here from the chart file (an upload's own number came from
+ * the uploader's game). A few uploads at a time, verified ones first; each chart file read once from B2. The rating it had
+ * is kept once as stars3 (for moving PR worked out with it). Run by the hourly job and /api/admin/chart-stars.
+ */
+async function fillChartStars(env, maxItems = 6) {
+  const db = await r2json(env, WS_DB, { items: [] });
+  const missing = (it) => it.type === "charts" && !it.removed && it.meta && (it.b2Files || []).length && (it.meta.starTries || 0) < 3 &&
+    (it.meta.songs || []).some((sg) => (sg.charts || []).some((c) => c.stv !== STAR_VERSION));
+  const all = (db.items || []).filter(missing);
+  const todo = all.sort((a, b) => (b.verified ? 1 : 0) - (a.verified ? 1 : 0) || (b.builtin ? 1 : 0) - (a.builtin ? 1 : 0)).slice(0, maxItems);
+  const found = [], tried = [];
+  for (const it of todo) {
+    const songs = it.meta.songs || [], files = it.b2Files || [];
+    let any = false;
+    for (let fi = 0; fi < files.length && fi < 20; fi++) {
+      const f = files[fi];
+      if (!f || !f.key || Number(f.size) > 200 * 1048576) continue;
+      let m;
+      try { m = await judgeManifest(env, f); } catch (e) { console.log("chart stars", it.id, e && e.message); continue; }
+      let si = m.songId ? songs.findIndex((x) => x.songId === m.songId) : -1;
+      if (si < 0 && songs.length === files.length) si = fi;
+      if (si < 0) continue;
+      const charts = songs[si].charts || [];
+      for (let j = 0; j < charts.length && j < m.charts.length; j++) {
+        if (charts[j].stv === STAR_VERSION || !m.charts[j].entry) continue;
+        try { found.push([it.id, si, j, starRating(new TextDecoder().decode(await judgeZipFile(env, f, m.charts[j].entry)), 1)]); any = true; }
+        catch (e) { console.log("chart stars", it.id, e && e.message); }
+      }
+    }
+    if (!any) tried.push(it.id);
+  }
+  if (found.length || tried.length) {
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      const byId = new Map((d.items || []).map((x) => [x.id, x]));
+      for (const [id, si, j, st] of found) {
+        const ch = byId.get(id)?.meta?.songs?.[si]?.charts?.[j];
+        if (!ch || ch.stv === STAR_VERSION) continue;
+        if (ch.stars3 === undefined) ch.stars3 = Number(ch.stars) || 0;
+        ch.stars = st; ch.stv = STAR_VERSION;
+      }
+      for (const id of tried) { const it = byId.get(id); if (it && it.meta) it.meta.starTries = (it.meta.starTries || 0) + 1; }
+    });
+    judgeDbCache = null; chartInfoCache = null; verIdx = null; rkPoolCache[4] = rkPoolCache[7] = null;
+  }
+  return { uploads: todo.length, charts: found.length, left: Math.max(0, all.length - todo.length) };
+}
+
 let judgeDbCache = null, judgeDbAt = 0;
 async function judgeDb(env) {
   if (judgeDbCache && Date.now() - judgeDbAt < 60_000) return judgeDbCache;
@@ -6068,6 +6219,9 @@ async function wsMeta(kind, u8) {
         bpm: Number(m.song?.bpm) || 0, durationUs: Number(m.song?.durationUs) || 0, osuSet: set ? Number(set[1]) : 0,
         charts: src.map((c) => ({
           difficulty: String(c.difficulty || "").slice(0, 100), keys: Number(c.keyCount) || 0, stars: Math.round((Number(c.rating) || 0) * 100) / 100,
+          // (2.1.3) rated with star rating v5 by the uploader's game (2.1.3+ marks its exact numbers "s1-v5"); older games' stars
+          // are rated again by the developer's tools (Tools/stars_v5.py rate)
+          stv: String(c.summary || "") === "s1-v" + STAR_VERSION ? STAR_VERSION : undefined,
           notes: Number(c.noteCount) || 0, creator: String(c.creator || "").slice(0, 60),
           // the chart's own id, and (charts from osu!) its .osu file's MD5: what the verified-copy check compares
           chartId: typeof c.chartId === "string" && /^[A-Za-z0-9_.:-]{1,80}$/.test(c.chartId) ? c.chartId : undefined,
@@ -6554,9 +6708,8 @@ function findDan(idx, songId, difficulty, board) {
 }
 // ---- a copy of a verified chart that's been changed (its notes, keys or stars) doesn't count for dans or dailies and
 // can't be picked in multiplayer: the player is told to redownload the verified map. Notes and keys must be the same;
-// stars within 0.1, and only for uploads rated with the game's current star rating (v3, from 1.3.3), since an older
-// upload's stored stars differ for unchanged charts too.
-const STAR_VERSION = 3, STARS_V3_FROM = Date.parse("2026-11-12T00:00:00Z");
+// stars within 0.1, and only when both were rated with the current star rating (2.1.3: v5, STAR_VERSION from judge.js; the
+// server rates uploads itself now, see fillChartStars), since stars from another version differ for unchanged charts too.
 function chartProblems(it, chart, local, songId, via) {
   if (!local || typeof local !== "object" || !chart) return [];
   const out = [];
@@ -6573,7 +6726,7 @@ function chartProblems(it, chart, local, songId, via) {
   const rated = typeof when === "number" ? when : Date.parse(when || "") || 0;
   // OCTIVE's own songs carry hand-set difficulty numbers, not worked-out stars: their notes and keys are checked
   const ownSong = (it && it.builtin) || officialSong(songId);
-  if (!ownSong && Number(local.sv) === STAR_VERSION && rated >= STARS_V3_FROM && chart.stars > 0 && Number.isFinite(s) && s > 0 && Math.abs(s - chart.stars) > 0.1)
+  if (!ownSong && Number(local.sv) === STAR_VERSION && Number(chart.stv) === STAR_VERSION && chart.stars > 0 && Number.isFinite(s) && s > 0 && Math.abs(s - chart.stars) > 0.1)
     out.push(`${s.toFixed(2)}★ instead of ${Number(chart.stars).toFixed(2)}★`);
   return out;
 }
@@ -9300,6 +9453,14 @@ async function playRoutes(request, env, url) {
     if (isOfficial(id)) return reply({ days: [], built: [], skills: { overall: 0, plays: 0, axes: [] }, official: true });
     return reply(await progressOf(env, id));
   }
+  // ---- (2.1.4) a player's top plays (the PR the ranking counts per chart, best first, with each one's weight) and recent
+  // plays (the plays the server judged, newest first; before it kept them, their best plays by date), for their profile
+  if (path === "/play/plays" && request.method === "GET") {
+    const id = String(url.searchParams.get("player") || "");
+    if (!okPlayerId(id)) fail(400, "That player can't be found.");
+    if (isOfficial(id)) return reply({ top: [], recent: [], official: true });
+    return json(await playsOf(env, id), 60);
+  }
   // ---- a player's cleared dans (their profile's View Dans)
   if (path === "/play/dans/of" && request.method === "GET") {
     const id = String(url.searchParams.get("player") || "");
@@ -10094,6 +10255,132 @@ async function workshopRoutes(request, env, url, ctx) {
       await r2update(env, key, () => ({ entries: [] }), (x) => { convert(x); });
       boards.delete(key);
     }
+    const left = last ? keys.filter((k) => k > last).length : 0;
+    return reply({ ok: true, dry, ...out, after: last, left });
+  }
+  // ---- (2.1.3) Workshop charts' stars worked out by the developer's tools (Tools/stars_v5.py rate: the same judge.js,
+  // run on the uploads' files): { results: [[itemId, songIndex, chartIndex, stars]], version }. One write for the lot.
+  if (path === "/api/admin/chart-stars-set" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 2_000_000).catch(() => ({}));
+    if (Number(b.version) !== STAR_VERSION) fail(409, `The server rates with v${STAR_VERSION}.`);
+    const list = (Array.isArray(b.results) ? b.results : []).filter((r) => Array.isArray(r) && typeof r[0] === "string" && isInt(r[1], 0, 1000) && isInt(r[2], 0, 1000) && isNum(r[3], 0, V.maxStars));
+    let set = 0;
+    await r2update(env, WS_DB, () => ({ items: [] }), (d) => {
+      const byId = new Map((d.items || []).map((x) => [x.id, x]));
+      for (const [id, si, j, st] of list) {
+        const ch = byId.get(id)?.meta?.songs?.[si]?.charts?.[j];
+        if (!ch || ch.stv === STAR_VERSION) continue;
+        if (ch.stars3 === undefined) ch.stars3 = Number(ch.stars) || 0;
+        ch.stars = round2(st); ch.stv = STAR_VERSION; set++;
+      }
+      if (!set) return false;
+    });
+    judgeDbCache = null; chartInfoCache = null; verIdx = null; rkPoolCache[4] = rkPoolCache[7] = null;
+    return reply({ ok: true, set, sent: list.length });
+  }
+  // ---- (2.1.3) Workshop charts' stars worked out here with v5: a batch per call until "left" is 0 (small uploads only:
+  // the Worker's CPU limit is reached on big packs, so Tools/stars_v5.py rate does the rest)
+  if (path === "/api/admin/chart-stars" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 2000).catch(() => ({}));
+    return reply({ ok: true, ...(await fillChartStars(env, Math.max(1, Math.min(12, Number(b.uploads) || 6)))) });
+  }
+  // ---- (2.1.3) PR moved to star rating v5 and the new accuracy curve. Phase "boards": every board score's PR is worked
+  // out again from its judgement counts and the chart's v5 stars (normal-speed plays exactly; speed plays scaled by the
+  // stars and the curve). Boards whose chart isn't rated with v5 yet wait (run chart-stars first). Phase "judged": each
+  // player's judged plays (the ranking reads them) take their board score's new PR when it's the same play, else are
+  // scaled the same way; unverified plays (their chart isn't kept) only by the curve. Every file is copied to
+  // backups/pr-v5/ first and marked (prv: 5), so a call can be repeated. Then /api/admin/rank-recompute.
+  if (path === "/api/admin/pr-v5" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 20_000).catch(() => ({}));
+    const dry = b.dry === true, phase = b.phase === "judged" ? "judged" : "boards";
+    const limit = Math.max(1, Math.min(phase === "boards" ? 200 : 20, Number(b.limit) || (phase === "boards" ? 80 : 8)));
+    const info = (await boardChartInfo(env)).charts;
+    const starScale = (i) => (i && i.stv === STAR_VERSION && i.stars3 > 0 ? Math.pow(Math.max(i.stars - 0.15, 0.05) / Math.max(i.stars3 - 0.15, 0.05), 2.2) : 1);
+    const curveScale = (a) => (accCurveOld(a) > 0 ? accCurve(a) / accCurveOld(a) : 1);
+    const prefix = phase === "boards" ? "scores/" : "rank/judged/";
+    const keys = [];
+    let cursor;
+    do {
+      const list = await env.RELEASES.list({ prefix, cursor });
+      for (const o of list.objects) if (o.key.endsWith(".json") && !o.key.startsWith("scores/rate/")) keys.push(o.key);
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
+    keys.sort();
+    const after = String(b.after || "");
+    const out = { phase, files: 0, exact: 0, scaled: 0, waiting: [], prBefore: 0, prAfter: 0 };
+    let last = null, done = 0;
+    for (const key of keys) {
+      if (after && key <= after) continue;
+      if (done >= limit) break;
+      done++; last = key;
+      const data = await r2json(env, key, null);
+      if (!data) continue;
+      if (phase === "boards") {
+        const board = key.slice(7, -5), i = info.get(board);
+        if (!Array.isArray(data.entries) || !data.entries.some((e) => e && e.prv !== 5)) continue;
+        // OCTIVE's own songs keep their hand-set numbers (not v5): worked out again with those; a board whose chart isn't
+        // listed any more only gets the new accuracy curve
+        if (!i || i.stv !== STAR_VERSION) out.waiting.push(board);
+        const stars = i && i.stars > 0 ? i.stars : 0;
+        out.files++;
+        const move = (x) => {
+          for (const e of x.entries || []) {
+            if (!e || e.prv === 5) continue;
+            out.prBefore += Number(e.pp) || 0;
+            const counts = Array.isArray(e.counts) && e.counts.length >= 6 ? e.counts : null;
+            const targets = counts ? counts.slice(0, 6).reduce((a, n) => a + (Number(n) || 0), 0) : 0;
+            if (stars > 0 && counts && targets > 0 && rateOf(e.mods) === 1) { e.pp = playPR(stars, counts, targets, false, e.mods); out.exact++; }
+            else {
+              // (the shown accuracy is within a few hundredths of osu!mania's on real plays)
+              const acc = counts && ppAccuracy(counts) >= 0 ? ppAccuracy(counts) / 100 : (Number(e.accuracy) || 0) / 100;
+              e.pp = round2((Number(e.pp) || 0) * starScale(i) * curveScale(acc)); out.scaled++;
+            }
+            e.prv = 5;
+            out.prAfter += e.pp;
+          }
+        };
+        if (dry) { move(JSON.parse(JSON.stringify(data))); continue; }
+        if (!(await env.RELEASES.head(`backups/pr-v5/${key}`))) await env.RELEASES.put(`backups/pr-v5/${key}`, JSON.stringify(data));
+        await r2update(env, key, () => ({ entries: [] }), (x) => { move(x); });
+        boards.delete(key);
+      } else {
+        if (data.prv === 5) continue;
+        const id = key.slice(prefix.length, -5);
+        out.files++;
+        // this player's board scores (their new PR), for the plays that are the same as their board score
+        const mine = new Map();
+        for (const k of Object.keys(data.charts || {})) {
+          const bd = await r2json(env, `scores/${k}.json`, null).catch(() => null);
+          const e = bd && Array.isArray(bd.entries) ? bd.entries.find((x) => x && x.playerId === id && x.prv === 5) : null;
+          if (e) mine.set(k, e);
+        }
+        const move = (d) => {
+          for (const [k, p] of Object.entries(d.charts || {})) {
+            if (!p || !(p.pp > 0)) continue;
+            out.prBefore += p.pp;
+            const e = mine.get(k);
+            if (e && Math.abs((Number(e.accuracy) || 0) - (Number(p.acc) || 0)) < 0.005 && String(e.mods || "") === String(p.m || "")) { p.pp = Number(e.pp) || 0; out.exact++; }
+            else { p.pp = round2(p.pp * starScale(info.get(k)) * curveScale((Number(p.acc) || 0) / 100)); out.scaled++; }
+            out.prAfter += p.pp;
+          }
+          for (const p of Object.values(d.unverified || {})) {
+            if (!p || !(p.pp > 0)) continue;
+            out.prBefore += p.pp;
+            p.pp = round2(p.pp * curveScale((Number(p.acc) || 0) / 100)); out.scaled++;
+            out.prAfter += p.pp;
+          }
+          d.prv = 5;
+        };
+        if (dry) { move(JSON.parse(JSON.stringify(data))); continue; }
+        if (!(await env.RELEASES.head(`backups/pr-v5/${key}`))) await env.RELEASES.put(`backups/pr-v5/${key}`, JSON.stringify(data));
+        await r2update(env, key, () => ({ v: 1, charts: {} }), (d) => { if (d.prv === 5) return false; move(d); });
+      }
+    }
+    out.prBefore = round2(out.prBefore); out.prAfter = round2(out.prAfter);
+    out.waiting = out.waiting.slice(0, 50);
     const left = last ? keys.filter((k) => k > last).length : 0;
     return reply({ ok: true, dry, ...out, after: last, left });
   }
@@ -11212,6 +11499,13 @@ export default {
     if (/^\/(support\/|stripe\/webhook$|looks\/|social\/|follow$|twitch\/callback$)/.test(url.pathname)) {
       try { const r = await supportRoutes(request, env, url, ctx); if (r) return r; }
       catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message, code: e.code || undefined, itemId: e.itemId || undefined }, e.status >= 400 && e.status < 600 ? e.status : 500); }
+    }
+    // (2.1.3) star ratings: the version the server rates with (the game compares it with its own), and stars by the
+    // SHA-256 of a chart's text (charts sent gzip + base64 are rated here and kept by hash)
+    if (url.pathname === "/stars/version" && request.method === "GET") return json({ version: STAR_VERSION }, 300);
+    if (url.pathname === "/stars" && request.method === "POST") {
+      try { return await starsByHash(request, env); }
+      catch (e) { return reply({ error: e.expose ? e.message : "Something went wrong on the server: " + e.message }, e.status >= 400 && e.status < 600 ? e.status : 500); }
     }
     if (url.pathname.startsWith("/play/")) {
       try { return await playRoutes(request, env, url); }

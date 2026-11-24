@@ -773,6 +773,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     overview.append(showcase);
     const skillsSlot = h("div.pf-skills-slot");
     overview.append(skillsSlot);
+    // (2.1.4) their top plays and recent plays, as the global ranking counts them
+    if (!official) overview.append(playsSection(p));
     loadCosmetics().then((cz) => {
       const mine = cz.players[p.id] || {};
       const title = mine.title && cz.titles[mine.title];
@@ -814,6 +816,54 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     document.title = `${p.name} · OCTIVE`;
     setTimeout(giftPopup, 400);
     window.scrollTo(0, 0);
+  }
+
+  // ---------------------------------------------------------------- top plays and recent plays (2.1.4)
+  const GRADE_COL = { SS: "#ffd23f", S: "#ffb13b", A: "#5ee08a", B: "#5ab8ff", C: "#b69bff", D: "#ff6b8b", F: "#8a8aa0" };
+  const shortDate = (iso) => new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+  /**
+   * A profile's Top plays (the PR the global ranking counts per chart, best first, with what each counts for in their total)
+   * and Recent plays (the plays the server checked, newest first), from /play/plays. Hidden when they have none.
+   */
+  function playsSection(p) {
+    const list = h("div.pl-list");
+    const tabBtns = {};
+    const tabs = h("div.pl-tabs", {}, ...[["top", "Top plays"], ["recent", "Recent plays"]].map(([k, label]) =>
+      (tabBtns[k] = h("button.pl-tab", { type: "button", onclick: () => { mode = k; shown = 10; paint(); } }, label))));
+    const box = h("section.pl-section", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: "Plays" }), tabs), list);
+    let data = null, mode = "top", shown = 10;
+    const row = (t, i) => {
+      const top = mode === "top";
+      const meta = [t.difficulty, t.keys ? t.keys + "K" : "", t.mods, t.at ? (top ? shortDate(t.at) : ago(t.at)) : ""].filter(Boolean).join(" · ");
+      return h("div.pl-row", { "data-place": top ? i + 1 : null },
+        h("span.pl-rank", { text: top ? "#" + (i + 1) : "" }),
+        h("span.pl-grade", { text: t.grade || "–", style: `--g:${GRADE_COL[t.grade] || "#8a8aa0"}`, title: t.fc ? "Full combo" : null }, t.fc ? h("i", { text: "FC" }) : null),
+        h("div.pl-song", {},
+          h("b", { text: t.title, title: t.title }),
+          h("small", {}, h("span.pl-star", { text: "★ " + (t.stars || 0).toFixed(2), style: `--s:${starColor(t.stars || 0)}` }), h("span", { text: meta }),
+            h("span.pl-acc-m", { text: fmt2.format(t.acc || 0) + "%" }))),
+        h("span.pl-acc", { text: fmt2.format(t.acc || 0) + "%" }),
+        h("div.pl-pr", { title: t.verified ? null : "Not verified: a third of the play's PR counts toward the ranking" },
+          h("b", { text: fmt0.format(t.pp || 0) + " PR" }),
+          top ? h("small", { text: `counts ${(t.weighted || 0).toFixed(1)} PR · ${t.weight}%` })
+            : !t.verified ? h("small", { text: "not verified" }) : null));
+    };
+    const paint = () => {
+      for (const [k, b] of Object.entries(tabBtns)) b.classList.toggle("active", k === mode);
+      tabBtns.top.textContent = data && data.total ? `Top plays · ${fmt0.format(data.total)}` : "Top plays";
+      const rows = (data && data[mode]) || [];
+      list.replaceChildren(
+        ...(rows.length ? rows.slice(0, shown).map(row) : [h("p.empty", { text: mode === "top" ? "No plays on the ranking yet." : "No recent plays yet." })]),
+        rows.length > shown ? h("button.btn.small.pl-more", { type: "button", onclick: () => { shown += 20; paint(); } }, `Show more (${fmt0.format(rows.length - shown)})`) : null);
+    };
+    if (worker) fetch(`${worker}/play/plays?player=${encodeURIComponent(p.id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+      if (!d || !box.isConnected && !box.parentNode) return;
+      if (!((d.top || []).length || (d.recent || []).length)) return;
+      data = d;
+      paint();
+      box.hidden = false;
+    });
+    return box;
   }
 
   // ---------------------------------------------------------------- small DOM helper

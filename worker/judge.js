@@ -1210,13 +1210,30 @@ function behaviorWeight(b) {
 }
 
 const roundEven2 = (x) => roundEven(x * 100) / 100;
-const jackFactor = (dt) => (!Number.isFinite(dt) || dt >= 80 ? 1 : dt >= 55 ? 1 - ((80 - dt) / 25) * 0.35 : dt >= 25 ? 0.65 - ((55 - dt) / 30) * 0.5 : 0.15);
-const runFactor = (run) => (run <= 3 ? 1 : Math.max(0.45, 1 - (run - 3) * 0.055));
+// (2.1.3) v5's knobs, as StarRating's defaults (Performance.cs)
+const SR = { version: 5, scale: 0.013164, speedRef: 150, speedExp: 0.28, speedMax: 1.4, speedPeak: 70, speedVibro: 40, chordOverall: 0.75,
+  techMax: 0.5, techMusical: 0.05, offRelease: 1.45, jackAt55: 0.65, jackAt25: 0.15, runMin: 0.6, runStep: 0.055, sectionDecay: 0.94 };
+/** The star rating's version (StarRating.Version): 5 since 2.1.3. */
+export const STAR_VERSION = SR.version;
+const jackFactor = (dt) => (!Number.isFinite(dt) || dt >= 80 ? 1 : dt >= 55 ? 1 - ((80 - dt) / 25) * (1 - SR.jackAt55) : dt >= 25 ? SR.jackAt55 - ((55 - dt) / 30) * (SR.jackAt55 - SR.jackAt25) : SR.jackAt25);
+const runFactor = (run) => (run <= 3 ? 1 : Math.max(SR.runMin, 1 - (run - 3) * SR.runStep));
+/** StarRating.SpeedBoost: a finger switch on one hand counts more the faster that hand is going (not at vibro speed). */
+function speedBoost(gap) {
+  if (!Number.isFinite(gap) || gap >= SR.speedRef) return 1;
+  const peak = Math.min(SR.speedMax, Math.pow(SR.speedRef / SR.speedPeak, SR.speedExp));
+  if (gap >= SR.speedPeak) return Math.min(SR.speedMax, Math.pow(SR.speedRef / gap, SR.speedExp));
+  if (gap <= SR.speedVibro) return 1;
+  return 1 + (peak - 1) * (gap - SR.speedVibro) / (SR.speedPeak - SR.speedVibro);
+}
+/** StarRating.HandOf: left half, right half, and the middle key of odd layouts (a thumb). */
+const handOf = (lane, keys) => (keys % 2 === 1 && lane === Math.floor(keys / 2) ? 2 : lane < Math.floor(keys / 2) ? 0 : 1);
+/** C#'s Math.Log(x, 2). */
+const log2cs = (x) => Math.log(x) / Math.log(2);
 const decay = (v, dtMs, perSecond) => (!Number.isFinite(dtMs) ? 0 : v * Math.pow(perSecond, Math.max(0, dtMs) / 1000));
 
 /**
- * A chart's stars at a song speed, as the game works them out (StarRating.Calculate v3): from the chart file (its JSON
- * text or object). Throws JudgeDataError for a chart the game can't load.
+ * A chart's stars at a song speed, as the game works them out (StarRating.Calculate, v5 since 2.1.3): from the chart file
+ * (its JSON text or object). Throws JudgeDataError for a chart the game can't load.
  */
 export function starRating(json, rate = 1) {
   let root = json;
@@ -1267,26 +1284,61 @@ export function starRating(json, rate = 1) {
   for (let i = 0; i < n; i++) { const kind = c.kind[i]; if (kind === TAP || kind === HOLD_HEAD || (kind === HOLD_TAIL && realHold(c.note[i]))) idx.push(i); }
   idx.sort((a, b) => cmp(c.time[a], c.time[b]) || (c.kind[a] === HOLD_TAIL ? 1 : 0) - (c.kind[b] === HOLD_TAIL ? 1 : 0) || c.lane[a] - c.lane[b] || a - b);
   if (!idx.some((i) => c.kind[i] !== HOLD_TAIL)) return 0;
+  // press times, for "is anything pressed when this note is let go?"
+  const pressMs = idx.filter((i) => c.kind[i] !== HOLD_TAIL).map((i) => c.time[i] / (1000 * rate)).sort((a, b) => a - b);
+  const pressNear = (ms, tol) => {
+    let lo = 0, hi = pressMs.length - 1;
+    while (lo <= hi) { const mid = (lo + hi) >> 1; if (pressMs[mid] === ms) return true; if (pressMs[mid] < ms) lo = mid + 1; else hi = mid - 1; }
+    return (lo < pressMs.length && pressMs[lo] - ms <= tol) || (lo > 0 && ms - pressMs[lo - 1] <= tol);
+  };
   const lane = new Array(k).fill(0), laneTime = new Array(k).fill(-Infinity), laneHoldUntil = new Array(k).fill(-Infinity);
   const laneTimeStrain = new Array(k).fill(-Infinity), laneGap = new Array(k).fill(Infinity), laneRun = new Array(k).fill(0);
+  const handCur = [-Infinity, -Infinity, -Infinity], handPrev = [-Infinity, -Infinity, -Infinity];
+  const handCurLanes = [0, 0, 0], handPrevLanes = [0, 0, 0]; // keys pressed in the hand's current / previous chord
   let overall = 0, overallTime = -Infinity;
+  let groupT = -Infinity, lastGroupT = -Infinity, prevGap = Infinity, groupTech = 1, groupIdx = 0;
   const peaks = new Map();
   for (const i of idx) {
     const ms = c.time[i] / (1000 * rate);
     const l = Math.max(0, Math.min(k - 1, c.lane[i]));
     let laneAdd, overallAdd;
-    if (c.kind[i] === HOLD_TAIL) { laneAdd = 0.8; overallAdd = 0.45; }
-    else {
+    if (c.kind[i] === HOLD_TAIL) {
+      // a release with nothing pressed around it has to be timed on its own
+      const m = pressNear(ms, 12) ? 1 : SR.offRelease;
+      laneAdd = 0.8 * m; overallAdd = 0.45 * m;
+    } else {
+      // presses within 2 ms are one chord: the rhythm is read once per chord
+      if (ms - groupT > 2) {
+        const gap = ms - lastGroupT;
+        groupTech = 1;
+        if (gap < 400 && prevGap < 400) {
+          const lr = Math.abs(log2cs(gap / prevGap));
+          // a rhythm change only matters when the notes are fast; only a musical change counts (straight <-> triplet, 3:2, 4:3)
+          const fastNotes = Math.max(0, Math.min(1, (300 - Math.max(gap, prevGap)) / 150));
+          const frac = lr - Math.floor(lr);
+          const musical = Math.min(Math.abs(frac - 0.585), Math.abs(frac - 0.415));
+          groupTech = 1 + SR.techMax * fastNotes * (musical <= SR.techMusical ? 1 : 0);
+        }
+        prevGap = gap; lastGroupT = ms; groupT = ms; groupIdx = 0;
+      } else groupIdx++;
+      // how fast this hand is going (time since its previous chord); only switching fingers counts as speed
+      const hand = handOf(l, k);
+      if (handCur[hand] !== groupT) { handPrev[hand] = handCur[hand]; handPrevLanes[hand] = handCurLanes[hand]; handCur[hand] = groupT; handCurLanes[hand] = 0; }
+      const bit = 2 ** Math.min(62, l);
+      if (Math.floor(handCurLanes[hand] / bit) % 2 === 0) handCurLanes[hand] += bit;
+      const hgap = ms - handPrev[hand];
+      const switched = Math.floor(handPrevLanes[hand] / bit) % 2 === 0;
+      const speed = switched ? speedBoost(hgap) : 1;
       let underHold = false;
       for (let j = 0; j < k; j++) if (j !== l && laneHoldUntil[j] > ms + 1) { underHold = true; break; }
-      const hb = (underHold ? 1.25 : 1.0) * reading(c.note[i], l, c.time[i]);
-      const gap = ms - laneTime[l];
-      if (gap < 130 && Number.isFinite(laneGap[l]) && Math.abs(gap - laneGap[l]) <= 0.15 * gap) laneRun[l]++;
+      const hb = (underHold ? 1.25 : 1.0) * reading(c.note[i], l, c.time[i]) * groupTech * speed;
+      const gapL = ms - laneTime[l];
+      if (gapL < 130 && Number.isFinite(laneGap[l]) && Math.abs(gapL - laneGap[l]) <= 0.15 * gapL) laneRun[l]++;
       else laneRun[l] = 0;
-      laneGap[l] = gap;
-      const jack = jackFactor(gap) * runFactor(laneRun[l]);
+      laneGap[l] = gapL;
+      const jack = jackFactor(gapL) * runFactor(laneRun[l]);
       laneAdd = 2.0 * hb * jack;
-      overallAdd = 1.0 * hb * (0.35 + 0.65 * jack);
+      overallAdd = 1.0 * hb * (0.35 + 0.65 * jack) * (groupIdx > 0 ? SR.chordOverall : 1);
       laneTime[l] = ms;
       if (c.kind[i] === HOLD_HEAD && realHold(c.note[i])) laneHoldUntil[l] = holdEnd.get(c.note[i]);
     }
@@ -1299,8 +1351,8 @@ export function starRating(json, rate = 1) {
     if (!peaks.has(section) || strain > peaks.get(section)) peaks.set(section, strain);
   }
   let weighted = 0, w = 1;
-  for (const v of [...peaks.values()].sort((a, b) => b - a)) { weighted += v * w; w *= 0.9; }
-  return roundEven2(weighted * 0.0213);
+  for (const v of [...peaks.values()].sort((a, b) => b - a)) { weighted += v * w; w *= SR.sectionDecay; }
+  return roundEven2(weighted * SR.scale);
 }
 
 const PP_WEIGHTS = [300, 300, 200, 100, 50, 0];
@@ -1324,7 +1376,7 @@ export function playPR(stars, counts, targets, failed, mods) {
   if (accPct < 0) return 0;
   const acc = Math.max(0, Math.min(1, accPct / 100));
   const difficulty = 8.0 * Math.pow(Math.max(stars - 0.15, 0.05), 2.2);
-  const accFactor = Math.max(0, 5 * acc - 4);
+  const accFactor = Math.max(0, 1 - 3 * (1 - acc)); // (2.1.3; before: 5 x acc - 4)
   const length = 1 + 0.1 * Math.min(1.0, targets / 1500.0);
   // (the game: Math.Round(PlayPP × Mods.PPMultiplier, 2), the multiplier a product in the mods' list order)
   const m = parseMods(mods);
