@@ -913,7 +913,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const ver = stat("Latest version", "…");
     const strip = h("section.hm-stats", {},
       stat("Online now", data ? fmt0.format(online) : "…", "on"),
-      stat("Ranked players", data ? fmt0.format(players.length) : "…"),
+      stat("On the global ranking", data ? fmt0.format(players.length) : "…"),
       stat("Top performance", best ? fmt0.format(best.pp || 0) + " PR" : "—"),
       ver);
     const update = h("aside.hm-update", {}, h("p.empty", { text: "Loading the latest update…" }));
@@ -2800,7 +2800,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const forMe = h("button.seg", { type: "button" }, "For me");
     const forGift = h("button.seg", { type: "button" }, "♥ As a gift");
     const giftBox = h("div.gift-box", { hidden: true });
-    const giftSearch = h("input", { type: "search", placeholder: "Search ranked players by name…", spellcheck: "false" });
+    const giftSearch = h("input", { type: "search", placeholder: "Search players by name…", spellcheck: "false" });
     const giftList = h("div.gift-list");
     const giftChosen = h("div.gift-chosen");
     giftBox.append(giftChosen, giftSearch, giftList);
