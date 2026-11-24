@@ -2188,3 +2188,14 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
   .pl-pr b { font-size: 15px; white-space: nowrap; }
   .pl-pr small { display: none; }
 }
+
+/* (2.1.4) the skills radar drawn like the game's: rings at whole stars, a soft pink shape, dots, values under the names */
+.sk-ring { fill: none; stroke: #ffffff12; }
+.sk-ring.edge { stroke: #ffffff24; }
+.sk-shape { fill: #ff4d9d38; stroke: var(--accent); stroke-width: 2.5; stroke-linejoin: round; }
+.sk-dot { fill: var(--accent); }
+.sk-label { fill: #ffffffe6; font-size: 12px; font-weight: 700; }
+.sk-val { fill: #ff7ab8; font-size: 11px; font-weight: 700; }
+.sk-overall { color: var(--accent); font-size: 22px; font-weight: 900; margin-right: 4px; }
+.sk-sub { display: flex; align-items: baseline; gap: 2px; }
+.sk-words { margin: 10px 0 0; color: var(--dim); font-size: 13px; }

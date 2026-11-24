@@ -1735,33 +1735,43 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const axes = sk.axes || [];
     const NS = "http://www.w3.org/2000/svg", S = 260, C = S / 2, R = 92;
     const levels = axes.map((a) => Number(a.level) || 0);
-    const top = Math.max(1, Math.ceil(Math.max(...levels, 1)));
-    // the scale starts a little under the weakest skill, so the differences show (not one full octagon)
-    const floor = Math.max(0, Math.min(top - 2, Math.floor(Math.min(...levels)) - 1));
-    const frac = (v) => Math.max(0.04, (v - floor) / (top - floor));
+    // (2.1.4) the same scale as the game's radar (ProgressView.SkillRadar): 0 in the middle, the best skill + 0.4 (rounded up
+    // to a whole star) at the edge, rings at whole stars (every second one past 6)
+    const max = Math.max(2, Math.ceil(Math.max(0, ...levels) + 0.4));
+    const frac = (v) => Math.max(0, Math.min(1, v / max));
     const ang = (i) => -Math.PI / 2 + i * 2 * Math.PI / axes.length;
     const pt = (i, r) => [C + Math.cos(ang(i)) * r, C + Math.sin(ang(i)) * r];
+    const poly = (r) => axes.map((_, i) => pt(i, r).map((v) => v.toFixed(1)).join(",")).join(" ");
     const svg = document.createElementNS(NS, "svg");
-    svg.setAttribute("viewBox", `-56 -6 ${S + 112} ${S + 12}`); svg.setAttribute("class", "sk-radar"); svg.setAttribute("role", "img");
+    svg.setAttribute("viewBox", `-62 -14 ${S + 124} ${S + 34}`); svg.setAttribute("class", "sk-radar"); svg.setAttribute("role", "img");
     svg.setAttribute("aria-label", "Skills: " + axes.map((a) => `${a.name} ${(+a.level).toFixed(1)}`).join(", "));
-    let inner = `<defs><linearGradient id="sk-fill" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff4d9d" stop-opacity=".55"/><stop offset="1" stop-color="#a764ff" stop-opacity=".45"/></linearGradient></defs>`;
-    for (const f of [0.25, 0.5, 0.75, 1]) inner += `<polygon class="sk-ring" points="${axes.map((_, i) => pt(i, R * f).map((v) => v.toFixed(1)).join(",")).join(" ")}"/>`;
+    let inner = "";
+    const step = max > 6 ? 2 : 1;
+    for (let st = step; st <= max; st += step) inner += `<polygon class="sk-ring${st === max ? " edge" : ""}" points="${poly(R * st / max)}"/>`;
     axes.forEach((_, i) => { const [x2, y2] = pt(i, R); inner += `<line class="sk-spoke" x1="${C}" y1="${C}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"/>`; });
-    inner += `<polygon class="sk-shape" points="${axes.map((a, i) => pt(i, R * frac(Number(a.level) || 0)).map((v) => v.toFixed(1)).join(",")).join(" ")}"/>`;
-    inner += `<text class="sk-scale" x="${C + 4}" y="${(C - R - 4).toFixed(1)}">${top}★</text><text class="sk-scale" x="${C + 4}" y="${(C - 4).toFixed(1)}">${floor}★</text>`;
+    if (levels.some((v) => v > 0)) {
+      inner += `<polygon class="sk-shape" points="${axes.map((a, i) => pt(i, R * frac(levels[i])).map((v) => v.toFixed(1)).join(",")).join(" ")}"/>`;
+      axes.forEach((_, i) => { if (levels[i] > 0) { const [x, y] = pt(i, R * frac(levels[i])); inner += `<circle class="sk-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.5"/>`; } });
+    }
     axes.forEach((a, i) => {
-      const [lx, ly] = pt(i, R + 20);
+      const [lx, ly] = pt(i, R + 22);
       const anchor = Math.abs(lx - C) < 8 ? "middle" : lx < C ? "end" : "start";
-      inner += `<text class="sk-label" x="${lx.toFixed(1)}" y="${(ly + 4).toFixed(1)}" text-anchor="${anchor}">${String(a.name).replace(/[<&]/g, "")}</text>`;
+      const y0 = ly + (ly < C - R * 0.5 ? -6 : ly > C + R * 0.5 ? 6 : -2);
+      inner += `<text class="sk-label" x="${lx.toFixed(1)}" y="${y0.toFixed(1)}" text-anchor="${anchor}">${String(a.name).replace(/[<&]/g, "")}`
+        + `<tspan class="sk-val" x="${lx.toFixed(1)}" dy="14">★${levels[i].toFixed(1)}</tspan></text>`;
     });
     svg.innerHTML = inner;
     const list = h("ul.sk-list", {}, ...axes.slice().sort((a, b) => b.level - a.level).map((a) => h("li", {},
-      h("span", { text: a.name }), h("span.sk-bar", {}, h("i", { style: `width:${Math.min(100, frac(Number(a.level) || 0) * 100)}%` })), h("b", { text: (Number(a.level) || 0).toFixed(1) }),
+      h("span", { text: a.name }), h("span.sk-bar", {}, h("i", { style: `width:${frac(Number(a.level) || 0) * 100}%` })), h("b", { text: (Number(a.level) || 0).toFixed(1) }),
       h("small", { text: `${fmt0.format(a.plays || 0)} play${a.plays === 1 ? "" : "s"}` }))));
+    // the strongest and the weakest, in words (as the game says it)
+    const known = axes.filter((a) => (Number(a.level) || 0) > 0).sort((a, b) => b.level - a.level);
+    const best = known.length ? known[0].name : null, weak = known.length > 1 ? known[known.length - 1].name : null;
     return h("section.pf-skills", {},
       h("h2", { text: "Skills" }),
-      h("p.sk-sub", { text: `Overall ${(Number(sk.overall) || 0).toFixed(2)}★ · from ${fmt0.format(sk.plays || 0)} plays on verified charts` }),
-      h("div.sk-grid", {}, svg, list));
+      h("p.sk-sub", {}, h("b.sk-overall", { text: `★${(Number(sk.overall) || 0).toFixed(1)}` }), " overall level"),
+      h("div.sk-grid", {}, svg, list),
+      best ? h("p.sk-words", { text: `Best at ${best}` + (weak && weak !== best ? ` · could work on ${weak}` : "") + ` · from ${fmt0.format(sk.plays || 0)} verified plays` }) : null);
   }
 
   // ---------------------------------------------------------------- Workshop search: players too
