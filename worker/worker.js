@@ -5773,7 +5773,9 @@ function cheatSigns(result, claimed) {
  */
 async function judgeFlags(env, playerId, what, result, claimed) {
   const signs = cheatSigns(result, claimed);
-  if (!signs.length) return;
+  // (2.1.2) supporting signs only back up a strong one: alone they mean nothing (phones give every finger in a frame the
+  // same timestamp, so touch players' chords are always "at the very same instant"), so nothing is posted or held back
+  if (!signs.some((s) => s.strong)) return;
   const [cfg, trustedDoc] = await Promise.all([r2json(env, AC_CONFIG, { bans: false }), r2json(env, AC_TRUSTED, { players: {} })]);
   const trusted = !!(trustedDoc.players || {})[playerId];
   // strong signs are counted per player: the same one on a third play is proof
