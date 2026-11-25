@@ -318,6 +318,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         setAvatar(r.querySelector(".avatar"), p);
         setRole(r, r.querySelector(".badge"), p);
         if (isSupporter(p)) { r.classList.add("supporter"); const pill = supporterPill(p); pill.classList.add("rank"); r.querySelector(".player").append(pill); }
+        else if (wasSupporter(p)) { const pill = supporterPill(p); pill.classList.add("rank"); r.querySelector(".player").append(pill); } // the badge they earned stays
         // name and badges together; on phones the badges go on their own line under the name
         {
           const player = r.querySelector(".player"), nameEl = r.querySelector(".name");
@@ -495,6 +496,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       setAvatar(r.querySelector(".avatar"), p);
       setRole(r, r.querySelector(".badge"), p);
       if (isSupporter(p)) { r.classList.add("supporter"); const pill = supporterPill(p); pill.classList.add("rank"); r.querySelector(".player").append(pill); }
+        else if (wasSupporter(p)) { const pill = supporterPill(p); pill.classList.add("rank"); r.querySelector(".player").append(pill); } // the badge they earned stays
       {
         const player = r.querySelector(".player"), nameEl = r.querySelector(".name");
         const who = h("span.who"), tags = h("span.tags");
@@ -2508,6 +2510,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   const EFFECT_NAMES = { none: "None", sparkles: "Sparkles", snow: "Snow", hearts: "Hearts", embers: "Embers", stars: "Stars", aurora: "Aurora", rain: "Rain" };
   const monthsText = (days) => { const m = Math.floor((days || 0) / 30.4375); return m >= 12 ? `${Math.floor(m / 12)} year${m >= 24 ? "s" : ""}${m % 12 ? ` ${m % 12} month${m % 12 === 1 ? "" : "s"}` : ""}` : m >= 1 ? `${m} month${m === 1 ? "" : "s"}` : `${Math.max(0, Math.floor(days || 0))} day${Math.floor(days) === 1 ? "" : "s"}`; };
   const isSupporter = (p) => !!(p && p.supporter && p.supporter.active);
+  /** (2.1.4) Supported before but not now: they keep the badge they earned (not the perks). */
+  const wasSupporter = (p) => !!(p && p.supporter && !p.supporter.active && (p.supporter.days || 0) > 0);
 
   function hashQuery() {
     const i = location.hash.indexOf("?");
@@ -2541,10 +2545,11 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   }
 
   function supporterPill(p, small) {
-    const s = p.supporter;
+    const s = p.supporter, former = !s.active;
     const [, key] = milestoneArt(s.months || 0);
-    return h("span.sup-pill" + (small ? ".small" : ""), { title: s.lifetime ? "Lifetime OCTIVE supporter" : `OCTIVE supporter · ${monthsText(s.days)} in total` },
-      h("img", { src: `badges/supporter-${key}.png`, alt: "" }), small ? null : h("span", { text: "Supporter" }));
+    return h("span.sup-pill" + (small ? ".small" : "") + (former ? ".former" : ""),
+      { title: s.lifetime ? "Lifetime OCTIVE supporter" : former ? `Former OCTIVE supporter · ${monthsText(s.days)} in total` : `OCTIVE supporter · ${monthsText(s.days)} in total` },
+      h("img", { src: `badges/supporter-${key}.png`, alt: "" }), small ? null : h("span", { text: former ? "Former supporter" : "Supporter" }));
   }
 
   /** Profile effects drawn on a canvas over the card (same set as the game). */
@@ -2605,7 +2610,12 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   /** Supporter decoration on a profile card: banner, effect, pill, coloured name. */
   function decorateCard(card, p) {
     const gp = gifterPill(p), row0 = card.querySelector(".card-name-row");
-    if (!isSupporter(p)) { if (gp && row0) row0.append(gp); return; }
+    if (!isSupporter(p)) {
+      // a former supporter keeps the badge they earned
+      if (row0 && wasSupporter(p)) row0.append(supporterPill(p));
+      if (gp && row0) row0.append(gp);
+      return;
+    }
     const s = p.supporter;
     card.classList.add("supporter");
     if (s.banner && worker) {
@@ -2640,9 +2650,11 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("div.tile", {}, h("span", { text: "Months bought" }), h("b", { text: fmt0.format(s.totalMonthsBought || 0) })),
         s.monthsReceived ? h("div.tile", {}, h("span", { text: "Months gifted to them" }), h("b", { text: monthsGiftedText(s.monthsReceived) })) : null,
         h("div.tile", {}, h("span", { text: "Months gifted to others" }), h("b", { text: monthsGiftedText(gifted) }))),
-      h("div.sup-earned", {},
-        earned.map(([, key, label]) => h("figure", {}, h("img", { src: `badges/supporter-${key}.png`, alt: "" }), h("figcaption", { text: label }))),
-        gifts.map(([, key, label]) => h("figure", { title: `${monthsGiftedText(gifted)} gifted to other players` }, h("img", { src: `badges/gifter-${key}.png`, alt: "" }), h("figcaption", { text: label })))));
+      // (2.1.4) supporter badges and gifter badges on lines of their own
+      earned.length ? h("div.sup-earned-row", {}, h("span.sup-earned-head", { text: "Supporter badges" }),
+        h("div.sup-earned", {}, earned.map(([, key, label]) => h("figure", {}, h("img", { src: `badges/supporter-${key}.png`, alt: "" }), h("figcaption", { text: label }))))) : null,
+      gifts.length ? h("div.sup-earned-row", {}, h("span.sup-earned-head", { text: "Gifter badges" }),
+        h("div.sup-earned", {}, gifts.map(([, key, label]) => h("figure", { title: `${monthsGiftedText(gifted)} gifted to other players` }, h("img", { src: `badges/gifter-${key}.png`, alt: "" }), h("figcaption", { text: label }))))) : null);
   }
 
   /** Names of people opened from a profile's Message button (not friends, so not in the inbox yet). */

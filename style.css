@@ -2223,3 +2223,11 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .life-note { margin: 8px 0 0; padding: 10px 12px; border-radius: 10px; font-size: 13px; color: var(--dim); background: #ffd23f12; border: 1px solid #ffd23f40; }
 .life-note b { color: #ffd23f; }
 .buy[disabled] { opacity: .55; cursor: default; filter: saturate(.6); }
+
+/* (2.1.4) supporter and gifter badges on their own lines; a former supporter's badge, muted */
+.sup-earned-row { margin-top: 14px; }
+.sup-earned-row + .sup-earned-row { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.sup-earned-head { display: block; font-size: 11px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); }
+.sup-earned-row .sup-earned { margin-top: 8px; }
+.sup-pill.former { filter: saturate(.45); opacity: .85; border-color: var(--line); background: #ffffff0a; }
+.sup-pill.former span { color: var(--dim); }
