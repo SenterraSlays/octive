@@ -2902,6 +2902,24 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         location.href = r.url;
       } catch (e) { setMsg(out, e.message); }
     }));
+    // (2.1.4) lifetime supporter: $35 once, for your own account
+    const lifeOut = msg();
+    const lifeBuy = h("button.btn.primary.life-buy", { type: "button" }, "Get lifetime · $35");
+    lifeBuy.addEventListener("click", () => busy(lifeBuy, async () => {
+      setMsg(lifeOut, "");
+      if (!me) { setMsg(lifeOut, "Sign in first (same account as the game)."); return; }
+      try {
+        const r = await callApi("/support/checkout", { lifetime: true }, true);
+        location.href = r.url;
+      } catch (e) { setMsg(lifeOut, e.message); }
+    }));
+    const lifetimePanel = h("section.panel.life-panel", {},
+      h("img.life-badge", { src: "badges/supporter-3y.png", alt: "" }),
+      h("div.life-text", {},
+        h("span.life-tag", { text: "Lifetime" }),
+        h("h2", { text: "Supporter forever, for $35" }),
+        h("p.panel-sub", { text: "Pay once and every perk is yours for good: it never runs out. That's the price of 14 months at $2.50, and your total time as a supporter keeps growing every day. For your own account." })),
+      h("div.life-cta", {}, h("b.life-price", { text: "$35" }), h("span.life-once", { text: "one time" }), lifeBuy, lifeOut));
     const signHint = h("p.panel-sub.center");
     // the developer can gift supporter time for free
     const freeBtn = h("button.btn.wide.free-gift", { type: "button", hidden: true }, "♥ Gift for free (developer)");
@@ -2921,6 +2939,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("div", {}, h("h1", { text: "Support OCTIVE" }),
           h("p.sub", { text: "OCTIVE is free and made by one developer. Supporting keeps the servers running and gets you a few nice extras." }),
           status)),
+      lifetimePanel,
       h("div.sup-grid", {},
         h("section.panel.buy-panel", {},
           h("h2", { text: "Choose your time" }),
@@ -2950,6 +2969,11 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (!me) signHint.append(h("a", { href: "#/account" }, "Sign in"), " with your game account to buy.");
       status.textContent = "";
       const s = me && me.supporter;
+      // already lifetime: nothing to buy here
+      const life = !!(s && s.lifetime);
+      lifeBuy.hidden = life;
+      lifetimePanel.classList.toggle("owned", life);
+      lifetimePanel.querySelector(".life-once").textContent = life ? "You're a lifetime supporter ♥" : "one time";
       if (s && (s.active || s.days > 0))
         status.append(h("span.sup-pill", {}, h("img", { src: `badges/supporter-${milestoneArt(s.months || 0)[1]}.png`, alt: "" }), h("span", { text: s.lifetime ? "Lifetime supporter" : s.booster ? "Supporter · Server Booster" : s.active ? `Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "medium" })}` : "Former supporter" })),
           h("span.dim", { text: ` · ${monthsText(s.days)} in total` }));

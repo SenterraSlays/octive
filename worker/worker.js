@@ -3682,6 +3682,7 @@ function withWeb(p, web) {
 // Secrets: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET (Tools/stripe_setup.py sets both).
 const MONTH_MS = 30.4375 * 86_400_000;
 const PRICE_CENTS = 250;
+const LIFETIME_CENTS = 3500; // (2.1.4) lifetime supporter, once: never runs out
 const MAX_MONTHS = 120; // any number of months (up to 10 years) for yourself or as a gift
 const GIF_MAX = 8 * 1048576; // supporters' animated pictures
 const LIFETIME_SUPPORTERS = ["PlwcYVKV9y7NBFWfUaC263XpCFbE", "o2quUJmLzZujIpPomajHJ7oW07aI"]; // Senterra, and the official OCTIVE account
@@ -4009,7 +4010,7 @@ async function backfillRecent(env) {
 async function recordSupport(env, e) {
   try {
     await recentSupport(env); // the history is there first
-    const item = { at: new Date().toISOString(), months: e.months, cents: e.free ? 0 : e.cents || 0, full: e.months * PRICE_CENTS, free: !!e.free, gift: !!e.gift,
+    const item = { at: new Date().toISOString(), months: e.months, lifetime: e.lifetime || undefined, cents: e.free ? 0 : e.cents || 0, full: e.lifetime ? LIFETIME_CENTS : e.months * PRICE_CENTS, free: !!e.free, gift: !!e.gift,
       buyer: e.buyer || "", to: e.to || "", buyerName: await supportName(env, e.buyer), toName: await supportName(env, e.to), ref: e.ref || null };
     await r2update(env, RECENT_KEY, () => ({ items: [] }), (d) => {
       d.items ||= [];
@@ -4053,14 +4054,34 @@ async function grantMonths(env, playerId, months, session) {
   return rec;
 }
 
+/** (2.1.4) Makes a player a lifetime supporter (once per checkout session): true when it's new. */
+async function grantLifetime(env, playerId, session) {
+  const key = `supporters/${playerId}.json`;
+  let added = false;
+  await r2update(env, key, () => ({ periods: [], purchases: [] }), (rec) => {
+    rec.periods ||= []; rec.purchases ||= [];
+    if (rec.purchases.some((p) => p.session === session.id)) return false;
+    rec.lifetime = true;
+    rec.lifetimeAt = new Date().toISOString();
+    rec.purchases.push({ at: rec.lifetimeAt, months: 0, lifetime: true, amount: session.amount_total, currency: session.currency, session: session.id });
+    added = true;
+  });
+  supportIndex = null;
+  return added;
+}
+
 async function supportRoutes(request, env, url, ctx) {
   const path = url.pathname;
   if (path === "/support/prices") {
     const tiers = [];
     for (let m = 1; m <= MAX_MONTHS; m++) tiers.push({ months: m, cents: priceFor(m), discount: discountFor(m) });
-    return reply({ monthly: PRICE_CENTS, currency: "usd", tiers, effects: EFFECTS });
+    return reply({ monthly: PRICE_CENTS, lifetime: LIFETIME_CENTS, currency: "usd", tiers, effects: EFFECTS });
   }
-  if (path === "/support/recent") return reply({ items: await recentSupport(env), monthly: PRICE_CENTS });
+  // (lifetime purchases only for games that show them: older ones would say "0 months")
+  if (path === "/support/recent") {
+    const items = await recentSupport(env);
+    return reply({ items: url.searchParams.get("v") === "2" ? items : items.filter((x) => !x.lifetime), monthly: PRICE_CENTS, lifetime: LIFETIME_CENTS });
+  }
   if (path === "/support/all") { const all = await supporters(env); return reply({ supporters: all, owner: OWNER, gifted: giftedIndex, numbers: numberIndex }); }
   if (path === "/stripe/webhook" && request.method === "POST") {
     const body = await request.text();
@@ -4069,7 +4090,14 @@ async function supportRoutes(request, env, url, ctx) {
     if (ev.type === "checkout.session.completed" || ev.type === "checkout.session.async_payment_succeeded") {
       const s = ev.data.object;
       const id = s.metadata?.playerId, months = Number(s.metadata?.months);
-      if (s.payment_status === "paid" && id && months >= 1 && months <= MAX_MONTHS) {
+      // (2.1.4) lifetime supporter
+      if (s.payment_status === "paid" && id && s.metadata?.lifetime === "1") {
+        if (await grantLifetime(env, id, s)) {
+          supportIndex = null; await syncSupporterRole(env, id);
+          await recordSupport(env, { months: 0, lifetime: true, cents: s.amount_total, gift: false, buyer: id, to: id, ref: s.id });
+        }
+      }
+      else if (s.payment_status === "paid" && id && months >= 1 && months <= MAX_MONTHS) {
         if (s.metadata?.gift === "1") {
           await addGift(env, id, { id: s.id, from: s.metadata?.buyer || "", months, amount: s.amount_total, currency: s.currency, free: false });
           await recordSupport(env, { months, cents: s.amount_total, gift: true, buyer: s.metadata?.buyer || "", to: id, ref: s.id });
@@ -4084,6 +4112,32 @@ async function supportRoutes(request, env, url, ctx) {
   if (path === "/support/checkout") {
     const b = await bodyOf(request);
     const who = await signedIn(request, env);
+    // (2.1.4) lifetime supporter: $35 once, for your own account
+    if (b.lifetime === true) {
+      if (b.giftTo && String(b.giftTo) !== who.playerId) fail(400, "Lifetime supporter can only be bought for your own account.");
+      const st = supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId, null);
+      if (st.lifetime) fail(409, "You're already a lifetime supporter. Thank you!");
+      const fromGame = b.from === "game";
+      const s = await stripe(env, "checkout/sessions", {
+        mode: "payment",
+        success_url: fromGame ? `${url.origin}/support/done?paid=1` : `${SITE}#/supporter?thanks=1`,
+        cancel_url: fromGame ? `${url.origin}/support/done?cancel=1` : `${SITE}#/supporter`,
+        client_reference_id: who.playerId,
+        "metadata[playerId]": who.playerId,
+        "metadata[months]": "0",
+        "metadata[lifetime]": "1",
+        "metadata[buyer]": who.playerId,
+        "metadata[gift]": "0",
+        "line_items[0][quantity]": "1",
+        "line_items[0][price_data][currency]": "usd",
+        "line_items[0][price_data][unit_amount]": String(LIFETIME_CENTS),
+        "line_items[0][price_data][product_data][name]": "OCTIVE Supporter · Lifetime",
+        "line_items[0][price_data][product_data][description]": "Supporter forever: pay once, it never runs out",
+        "payment_intent_data[metadata][playerId]": who.playerId,
+        "payment_intent_data[metadata][lifetime]": "1",
+      });
+      return reply({ url: s.url, session: s.id });
+    }
     const months = Math.round(Number(b.months));
     if (!(months >= 1 && months <= MAX_MONTHS)) fail(400, `Choose 1 to ${MAX_MONTHS} months.`);
     // gifting: someone else's account by player id (from their profile)
@@ -4125,7 +4179,7 @@ async function supportRoutes(request, env, url, ctx) {
     if (!/^cs_[A-Za-z0-9_]{10,200}$/.test(id)) fail(400, "That checkout can't be found.");
     const s = await stripe(env, "checkout/sessions/" + encodeURIComponent(id));
     if (s.metadata?.buyer !== who.playerId) fail(404, "That checkout can't be found.");
-    return reply({ paid: s.payment_status === "paid", status: s.status, months: Number(s.metadata?.months) || 0, gift: s.metadata?.gift === "1", to: s.metadata?.playerId || null });
+    return reply({ paid: s.payment_status === "paid", status: s.status, months: Number(s.metadata?.months) || 0, lifetime: s.metadata?.lifetime === "1", gift: s.metadata?.gift === "1", to: s.metadata?.playerId || null });
   }
   if (path === "/support/done") {
     // where the game's payment window lands: thanks (or nothing charged), then it closes itself

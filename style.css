@@ -2199,3 +2199,24 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .sk-overall { color: var(--accent); font-size: 22px; font-weight: 900; margin-right: 4px; }
 .sk-sub { display: flex; align-items: baseline; gap: 2px; }
 .sk-words { margin: 10px 0 0; color: var(--dim); font-size: 13px; }
+
+/* (2.1.4) supporter page: the lifetime card */
+.life-panel { position: relative; display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; gap: 20px; align-items: center; margin: 0 0 18px; padding: 20px 24px; border: 1px solid transparent; border-radius: 16px;
+  background: linear-gradient(var(--surface), var(--surface)) padding-box, linear-gradient(120deg, #ffd23f, #ff4d9d 45%, #a764ff) border-box; box-shadow: 0 10px 40px #ff4d9d22; overflow: hidden; }
+.life-panel::before { content: ""; position: absolute; inset: 0; background: radial-gradient(circle at 12% 30%, #ffd23f22, transparent 45%), radial-gradient(circle at 90% 80%, #a764ff26, transparent 50%); pointer-events: none; }
+.life-badge { width: 96px; height: 96px; object-fit: contain; filter: drop-shadow(0 6px 18px #ffd23f55); position: relative; }
+.life-text { position: relative; min-width: 0; }
+.life-text h2 { margin: 4px 0 6px; font-size: 24px; }
+.life-text .panel-sub { margin: 0; }
+.life-tag { display: inline-block; font-size: 11px; font-weight: 900; letter-spacing: .14em; text-transform: uppercase; color: #1b1631; background: linear-gradient(90deg, #ffd23f, #ff9a3d); padding: 3px 10px; border-radius: 999px; }
+.life-cta { position: relative; display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 170px; }
+.life-price { font-size: 40px; font-weight: 900; line-height: 1; background: linear-gradient(90deg, #ffd23f, #ff4d9d); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.life-once { color: var(--dim); font-size: 13px; margin-bottom: 6px; text-align: center; }
+.life-buy { width: 100%; }
+.life-panel.owned .life-once { color: #ffd23f; font-weight: 700; }
+@media (max-width: 760px) {
+  .life-panel { grid-template-columns: 64px minmax(0, 1fr); padding: 16px; gap: 14px; }
+  .life-badge { width: 64px; height: 64px; }
+  .life-text h2 { font-size: 19px; }
+  .life-cta { grid-column: 1 / -1; min-width: 0; }
+}
