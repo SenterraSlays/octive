@@ -2876,7 +2876,16 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       } else if (giftTo === "") giftChosen.append(h("span", { text: "Who should get it?" }));
       giftSearch.hidden = !!giftTo; giftList.hidden = !!giftTo;
       freeBtn.hidden = !(me && me.playerId === ROLE_OWNER && giftTo);
+      paintBuy();
     };
+    // (2.1.4) a lifetime supporter only gifts: months for themselves would do nothing
+    const lifeNote = h("p.life-note", { hidden: true }, "You're a lifetime supporter, so you don't need months. You can still gift supporter to other players: choose ", h("b", { text: "♥ As a gift" }), ".");
+    function paintBuy() {
+      const life = !!(me && me.supporter && me.supporter.lifetime) && giftTo === null;
+      buy.disabled = life;
+      buy.textContent = life ? "You're a lifetime supporter" : "Continue to payment";
+      lifeNote.hidden = !life;
+    }
     const searchGift = () => {
       giftList.textContent = "";
       const term = giftSearch.value.trim().toLowerCase();
@@ -2947,7 +2956,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           h("div.seg-row", {}, forMe, forGift), giftBox,
           h("div.months-row", {}, monthsLabel, slider, h("label.months-custom-wrap", {}, h("span", { text: "Custom" }), custom)), quick,
           h("div.price-box", {}, total, h("div", {}, each, save)),
-          buy, freeBtn, out, signHint,
+          buy, lifeNote, freeBtn, out, signHint,
           h("p.fine", { text: "Payments are handled by Stripe; OCTIVE never sees your card. Time adds onto any time you already have. See the Terms for refunds." })),
         h("section.panel.perk-panel", {},
           h("h2", { text: "What you get" }),
@@ -2974,6 +2983,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       lifeBuy.hidden = life;
       lifetimePanel.classList.toggle("owned", life);
       lifetimePanel.querySelector(".life-once").textContent = life ? "You're a lifetime supporter ♥" : "one time";
+      paintBuy();
       if (s && (s.active || s.days > 0))
         status.append(h("span.sup-pill", {}, h("img", { src: `badges/supporter-${milestoneArt(s.months || 0)[1]}.png`, alt: "" }), h("span", { text: s.lifetime ? "Lifetime supporter" : s.booster ? "Supporter · Server Booster" : s.active ? `Supporter until ${new Date(s.until).toLocaleDateString(undefined, { dateStyle: "medium" })}` : "Former supporter" })),
           h("span.dim", { text: ` · ${monthsText(s.days)} in total` }));

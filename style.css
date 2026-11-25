@@ -2220,3 +2220,6 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
   .life-text h2 { font-size: 19px; }
   .life-cta { grid-column: 1 / -1; min-width: 0; }
 }
+.life-note { margin: 8px 0 0; padding: 10px 12px; border-radius: 10px; font-size: 13px; color: var(--dim); background: #ffd23f12; border: 1px solid #ffd23f40; }
+.life-note b { color: #ffd23f; }
+.buy[disabled] { opacity: .55; cursor: default; filter: saturate(.6); }

@@ -4150,6 +4150,9 @@ async function supportRoutes(request, env, url, ctx) {
         if (!card || moderation.bans[target]) fail(400, "That player can't be found (they need to have played online once).");
       }
     }
+    // (2.1.4) a lifetime supporter can't buy months for themselves (they never run out); gifts are fine
+    if (target === who.playerId && supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId, null).lifetime)
+      fail(409, "You're a lifetime supporter, so you don't need months. You can still gift supporter to other players.");
     const cents = priceFor(months), pct = Math.round(discountFor(months) * 100);
     // from the game: the payment window ends on a small page that says to go back (and closes itself)
     const fromGame = b.from === "game";
