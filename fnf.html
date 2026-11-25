@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <script>
+    // OCTIVE's site only runs as itself: shown in a frame by another site, it goes to a page that links to the official site
+    (function () {
+      var framed = false;
+      try { framed = window.top !== window.self && window.top.location.hostname !== location.hostname; } catch (e) { framed = true; }
+      if (framed) location.replace("framed.html");
+    })();
+  </script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Friday Night Funkin&#x27; charts and modcharts in OCTIVE · free VSRG</title>
+  <meta name="description" content="Play Friday Night Funkin&#x27; (FNF) songs as 4K charts in OCTIVE, a free VSRG: the chart editor imports Psych Engine, Kade, V-Slice and Codename charts, modcharts included.">
+  <link rel="canonical" href="https://senterraslays.github.io/octive/fnf.html">
+  <meta name="theme-color" content="#1b1631">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="OCTIVE">
+  <meta property="og:title" content="Friday Night Funkin&#x27; charts and modcharts in OCTIVE · free VSRG">
+  <meta property="og:description" content="Play Friday Night Funkin&#x27; (FNF) songs as 4K charts in OCTIVE, a free VSRG: the chart editor imports Psych Engine, Kade, V-Slice and Codename charts, modcharts included.">
+  <meta property="og:url" content="https://senterraslays.github.io/octive/fnf.html">
+  <meta property="og:image" content="https://senterraslays.github.io/octive/logo-512.png">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="pages.css?v=1">
+  <script type="application/ld+json">[{"@context": "https://schema.org", "@type": "WebPage", "name": "Friday Night Funkin' charts and modcharts in OCTIVE · free VSRG", "url": "https://senterraslays.github.io/octive/fnf.html", "description": "Play Friday Night Funkin' (FNF) songs as 4K charts in OCTIVE, a free VSRG: the chart editor imports Psych Engine, Kade, V-Slice and Codename charts, modcharts included.", "isPartOf": {"@type": "WebSite", "name": "OCTIVE", "url": "https://senterraslays.github.io/octive/"}, "about": {"@type": "VideoGame", "name": "OCTIVE", "url": "https://senterraslays.github.io/octive/", "genre": ["Rhythm game", "VSRG"], "gamePlatform": ["Windows", "Android", "Web browser"], "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}}}, {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Can OCTIVE play FNF mods?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. The chart editor imports Friday Night Funkin' charts from Psych Engine, Kade, V-Slice and Codename, with their audio and modcharts."}}, {"@type": "Question", "name": "Is it free?", "acceptedAnswer": {"@type": "Answer", "text": "Yes, OCTIVE is free on Windows, Android and in the browser."}}]}]</script>
+</head>
+<body>
+  <header class="top"><a class="brand" href="./"><img src="logo.svg" alt="" width="30" height="30"><span>OCTIVE</span></a><nav><a href="about.html">About</a><a href="osu-mania.html">osu!mania maps</a><a href="fnf.html" class="on">FNF charts</a><a href="download.html">Download</a><a href="./">Rankings & Workshop</a></nav></header>
+  <main>
+    <section class="hero">
+      <h1>Friday Night Funkin' charts in OCTIVE</h1>
+      <p class="lead">Turn FNF mods into OCTIVE charts. OCTIVE's chart editor reads Friday Night Funkin' songs from the popular engines and plays them as 4K charts, with their modcharts.</p>
+      <div class="cta"><a class="btn primary" href="download.html">Download free</a><a class="btn" href="play/">Play in your browser</a></div>
+    </section>
+    <section><h2>Importing an FNF song</h2><p>In the chart editor, pick the song's instrumental, vocals and chart: each one is optional and the BPM is filled in for you. <b>Psych Engine (0.x and 1.0), Kade, V-Slice and Codename</b> mods all work.</p><p>Psych Engine modcharts (Lua and HScript) are found and played with the chart, and events next to the chart are read too.</p></section>
+    <section><h2>Then play it like any chart</h2><p>Your FNF chart gets a star rating and PR, works with mods and multiplayer, and can be shared in the Workshop (the "fnf" tag) for others to play.</p></section>
+
+    <section class="faq"><h2>Questions</h2><details><summary>Can OCTIVE play FNF mods?</summary><p>Yes. The chart editor imports Friday Night Funkin&#x27; charts from Psych Engine, Kade, V-Slice and Codename, with their audio and modcharts.</p></details><details><summary>Is it free?</summary><p>Yes, OCTIVE is free on Windows, Android and in the browser.</p></details></section>
+    <section class="more"><h2>More about OCTIVE</h2><ul>
+      <li><a href="about.html">OCTIVE: a free VSRG rhythm game</a></li>
+      <li><a href="osu-mania.html">Play your osu!mania maps in OCTIVE</a></li>
+      <li><a href="fnf.html">Friday Night Funkin' charts and modcharts in OCTIVE</a></li>
+      <li><a href="download.html">Download OCTIVE for Windows and Android</a></li>
+      <li><a href="./">Global ranking, Workshop, daily charts and profiles</a></li>
+    </ul></section>
+  </main>
+  <footer>OCTIVE is a free rhythm game made by Senterra. · <a href="privacy.html">Privacy</a> · <a href="terms.html">Terms</a></footer>
+</body>
+</html>

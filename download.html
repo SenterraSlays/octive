@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <script>
+    // OCTIVE's site only runs as itself: shown in a frame by another site, it goes to a page that links to the official site
+    (function () {
+      var framed = false;
+      try { framed = window.top !== window.self && window.top.location.hostname !== location.hostname; } catch (e) { framed = true; }
+      if (framed) location.replace("framed.html");
+    })();
+  </script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Download OCTIVE · free rhythm game for Windows and Android</title>
+  <meta name="description" content="Download OCTIVE, the free VSRG rhythm game: the Windows installer, the Android app (APK), or play in your browser with nothing to install.">
+  <link rel="canonical" href="https://senterraslays.github.io/octive/download.html">
+  <meta name="theme-color" content="#1b1631">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="OCTIVE">
+  <meta property="og:title" content="Download OCTIVE · free rhythm game for Windows and Android">
+  <meta property="og:description" content="Download OCTIVE, the free VSRG rhythm game: the Windows installer, the Android app (APK), or play in your browser with nothing to install.">
+  <meta property="og:url" content="https://senterraslays.github.io/octive/download.html">
+  <meta property="og:image" content="https://senterraslays.github.io/octive/logo-512.png">
+  <meta name="twitter:card" content="summary">
+  <link rel="icon" href="logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="pages.css?v=1">
+  <script type="application/ld+json">[{"@context": "https://schema.org", "@type": "WebPage", "name": "Download OCTIVE · free rhythm game for Windows and Android", "url": "https://senterraslays.github.io/octive/download.html", "description": "Download OCTIVE, the free VSRG rhythm game: the Windows installer, the Android app (APK), or play in your browser with nothing to install.", "isPartOf": {"@type": "WebSite", "name": "OCTIVE", "url": "https://senterraslays.github.io/octive/"}, "about": {"@type": "VideoGame", "name": "OCTIVE", "url": "https://senterraslays.github.io/octive/", "genre": ["Rhythm game", "VSRG"], "gamePlatform": ["Windows", "Android", "Web browser"], "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"}}}, {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [{"@type": "Question", "name": "Is OCTIVE safe to install?", "acceptedAnswer": {"@type": "Answer", "text": "Yes. It's made by one developer, and the installer and app come straight from OCTIVE's own server. Windows may warn about new installers: choose More info, then Run anyway."}}, {"@type": "Question", "name": "Does OCTIVE cost anything?", "acceptedAnswer": {"@type": "Answer", "text": "No, it's free. Supporter is an optional purchase for cosmetics only."}}]}]</script>
+</head>
+<body>
+  <header class="top"><a class="brand" href="./"><img src="logo.svg" alt="" width="30" height="30"><span>OCTIVE</span></a><nav><a href="about.html">About</a><a href="osu-mania.html">osu!mania maps</a><a href="fnf.html">FNF charts</a><a href="download.html" class="on">Download</a><a href="./">Rankings & Workshop</a></nav></header>
+  <main>
+    <section class="hero">
+      <h1>Download OCTIVE</h1>
+      <p class="lead">OCTIVE is free. Pick your device below; the game updates itself after that.</p>
+      <div class="cta"><a class="btn primary" href="download.html">Download free</a><a class="btn" href="play/">Play in your browser</a></div>
+    </section>
+    <section class="dl">
+      <div class="dl-card"><h2>Windows</h2><p>Windows 10 and 11. The installer downloads the newest version, adds OCTIVE to your Start menu and starts it.</p>
+        <a class="btn primary" href="https://octive-rankings-api.lunalazum18.workers.dev/releases/OCTIVE-Installer.exe">Download the installer</a>
+        <p class="note">Windows may say it protected your PC because the installer is new: click More info, then Run anyway.</p></div>
+      <div class="dl-card"><h2>Android</h2><p>The Android app (APK). Allow installs from your browser when Android asks.</p>
+        <a class="btn primary" id="apk" href="./#/download">Download the APK</a><p class="note" id="ver"></p></div>
+      <div class="dl-card"><h2>Browser</h2><p>Play right away, nothing to install. Your songs stay saved in that browser.</p>
+        <a class="btn primary" href="play/">Play in your browser</a></div>
+    </section>
+    <script>
+      // the newest Android file, from the release list
+      fetch("https://octive-rankings-api.lunalazum18.workers.dev/releases/latest.json", { cache: "no-cache" }).then(function (r) { return r.ok ? r.json() : null; }).then(function (m) {
+        if (!m) return;
+        if (m.android && m.android.file) document.getElementById("apk").href = "https://octive-rankings-api.lunalazum18.workers.dev/releases/" + encodeURIComponent(m.android.file);
+        document.getElementById("ver").textContent = "Version " + m.version;
+      }).catch(function () {});
+    </script>
+
+    <section class="faq"><h2>Questions</h2><details><summary>Is OCTIVE safe to install?</summary><p>Yes. It&#x27;s made by one developer, and the installer and app come straight from OCTIVE&#x27;s own server. Windows may warn about new installers: choose More info, then Run anyway.</p></details><details><summary>Does OCTIVE cost anything?</summary><p>No, it&#x27;s free. Supporter is an optional purchase for cosmetics only.</p></details></section>
+    <section class="more"><h2>More about OCTIVE</h2><ul>
+      <li><a href="about.html">OCTIVE: a free VSRG rhythm game</a></li>
+      <li><a href="osu-mania.html">Play your osu!mania maps in OCTIVE</a></li>
+      <li><a href="fnf.html">Friday Night Funkin' charts and modcharts in OCTIVE</a></li>
+      <li><a href="download.html">Download OCTIVE for Windows and Android</a></li>
+      <li><a href="./">Global ranking, Workshop, daily charts and profiles</a></li>
+    </ul></section>
+  </main>
+  <footer>OCTIVE is a free rhythm game made by Senterra. · <a href="privacy.html">Privacy</a> · <a href="terms.html">Terms</a></footer>
+</body>
+</html>
