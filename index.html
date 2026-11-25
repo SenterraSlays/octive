@@ -2,6 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <script>
+    // OCTIVE's site only runs as itself: shown in a frame by another site, it goes to a page that links to the official site
+    (function () {
+      var framed = false;
+      try { framed = window.top !== window.self && window.top.location.hostname !== location.hostname; } catch (e) { framed = true; }
+      if (framed) location.replace("framed.html");
+    })();
+  </script>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OCTIVE · Free rhythm game with osu!mania maps, rankings and a Workshop</title>
   <meta name="description" content="OCTIVE is a free vertical scrolling rhythm game (VSRG) for Windows, Android and the browser. Play 4K, 7K and other key counts, import osu!mania maps, climb the global ranking and Ranked, and share charts, skins and packs in the Workshop.">

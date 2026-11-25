@@ -2,6 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <script>
+    // OCTIVE's site only runs as itself: shown in a frame by another site, it goes to a page that links to the official site
+    (function () {
+      var framed = false;
+      try { framed = window.top !== window.self && window.top.location.hostname !== location.hostname; } catch (e) { framed = true; }
+      if (framed) location.replace("../framed.html");
+    })();
+  </script>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
   <title>Play OCTIVE in your browser</title>
   <meta name="description" content="Play OCTIVE, the free vertical scrolling rhythm game, right in your browser. Import .oct and osu! beatmaps; they stay saved in this browser.">
