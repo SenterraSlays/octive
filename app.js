@@ -734,26 +734,27 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     // ranks, the rank graph and the numbers
     const countryRank = p.country ? players.filter((x) => x.country === p.country && !isOfficial(x)).sort((a, b) => a.rank - b.rank).findIndex((x) => x.id === p.id) + 1 : 0;
     const big = (label, value) => h("div.pf-big", {}, h("span", { text: label }), h("b", { text: value }));
-    const small = (label, value) => h("div.pf-small", {}, h("span", { text: label }), h("b", { text: value }));
     const graph = h("div.pf-graph");
-    const achCount = Object.keys(p.achievements || {}).length;
     const main = h("div.pf-main", {},
       h("div.pf-bigs", {},
         big("Global ranking", official ? INF : "#" + fmt0.format(p.rank)),
         countryRank > 0 && !official ? big("Country ranking", "#" + fmt0.format(countryRank)) : null),
-      graph,
-      h("div.pf-smalls", {},
-        small("Achievements", fmt0.format(achCount)),
-        small("Performance", official ? INF + " PR" : fmt0.format(p.pp || 0) + " PR"),
-        small("Play time", official ? INF : p.playTimeMs ? playTime(p.playTimeMs) : "—")));
-    const row = (label, value) => h("div", {}, h("dt", { text: label }), h("dd", { text: value }));
+      graph);
+    // (2.2.2) achievements, PR and play time are in the panel with the other numbers (under the graph, its line ran
+    // through them); achievements count the ones the game has now, like the achievements section
+    const row = (label, value, cls) => h("div" + (cls || ""), {}, h("dt", { text: label }), h("dd", { text: value }));
+    const achRow = row("Achievements", fmt0.format(Object.keys(p.achievements || {}).length), ".pf-ach");
+    if (!official) loadAchDefs().then((defs) => { if (defs.length) achRow.lastChild.textContent = fmt0.format(defs.filter((d) => (p.achievements || {})[d.id]).length); });
     const panel = h("dl.pf-panel", {},
       row("Accuracy", official ? "100.00%" : fmt2.format(p.accuracy || 0) + "%"),
       row("Total score", official ? INF : fmt0.format(p.totalScore || 0)),
       row("Play count", official ? INF : fmt0.format(p.playCount || 0)),
       row("Full combos", official ? INF : fmt0.format(p.fullCombos || 0)),
       row("Max combo", official ? INF + "x" : p.maxCombo ? fmt0.format(p.maxCombo) + "x" : "—"),
-      row("Experience", official ? INF : fmt0.format(p.xp || 0)));
+      row("Experience", official ? INF : fmt0.format(p.xp || 0)),
+      row("Performance", official ? INF + " PR" : fmt0.format(p.pp || 0) + " PR", ".pf-pp"),
+      row("Play time", official ? INF : p.playTimeMs ? playTime(p.playTimeMs) : "—", ".pf-time"),
+      achRow);
     const stats = h("section.pf-stats", {}, main, panel);
     if (worker && !official) {
       fetch(`${worker}/play/progress?player=${encodeURIComponent(p.id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
