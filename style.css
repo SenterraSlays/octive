@@ -2255,12 +2255,6 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .gain-total { grid-column: 2 / 4; color: var(--dim, #b6add6); }
 .gain-empty { margin: 4px 0; color: var(--dim, #b6add6); }
 
-/* ---- 2.2.2: achievements, PR and play time sit in the stats panel; the graph (tabs + chart) gets the room under the ranks
-   (it was 72px tall with ~100px inside, so its line ran over the numbers under it) */
-.pf-main { display: flex; flex-direction: column; min-width: 0; }
-.pf-graph { flex: 1; height: auto; min-height: 110px; margin-bottom: 0; display: flex; flex-direction: column; }
-.pf-graphs { flex: 1; }
-.pf-graphs .pf-chart { flex: 1; height: auto; min-height: 80px; }
-.pf-panel .pf-pp dd { color: var(--pink); }
-.pf-panel .pf-time dd { color: var(--orange); }
-.pf-panel .pf-ach dd { color: var(--green); }
+/* ---- 2.2.2: the graph's box fits its tabs and chart (it was 72px with ~100px inside, so the line ran over the numbers under it) */
+.pf-graph { height: auto; min-height: 72px; }
+.pf-graphs .pf-chart { height: 72px; }
