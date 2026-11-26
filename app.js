@@ -846,12 +846,36 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       (tabBtns[k] = h("button.pl-tab", { type: "button", onclick: () => { mode = k; shown = 10; paint(); } }, label))));
     const box = h("section.pl-section", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: "Plays" }), tabs), list);
     let data = null, mode = "top", shown = 10;
+    // (2.2.1) a play's details, in the showcase's popup. Plays from before 2.2.1 don't keep their score and judgements:
+    // they come from the player's board score when that's the same play (same accuracy and mods).
+    let opening = false;
+    const openPlay = async (t) => {
+      if (opening) return;
+      const s = { title: t.title, difficulty: t.difficulty, keys: t.keys, stars: t.stars, grade: t.grade, cover: t.pic, score: t.score, acc: t.acc,
+        pp: t.pp, maxCombo: t.maxCombo, fullCombo: t.fc, counts: t.counts, mods: t.mods, date: t.at, workshopId: t.item };
+      if ((s.score == null || !Array.isArray(s.counts)) && t.board && worker) {
+        opening = true;
+        const [song, chart] = t.board.split("/");
+        const d = await fetch(`${worker}/scores/${encodeURIComponent(song)}/${encodeURIComponent(chart)}`).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+        opening = false;
+        const e = d && (d.entries || []).find((x) => x.playerId === p.id);
+        if (e && Math.abs((Number(e.accuracy) || 0) - (Number(t.acc) || 0)) < 0.02 && String(e.mods || "") === String(t.mods || "")) {
+          s.score = e.score; s.counts = e.counts; s.maxCombo = e.maxCombo; if (e.date) s.date = e.date;
+        }
+      }
+      showcaseDetails(s);
+    };
     const row = (t, i) => {
       const top = mode === "top";
       const meta = [t.difficulty, t.keys ? t.keys + "K" : "", t.mods, t.at ? (top ? shortDate(t.at) : ago(t.at)) : ""].filter(Boolean).join(" · ");
-      return h("div.pl-row", { "data-place": top ? i + 1 : null },
+      // (2.2.1) the song's picture; the row opens the play's details (like a showcase play), with a link to its Workshop page
+      const thumb = h("span.pl-thumb", { "aria-hidden": "true" });
+      if (t.pic) { const img = h("img", { src: t.pic, alt: "", loading: "lazy" }); img.onerror = () => img.remove(); thumb.append(img); }
+      return h("div.pl-row.linked", { "data-place": top ? i + 1 : null, role: "button", tabindex: "0", title: "Details",
+        onclick: () => openPlay(t), onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openPlay(t); } } },
         h("span.pl-rank", { text: top ? "#" + (i + 1) : "" }),
         h("span.pl-grade", { text: t.grade || "–", style: `--g:${GRADE_COL[t.grade] || "#8a8aa0"}`, title: t.fc ? "Full combo" : null }, t.fc ? h("i", { text: "FC" }) : null),
+        thumb,
         h("div.pl-song", {},
           h("b", { text: t.title, title: t.title }),
           h("small", {}, h("span.pl-star", { text: "★ " + (t.stars || 0).toFixed(2), style: `--s:${starColor(t.stars || 0)}` }), h("span", { text: meta }),

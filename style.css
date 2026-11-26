@@ -2160,8 +2160,16 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .pl-tab:hover { color: var(--text); }
 .pl-tab.active { color: #fff; background: linear-gradient(90deg, #a764ff, #ff4d9d); }
 .pl-list { display: flex; flex-direction: column; gap: 6px; }
-.pl-row { display: grid; grid-template-columns: 40px 44px minmax(0, 1fr) auto minmax(118px, auto); gap: 12px; align-items: center; padding: 8px 12px; border-radius: 10px; background: #ffffff06; border: 1px solid transparent; transition: background 0.15s, border-color 0.15s, transform 0.15s; }
+.pl-row { display: grid; grid-template-columns: 40px 44px 64px minmax(0, 1fr) auto minmax(118px, auto); gap: 12px; align-items: center; padding: 8px 12px; border-radius: 10px; background: #ffffff06; border: 1px solid transparent; transition: background 0.15s, border-color 0.15s, transform 0.15s; }
 .pl-row:hover { background: #ffffff0d; border-color: var(--line); transform: translateX(2px); }
+/* (2.2.1) the song's picture; a row opens the play's details */
+.pl-row.linked { cursor: pointer; }
+.pl-row.linked:hover .pl-song b { color: var(--accent); }
+.pl-row.linked:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pl-thumb { position: relative; width: 64px; height: 36px; border-radius: 6px; overflow: hidden; background: linear-gradient(135deg, #3a2a6b, #6b2a5a); box-shadow: inset 0 0 0 1px #ffffff14; }
+.pl-thumb::before { content: "♪"; position: absolute; inset: 0; display: grid; place-items: center; color: #ffffff55; font-size: 16px; }
+.pl-thumb img { position: relative; display: block; width: 100%; height: 100%; object-fit: cover; transition: transform 0.25s; }
+.pl-row.linked:hover .pl-thumb img { transform: scale(1.08); }
 .pl-rank { color: var(--dim); font-weight: 800; font-size: 14px; text-align: right; }
 .pl-row[data-place="1"] .pl-rank { color: #ffd23f; }
 .pl-row[data-place="2"] .pl-rank { color: #d9dcef; }
@@ -2180,7 +2188,8 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .pl-more { align-self: center; margin-top: 6px; }
 @media (max-width: 640px) {
   .pl-section { padding: 14px; }
-  .pl-row { grid-template-columns: 26px 36px minmax(0, 1fr) auto; gap: 8px; padding: 8px; }
+  .pl-row { grid-template-columns: 26px 36px 48px minmax(0, 1fr) auto; gap: 8px; padding: 8px; }
+  .pl-thumb { width: 48px; height: 27px; border-radius: 5px; }
   .pl-rank { font-size: 12px; }
   .pl-grade { width: 34px; height: 28px; font-size: 14px; }
   .pl-acc { display: none; }
