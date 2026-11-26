@@ -296,6 +296,18 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const podium = h("div.lb-podium");
     table.before(podium);
     const topPR = Math.max(1, ...data.players.map((p) => p.pp || 0));
+    // (2.2.0) the players who gained the most PR in the last 7 days
+    const gainList = h("div.gain-list", {}, h("p.gain-empty", { text: "Loading…" }));
+    const gainers = h("section.gainers", {}, h("div.gain-head", {}, h("h2", { text: "Top gainers this week" }), h("small", { text: "Most PR gained in the last 7 days" })), gainList);
+    podium.before(gainers);
+    if (worker) fetch(worker + "/play/gainers?limit=10", { cache: "no-cache" }).then((r) => r.json()).then((g) => {
+      const list = (g && g.players) || [];
+      if (!list.length) { gainList.replaceChildren(h("p.gain-empty", { text: "Nobody has gained PR this week yet." })); return; }
+      gainList.replaceChildren(...list.map((p) => h("a.gain-row", { href: "#/u/" + encodeURIComponent(p.playerId) },
+        h("span.gain-rank", { text: "#" + p.rank }), h("span.gain-name", { text: p.name || "Player" }),
+        h("b.gain-amt", { text: "+" + fmt0.format(p.gain || 0) + " PR" }), h("small.gain-total", { text: fmt0.format(p.pp || 0) + " PR" }))));
+    }).catch(() => gainList.replaceChildren(h("p.gain-empty", { text: "Couldn't load this week's gainers." })));
+    else gainers.hidden = true;
 
     function render(filter) {
       rows.textContent = "";
@@ -847,7 +859,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("span.pl-acc", { text: fmt2.format(t.acc || 0) + "%" }),
         h("div.pl-pr", { title: t.verified ? null : "Not verified: a third of the play's PR counts toward the ranking" },
           h("b", { text: fmt0.format(t.pp || 0) + " PR" }),
-          top ? h("small", { text: `counts ${(t.weighted || 0).toFixed(1)} PR · ${t.weight}%` })
+          top ? h("small", { text: `${t.earned ?? t.weight}% earned`, title: "How much of this chart's PR the accuracy earned. Every play adds its full PR to the total." })
             : !t.verified ? h("small", { text: "not verified" }) : null));
     };
     const paint = () => {
@@ -3247,7 +3259,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     ]],
     ["Scoring, PR and mods", [
       ["What is PR?", "PR is your performance rating (it used to be called PP). It works like osu!'s performance points."],
-      ["How is PR worked out?", "Like osu!mania: each chart has a star rating, and a play's PR grows with the stars and needs high accuracy (osu!mania accuracy: Marvelous 320, Perfect 300, Great 200, Good 100, Bad 50). Your total is your best plays, each worth 95% of the one before, plus a small bonus for the number of charts played."],
+      ["How is PR worked out?", "Like osu!mania: each chart has a star rating, and a play's PR grows with the stars and needs high accuracy (osu!mania accuracy: Marvelous 320, Perfect 300, Great 200, Good 100, Bad 50). Your total adds up the best play on every chart, each at its full PR, so every chart you play well counts."],
       ["Why did my PR change?", "Version 1.3.3 reworked PR: vibro and spam charts are rated more fairly and accuracy counts more. Your past plays were recalculated the first time you opened the new version."],
       ["What do mods do?", "Pick them in Song Select (Mods, or F1). Easy widens the timing windows (PP ×0.5), Hard Rock tightens them (PP ×1.1), Hidden and Fade In hide the notes in different ways (PP ×1.06), Half Time and Double Time change the song speed (the stars are worked out at that speed), and Mirror flips the chart."],
       ["Can I change the speed without changing the pitch?", "Yes. In Song Select → Mods, turn off Pitch shift under the song speed: the song then keeps its own pitch at any speed (it takes a moment to prepare when the play starts). On, faster songs sound higher, like osu!'s Nightcore. The chart editor has the same switch next to its speed menu."],

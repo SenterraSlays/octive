@@ -111,6 +111,11 @@ export function windowsFor(mods) {
 const ACC_W = [100, 98, 70, 40, 10, 0];
 // 2.1.1: no score cap, points per judgement (Marvelous 350, Perfect 300, Great 250, Good 200, Bad 100, Miss 0)
 export const SCORE_POINTS = [350, 300, 250, 200, 100, 0];
+/** (2.2.0) ScorePoints.WithRate: a score at a song speed is the points times the rate (1.2x = 1.2 times, 0.8x = 0.8 times). */
+export function scoreWithRate(points, rate) {
+  if (!(rate > 0) || Math.abs(rate - 1) < 1e-9) return points;
+  return toLong(roundEven(points * rate));
+}
 const SCORE_W = SCORE_POINTS;
 // the old score out of 1,000,000 (games before 2.1.1 still send it)
 const OLD_SCORE_W = [1.0, 0.98, 0.70, 0.40, 0.10, 0];
@@ -876,6 +881,9 @@ export function judgeReplay(c, replay, opts = {}) {
   const r = score.result();
   r.mods = mods;
   r.rate = rateOf(replay.mods);
+  // (2.2.0) the score is the points times the song speed (ScorePoints.WithRate); baseScore is the plain points
+  r.baseScore = r.score;
+  r.score = scoreWithRate(r.score, r.rate);
   r.hits = score.devs.length;
   r.meanMs = score.meanDeviationMs;
   r.stdMs = score.deviationStdMs;

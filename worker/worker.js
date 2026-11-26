@@ -17,7 +17,7 @@
 // pictures, badges) is read here too, so banned players disappear from the site as well.
 
 // the game's judge, so plays are judged again from their replays (board scores, daily charts, dans): deploy judge.js with this file
-import { JUDGE_VERSION, JudgeDataError, loadChart, compileChart, packCompiled, unpackCompiled, readReplay, judgeReplay, parseMods, rateOf, signatureMatch, REPLAY_VERSION, chartStats, seededRandom, botPlay, starRating, playPR, gradeOf, ppAccuracy, STAR_VERSION } from "./judge.js";
+import { JUDGE_VERSION, JudgeDataError, loadChart, compileChart, packCompiled, unpackCompiled, readReplay, judgeReplay, parseMods, rateOf, signatureMatch, REPLAY_VERSION, chartStats, seededRandom, botPlay, starRating, playPR, gradeOf, ppAccuracy, STAR_VERSION, scoreWithRate } from "./judge.js";
 /**
  * The oldest replay version whose plays still count (boards, dailies, dans). 3 = 2.0 and newer (no early misses), raised
  * when 2.0 came out (2026-11-17): plays from 1.x get "Update the game and play it again".
@@ -80,13 +80,13 @@ const stripTag = (n) => { if (!n) return "Player"; const i = n.lastIndexOf("#");
 // leaderboard with impossible values are taken off it.
 const V = {
   maxStars: 25,            // the hardest real charts are far below this
-  maxTotalPR: 60_000,      // the best players are around 13,000
+  maxTotalPR: 5_000_000,   // (2.2.0) every play adds its full PR: totals grow with every chart played
   maxLevel: 1000,
   maxPlays: 2_000_000,
   maxCombo: 200_000,
   maxPlayTimeMs: 100_000_000_000, // about three years of playing
   maxBig: 9_000_000_000_000_000,
-  dayPR: 4_000,            // more PR than this within 24 hours waits for a moderator
+  dayPR: 30_000,           // more PR than this within 24 hours waits for a moderator ((2.2.0) every new chart adds its full PR)
   dayLevels: 25,           // the same for levels
   maxCharts: 30_000,
 };
@@ -108,12 +108,15 @@ const accCurve = (a) => Math.max(0, 1 - 3 * (1 - a));
 const accCurveOld = (a) => Math.max(0, 5 * a - 4);
 /** The game's rough osu!mania accuracy from its shown accuracy (Performance.PPAccuracyFromShown), 0..1. */
 const ppAccFromShown = (shown) => Math.max(0, 100 - (100 - shown) * 1.35) / 100;
-/** Total PR from the best play per chart: the best counts fully, the next 95%, … plus the plays bonus (Performance.Total). */
+/**
+ * Total PR (Performance.Total): (2.2.0) every chart's best play adds its full PR. Before 2.2.0 the best counted fully,
+ * the next 95%, ... plus a bonus for the number of charts (TOTAL_V 1).
+ */
+const TOTAL_V = 2;
 function totalPR(best) {
-  const sorted = [...best].sort((a, b) => b - a);
-  let t = 0, w = 1;
-  for (const p of sorted) { t += p * w; w *= 0.95; }
-  return round2(t + 416.6667 * (1 - Math.pow(0.995, Math.min(1000, sorted.length))));
+  let t = 0;
+  for (const p of best) t += Number(p) || 0;
+  return round2(t);
 }
 function weightedAccuracy(plays) {
   let s = 0, ws = 0, w = 1;
@@ -432,7 +435,7 @@ const ACH_RULES = (() => {
   min((x) => x.tot.plays, [["first-play", 1], ["plays-10", 10], ["plays-100", 100], ["plays-500", 500], ["plays-1000", 1000], ["plays-5000", 5000]]);
   min((x) => x.tot.timeMs, [["time-1h", 3_600_000], ["time-10h", 36_000_000], ["time-50h", 180_000_000], ["time-100h", 360_000_000]]);
   min((x) => x.level, [["level-10", 10], ["level-25", 25], ["level-50", 50], ["level-100", 100], ["level-250", 250], ["level-500", 500], ["level-1000", 1000]]);
-  min((x) => x.pp, [["pp-1000", 1000], ["pp-2500", 2500], ["pp-5000", 5000], ["pp-10000", 10000], ["pp-15000", 15000], ["pp-20000", 20000]]);
+  min((x) => x.pp, [["pp-1000", 1000], ["pp-2500", 2500], ["pp-5000", 5000], ["pp-10000", 10000], ["pp-15000", 15000], ["pp-20000", 20000], ["pp-25000", 25000], ["pp-50000", 50000], ["pp-100000", 100000], ["pp-250000", 250000]]);
   min((x) => x.tot.notes, [["hits-10k", 10_000], ["hits-100k", 100_000], ["hits-500k", 500_000], ["hits-1m", 1_000_000], ["hits-5m", 5_000_000]]);
   min((x) => x.tot.charts, [["charts-50", 50], ["charts-250", 250]]);
   min((x) => x.tot.score, [["score-10m", 10_000_000], ["score-100m", 100_000_000], ["score-1b", 1_000_000_000]]);
@@ -743,7 +746,8 @@ async function achSweep(env, max = 80) {
  * card and their pace record. It stops once it has been through the whole ranking; after that, playing keeps it current.
  */
 async function recomputeRanking(env, max = 6) {
-  const state = await r2json(env, "rank/recompute.json", { offset: 0, done: false, changed: 0 });
+  const stateKey = `rank/recompute-t${TOTAL_V}.json`; // (2.2.0) once more for the new totals
+  const state = await r2json(env, stateKey, { offset: 0, done: false, changed: 0 });
   if (state.done) return state;
   const cfg = config(env);
   await loadModeration(cfg);
@@ -767,14 +771,14 @@ async function recomputeRanking(env, max = 6) {
         if (card && typeof card === "object") { card.pp = r.pp; card.accuracy = r.accuracy; await saveItem(env, id, "card", card, true); }
       });
       const pk = `rank/players/${id}.json`, rec = await r2json(env, pk, null);
-      if (rec) { rec.pp = r.pp; rec.hist = []; await r2put(env, pk, rec); }
+      if (rec) { rec.pp = r.pp; rec.hist = []; rec.tv = TOTAL_V; delete rec.held; await r2put(env, pk, rec); }
       cards.delete(id);
       state.changed = (state.changed || 0) + 1;
     } catch (err) { console.log("ranking recompute", id, err && err.message); }
   }
   state.offset += results.length;
   if (results.length < max) { state.done = true; state.finishedAt = new Date().toISOString(); }
-  await r2put(env, "rank/recompute.json", state);
+  await r2put(env, stateKey, state);
   return state;
 }
 
@@ -824,14 +828,47 @@ async function rememberDay(env, id, pp, acc, rank, level) {
   const day = new Date(Date.now()).toISOString().slice(0, 10);
   await r2update(env, historyKey(id), () => ({ v: 1, days: [] }), (d) => {
     d.days ||= [];
-    const point = [day, round2(Number(pp) || 0), round2(Number(acc) || 0), Number(rank) || 0, Number(level) || 1];
+    const point = [day, round2(Number(pp) || 0), round2(Number(acc) || 0), Number(rank) || 0, Number(level) || 1, TOTAL_V];
     const last = d.days[d.days.length - 1];
     if (last && last[0] === day) {
-      if (last[1] === point[1] && last[2] === point[2] && last[3] === point[3] && last[4] === point[4]) return false;
+      if (last[1] === point[1] && last[2] === point[2] && last[3] === point[3] && last[4] === point[4] && last[5] === point[5]) return false;
       d.days[d.days.length - 1] = point;
     } else d.days.push(point);
     if (d.days.length > 730) d.days = d.days.slice(-730);
   });
+}
+
+// ---------------------------------------------------------------- (2.2.0) top PR gainers of the week
+// R2 rank/gainers.json: { players: { <id>: { name, gain, pp, at } } }. At every ranking sync the player's gain is their
+// PR now minus their PR 7 days ago (the first day of the last 7 with the same kind of total, see rememberDay's TOTAL_V),
+// so the change to plain-sum totals in 2.2.0 doesn't count as a gain.
+const GAIN_DAYS = 7;
+async function rememberGain(env, id, name, pp) {
+  const hist = await r2json(env, historyKey(id), null);
+  const days = (hist && hist.days) || [];
+  const since = new Date(Date.now() - GAIN_DAYS * 86_400_000).toISOString().slice(0, 10);
+  const base = days.find((d) => d[0] >= since && d[5] === TOTAL_V);
+  const gain = base ? round2(Math.max(0, (Number(pp) || 0) - (Number(base[1]) || 0))) : 0;
+  await r2update(env, "rank/gainers.json", () => ({ players: {} }), (g) => {
+    g.players ||= {};
+    const now = Date.now();
+    for (const [k, v] of Object.entries(g.players)) if (!v || now - Date.parse(v.at) > GAIN_DAYS * 86_400_000) delete g.players[k];
+    const old = g.players[id];
+    if (!(gain > 0)) { if (!old) return false; delete g.players[id]; return; }
+    if (old && old.gain === gain && old.name === name) return false;
+    g.players[id] = { name: String(name || "Player").slice(0, 40), gain, pp: round2(Number(pp) || 0), at: new Date(now).toISOString() };
+  });
+}
+async function topGainers(env, limit = 50) {
+  const g = await r2json(env, "rank/gainers.json", { players: {} });
+  const now = Date.now();
+  if (Date.now() - boardAt > BOARD_TTL) { try { await loadModeration(config(env)); } catch { /* keep */ } }
+  return Object.entries(g.players || {})
+    .filter(([id, v]) => v && v.gain > 0 && now - Date.parse(v.at) <= GAIN_DAYS * 86_400_000 && !moderation.bans[id] && !isOfficial(id))
+    .map(([id, v]) => ({ playerId: id, name: v.name, gain: v.gain, pp: v.pp, at: v.at }))
+    .sort((a, b) => b.gain - a.gain)
+    .slice(0, limit)
+    .map((x, i) => ({ ...x, rank: i + 1 }));
 }
 
 /** Every verified chart's stars and pattern tags by its board key ("song/chart", osu! sets as "osu-<set>/<md5>"). */
@@ -934,8 +971,8 @@ async function playsOf(env, id) {
   for (const p of Object.values((judged && judged.unverified) || {}))
     if (p && p.pp > 0 && after(p.at) && !(p.song && onBoard(p.song))) top.push(show(null, { ...p, counted: p.pp * UNVERIFIED_SHARE }, false));
   top.sort((a, c) => c.pp - a.pp);
-  let w = 1;
-  for (const t of top) { t.weight = round2(w * 100); t.weighted = round2(t.pp * w); w *= 0.95; }
+  // (2.2.0) every play counts its full PR; weight is the share of the chart's PR the accuracy earned (the accuracy curve)
+  for (const t of top) { t.earned = round2(accCurve((Number(t.acc) || 0) / 100) * 100); t.weight = t.earned; t.weighted = t.pp; }
   // recent: what the server kept, then their best plays by date
   const recent = [];
   for (const r of Array.isArray(judged && judged.recent) ? judged.recent : []) {
@@ -2033,6 +2070,8 @@ async function account(request, env, route) {
       // (dan clears aren't taken from synced plays any more: only from /play/dan/clear, judged from the replay)
       // a jump bigger than a day of real playing waits for a moderator
       const { key, rec } = await paceCheck(env, cfg, id, now);
+      // (2.2.0) totals became a plain sum: the record starts over from the new total once, so the jump isn't held
+      if (rec.tv !== TOTAL_V) { rec.tv = TOTAL_V; rec.pp = r.pp; rec.hist = []; delete rec.held; }
       rec.hist = (rec.hist || []).filter((h) => now - h.t < 86_400_000);
       const basePR = Math.min(rec.pp, ...rec.hist.map((h) => h.pp));
       const baseLv = Math.min(rec.level, ...rec.hist.map((h) => h.level));
@@ -2109,6 +2148,7 @@ async function account(request, env, route) {
       cards.delete(id);
       // the profile's progress graphs (what the ranking shows today), and their crew's score
       if (!official) await rememberDay(env, id, pub.pp, pub.accuracy, rank, pub.level).catch((e) => console.log("progress day", e && e.message));
+      if (!official && !held) await rememberGain(env, id, card.name, pub.pp).catch((e) => console.log("gainers", e && e.message));
       if (!official) await crewTouch(env, id, pub.pp).catch((e) => console.log("crew", e && e.message));
       return reply({ ok: true, pp: pub.pp, level: pub.level, rank, held, leftOut: r.problems.length, counted: r.counted, country, plays: r.byChart, starVersion: STAR_VERSION });
     }
@@ -3305,6 +3345,17 @@ async function readBoard(env, songId, chartId) {
   let data = { entries: [] };
   if (o) { try { data = await o.json(); } catch { /* start over */ } }
   data.entries ||= [];
+  // (2.2.0) scores are the points times the song speed: older scores at a rate get it once (rs marks scores that have it)
+  if (data.entries.some((e) => e && !e.rs)) {
+    for (const e of data.entries) {
+      if (!e || e.rs) continue;
+      const r = rateOf(e.mods);
+      if (r !== 1 && Number(e.score) > 0) e.score = scoreWithRate(Number(e.score), r);
+      e.rs = 1;
+    }
+    data.entries.sort((a, c) => c.score - a.score || c.accuracy - a.accuracy || Date.parse(a.date) - Date.parse(c.date));
+    if (o) await env.RELEASES.put(key, JSON.stringify(data), { httpMetadata: { contentType: "application/json" } }).catch((e) => console.log("board rate scores", e && e.message));
+  }
   boards.set(key, { data, at: Date.now() });
   if (boards.size > 500) boards.delete(boards.keys().next().value);
   return data;
@@ -3343,7 +3394,18 @@ async function chartScores(request, env, url) {
     let sup = {};
     try { sup = await supporters(env); } catch { /* none */ }
     const entries = data.entries.filter((e) => !moderation.bans[e.playerId] && !isOfficial(e.playerId)).slice(0, 50).map((e, i) => ({ ...e, rank: i + 1, supporter: !!sup[e.playerId]?.active }));
-    return reply({ official: true, entries, total: data.entries.length });
+    // (2.2.0) the chart's stars as the server rates them (the board's PR is worked out with them) and its max PR at normal speed
+    let stars = null, maxPR = null;
+    try {
+      const i = (await boardChartInfo(env)).charts.get(`${m[1]}/${m[2]}`);
+      if (i && i.stv === STAR_VERSION && i.stars > 0) {
+        stars = round2(i.stars);
+        const best = data.entries.find((e) => Array.isArray(e.counts) && e.counts.length >= 6);
+        const targets = best ? best.counts.slice(0, 6).reduce((a, n) => a + (Number(n) || 0), 0) : 0;
+        maxPR = targets > 0 ? playPR(i.stars, [targets, 0, 0, 0, 0, 0], targets, false, "") : null;
+      }
+    } catch { /* not known */ }
+    return reply({ official: true, entries, total: data.entries.length, stars, maxPR });
   }
   if (url.pathname === "/scores/submit") {
     const b = await bodyOf(request, 2_600_000); // the play's replay comes with it
@@ -3382,6 +3444,7 @@ async function chartScores(request, env, url) {
       rc: 1,
       judged: JUDGE_VERSION,
       pts: 1, // 2.1.1 points
+      rs: 1, // (2.2.0) the score has the song speed's bonus (the judge worked it out)
     };
     // (2.1.3) the PR is worked out here from the judged hits when the server has rated the chart (v5) and it was played at
     // normal speed: what the game sent doesn't count (older games work it out with the old stars and curve)
@@ -4093,6 +4156,7 @@ async function supportRoutes(request, env, url, ctx) {
       // (2.1.4) lifetime supporter
       if (s.payment_status === "paid" && id && s.metadata?.lifetime === "1") {
         if (await grantLifetime(env, id, s)) {
+          await giveLifetimeTitle(env, id).catch((e) => console.log("lifetime title", e && e.message));
           supportIndex = null; await syncSupporterRole(env, id);
           await recordSupport(env, { months: 0, lifetime: true, cents: s.amount_total, gift: false, buyer: id, to: id, ref: s.id });
         }
@@ -6442,6 +6506,8 @@ function iconsV2Entry(e) {
   return e;
 }
 
+/** (2.2.0) The lifetime supporters' title. */
+const LIFETIME_TITLE = "title-together-forever";
 const SHOP = [
   ...[["daily-grinder", "Daily Grinder"], ["jack-enjoyer", "Jack Enjoyer"], ["stream-machine", "Stream Machine"], ["ln-lover", "LN Lover"],
      ["chordjack-menace", "Chordjack Menace"], ["sv-survivor", "SV Survivor"], ["night-owl", "Night Owl"], ["speed-demon", "Speed Demon"],
@@ -6486,9 +6552,16 @@ const SHOP = [
   { id: "showcase", kind: "showcase", name: "Profile showcase", price: 1000, note: "Pin up to 3 of your best plays or achievements to your profile" },
   { id: "spotlight", kind: "spotlight", name: "Workshop spotlight", price: 2000, note: "One of your uploads at the top of the Workshop for 24 hours", noGift: true },
   { id: "supporter-month", kind: "supporter", name: "1 month of OCTIVE Supporter", price: 15000 },
+  // (2.2.0) only for lifetime supporters (given with lifetime, never sold)
+  { id: LIFETIME_TITLE, kind: "title", name: "Together Forever", price: 0, reward: true, noGift: true, note: "For lifetime supporters", minVersion: "2.2.0" },
 ];
 // ---- supporters: 3x the points from the daily charts, and 10% off in the shop (gifts too)
 const SUPPORTER_DAILY_MULT = 3, SUPPORTER_DISCOUNT = 10;
+/** Gives a lifetime supporter the Together Forever title (once). */
+async function giveLifetimeTitle(env, id) {
+  const w = await walletUpdate(env, id, (w) => { if (w.owned.includes(LIFETIME_TITLE)) return false; w.owned.push(LIFETIME_TITLE); });
+  if (w) await writeCosmetics(env, id, w);
+}
 async function isSupporterNow(env, id) {
   if (LIFETIME_SUPPORTERS.includes(id)) return true;
   try {
@@ -6512,6 +6585,13 @@ async function retireItems(env, id) {
       cur = (await walletUpdate(env, id, (w) => { for (const x of all) if (!w.owned.includes(x)) w.owned.push(x); })) || cur;
       await writeCosmetics(env, id, cur);
     }
+  }
+  // (2.2.0) lifetime supporters from before the title existed get it (checked once per player)
+  if (!cur.ltChecked && !(cur.owned || []).includes(LIFETIME_TITLE)) {
+    let life = LIFETIME_SUPPORTERS.includes(id);
+    if (!life) { try { life = !!supportStatus(await r2json(env, `supporters/${id}.json`, null), id, null).lifetime; } catch { life = false; } }
+    cur = (await walletUpdate(env, id, (w) => { w.ltChecked = true; if (life && !w.owned.includes(LIFETIME_TITLE)) w.owned.push(LIFETIME_TITLE); })) || cur;
+    if (life) await writeCosmetics(env, id, cur);
   }
   // icons became shapes + colours: what you had looks the same (the shape, its colour for free, still on)
   if (!cur.iconsV2 && (cur.owned || []).some((x) => x.startsWith("icon-"))) {
@@ -9504,6 +9584,10 @@ async function playRoutes(request, env, url) {
   if (path === "/play/tournament" || path.startsWith("/play/tournament/")) return tourRoutes(request, env, url, path);
   if (path === "/play/event" && request.method === "POST") return reply(await eventAdmin(env, await signedIn(request, env), await bodyOf(request, 4_000)));
   // ---- a player's progress (2.0): PR, accuracy and rank over time, and their skill radar
+  // (2.2.0) the players who gained the most PR in the last 7 days
+  if (path === "/play/gainers" && request.method === "GET") {
+    return reply({ days: GAIN_DAYS, players: await topGainers(env, Math.max(1, Math.min(100, Number(url.searchParams.get("limit")) || 50))) });
+  }
   if (path === "/play/progress" && request.method === "GET") {
     const id = String(url.searchParams.get("player") || "");
     if (!okPlayerId(id)) fail(400, "That player can't be found.");

@@ -2231,3 +2231,17 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 .sup-earned-row .sup-earned { margin-top: 8px; }
 .sup-pill.former { filter: saturate(.45); opacity: .85; border-color: var(--line); background: #ffffff0a; }
 .sup-pill.former span { color: var(--dim); }
+
+/* (2.2.0) top PR gainers of the week, on the rankings page */
+.gainers { margin: 18px 0 6px; padding: 14px 16px; border-radius: 16px; background: linear-gradient(135deg, #a764ff1f, #ff4d9d14); border: 1px solid #ffffff17; }
+.gain-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.gain-head h2 { margin: 0; font-size: 18px; }
+.gain-head small { color: var(--dim, #b6add6); }
+.gain-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; }
+.gain-row { display: grid; grid-template-columns: auto 1fr auto; grid-template-rows: auto auto; column-gap: 10px; align-items: center; padding: 8px 12px; border-radius: 12px; background: #ffffff0a; color: inherit; text-decoration: none; transition: background .15s, transform .15s; }
+.gain-row:hover { background: #ffffff14; transform: translateY(-1px); }
+.gain-rank { grid-row: span 2; font-weight: 800; color: #ff8cc4; }
+.gain-name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gain-amt { color: #3fe08a; text-align: right; }
+.gain-total { grid-column: 2 / 4; color: var(--dim, #b6add6); }
+.gain-empty { margin: 4px 0; color: var(--dim, #b6add6); }
