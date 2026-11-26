@@ -119,6 +119,111 @@
     "secret": true
   },
   {
+    "id": "ranked-placed",
+    "title": "Placed",
+    "desc": "Finish your Ranked placement.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-first-win",
+    "title": "On the Board",
+    "desc": "Win a Ranked match.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-sweep",
+    "title": "Clean Sweep",
+    "desc": "Win a Ranked match 2-0.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-comeback",
+    "title": "Comeback",
+    "desc": "Win a match after losing its first round.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-flawless",
+    "title": "Flawless",
+    "desc": "Win a Ranked round with 99% accuracy or better.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-giant",
+    "title": "Giant Slayer",
+    "desc": "Beat a player three or more divisions above you.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-rankup",
+    "title": "Moving Up",
+    "desc": "Rank up after a match.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-streak-3",
+    "title": "Heating Up",
+    "desc": "Win 3 Ranked matches in a row.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-streak-5",
+    "title": "Unstoppable",
+    "desc": "Win 5 Ranked matches in a row.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-rockstar",
+    "title": "Rockstar",
+    "desc": "Reach Rockstar in Ranked.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-superstar",
+    "title": "Superstar",
+    "desc": "Reach Superstar in Ranked.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-elite",
+    "title": "Elite",
+    "desc": "Reach Elite in Ranked.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-champion",
+    "title": "Champion",
+    "desc": "Reach Champion in Ranked.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-legend",
+    "title": "Legend",
+    "desc": "Reach Legend in Ranked.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
+    "id": "ranked-friendly",
+    "title": "Friendly Fire",
+    "desc": "Play a friendly match against someone.",
+    "group": "Ranked",
+    "secret": false
+  },
+  {
     "id": "plays-10",
     "title": "Warming Up",
     "desc": "Finish 10 songs.",
@@ -343,6 +448,34 @@
     "secret": false
   },
   {
+    "id": "pp-25000",
+    "title": "Powerhouse",
+    "desc": "Reach 25,000 PR.",
+    "group": "Milestones",
+    "secret": false
+  },
+  {
+    "id": "pp-50000",
+    "title": "Juggernaut",
+    "desc": "Reach 50,000 PR.",
+    "group": "Milestones",
+    "secret": false
+  },
+  {
+    "id": "pp-100000",
+    "title": "Six Figures",
+    "desc": "Reach 100,000 PR.",
+    "group": "Milestones",
+    "secret": false
+  },
+  {
+    "id": "pp-250000",
+    "title": "Living Legend",
+    "desc": "Reach 250,000 PR.",
+    "group": "Milestones",
+    "secret": false
+  },
+  {
     "id": "first-fc",
     "title": "Full Combo",
     "desc": "Full combo any chart.",
@@ -539,13 +672,6 @@
     "secret": false
   },
   {
-    "id": "keys-7",
-    "title": "Seven Fingers",
-    "desc": "Clear a 7K chart or more.",
-    "group": "Skill",
-    "secret": false
-  },
-  {
     "id": "sup-new",
     "title": "Supporter",
     "desc": "Become an OCTIVE supporter. Thank you!",
@@ -605,6 +731,13 @@
     "id": "remix-10",
     "title": "Remix Tour",
     "desc": "Clear 10 different OCTIVE Remix charts.",
+    "group": "OCTIVE Remixes",
+    "secret": false
+  },
+  {
+    "id": "remix-all-songs",
+    "title": "Completionist",
+    "desc": "Clear every OCTIVE Official song at least once.",
     "group": "OCTIVE Remixes",
     "secret": false
   },
@@ -738,13 +871,6 @@
     "id": "navsegda",
     "title": "Forever",
     "desc": "Get an S on Navsegda [V2].",
-    "group": "OCTIVE Remixes",
-    "secret": false
-  },
-  {
-    "id": "remix-all-songs",
-    "title": "Completionist",
-    "desc": "Clear every OCTIVE Official song at least once.",
     "group": "OCTIVE Remixes",
     "secret": false
   }

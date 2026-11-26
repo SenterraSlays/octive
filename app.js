@@ -622,17 +622,21 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     if (s.grade) banner.append(h("span.scd-grade", { text: s.grade }));
     coverStyle(banner, s.cover);
     const tile = (label, value, cls) => h("div.scd-tile" + (cls || ""), {}, h("span", { text: label }), h("b", { text: value }));
-    const tiles = h("div.scd-tiles");
-    if (s.score != null) tiles.append(tile("Score", fmt0.format(s.score)));
-    if (s.acc != null) tiles.append(tile("Accuracy", fmt2.format(s.acc) + "%"));
-    if (s.pp != null) tiles.append(tile("Rating", fmt0.format(s.pp) + " PR", ".pr"));
-    if (s.maxCombo != null) tiles.append(tile("Max combo", fmt0.format(s.maxCombo) + "x" + (s.fullCombo ? "  FC" : ""), s.fullCombo ? ".fc" : ""));
-    const box = h("div.scd-modal", { role: "dialog", "aria-modal": "true", "aria-label": "Showcase play" }, banner, tiles);
-    if (Array.isArray(s.counts) && s.counts.length === 6) {
-      const judg = h("div.scd-judg");
-      JUDGEMENTS.forEach(([n, c], i) => { const b = h("div", {}, h("span", { text: n }), h("b", { text: fmt0.format(s.counts[i] || 0) })); b.style.setProperty("--j", c); judg.append(b); });
-      box.append(judg);
-    }
+    const tiles = h("div.scd-tiles"), judg = h("div.scd-judg", { hidden: true });
+    // (2.2.2) painted again when a play's score and judgements arrive after the popup opened (see playsSection)
+    const paint = () => {
+      tiles.replaceChildren();
+      if (s.score != null) tiles.append(tile("Score", fmt0.format(s.score)));
+      else if (s.loading) tiles.append(tile("Score", "…"));
+      if (s.acc != null) tiles.append(tile("Accuracy", fmt2.format(s.acc) + "%"));
+      if (s.pp != null) tiles.append(tile("Rating", fmt0.format(s.pp) + " PR", ".pr"));
+      if (s.maxCombo != null) tiles.append(tile("Max combo", fmt0.format(s.maxCombo) + "x" + (s.fullCombo ? "  FC" : ""), s.fullCombo ? ".fc" : ""));
+      judg.replaceChildren();
+      judg.hidden = !(Array.isArray(s.counts) && s.counts.length === 6);
+      if (!judg.hidden) JUDGEMENTS.forEach(([n, c], i) => { const b = h("div", {}, h("span", { text: n }), h("b", { text: fmt0.format(s.counts[i] || 0) })); b.style.setProperty("--j", c); judg.append(b); });
+    };
+    paint();
+    const box = h("div.scd-modal", { role: "dialog", "aria-modal": "true", "aria-label": "Showcase play" }, banner, tiles, judg);
     box.append(h("p.scd-mods", {}, h("span", { text: "Mods" }), s.mods ? s.mods : "None"));
     if (s.date && !isNaN(Date.parse(s.date))) box.append(h("p.scd-when", { text: "Played " + new Date(s.date).toLocaleString(undefined, { dateStyle: "long", timeStyle: "short" }) }));
     const link = showcaseLink(s);
@@ -649,6 +653,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     box.querySelectorAll("a").forEach((a) => a.addEventListener("click", () => { if (!a.target) close(); }));
     document.body.append(layer);
     document.addEventListener("keydown", onKey);
+    return { update: (more) => { Object.assign(s, more, { loading: false }); paint(); } };
   }
 
   // (2.1) a profile laid out like a rhythm game profile usually is: a cover with the picture over its edge, the ranks
@@ -846,24 +851,29 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       (tabBtns[k] = h("button.pl-tab", { type: "button", onclick: () => { mode = k; shown = 10; paint(); } }, label))));
     const box = h("section.pl-section", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: "Plays" }), tabs), list);
     let data = null, mode = "top", shown = 10;
-    // (2.2.1) a play's details, in the showcase's popup. Plays from before 2.2.1 don't keep their score and judgements:
-    // they come from the player's board score when that's the same play (same accuracy and mods).
-    let opening = false;
-    const openPlay = async (t) => {
-      if (opening) return;
-      const s = { title: t.title, difficulty: t.difficulty, keys: t.keys, stars: t.stars, grade: t.grade, cover: t.pic, score: t.score, acc: t.acc,
-        pp: t.pp, maxCombo: t.maxCombo, fullCombo: t.fc, counts: t.counts, mods: t.mods, date: t.at, workshopId: t.item };
-      if ((s.score == null || !Array.isArray(s.counts)) && t.board && worker) {
-        opening = true;
+    // (2.2.1) a play's details, in the showcase's popup. A play without its score and judgements (kept before 2.2.1 and
+    // not filled in yet) gets them from the player's board score when that's the same play (same accuracy and mods).
+    // (2.2.2) the popup opens at once and fills in when the board answers (it waited for the board before); the board is
+    // asked for when the pointer comes over the row, so it's usually there by the click
+    const missing = (t) => (t.score == null || !Array.isArray(t.counts)) && t.board && worker;
+    const boardAsks = new Map();
+    const boardOf = (t) => {
+      if (!boardAsks.has(t.board)) {
         const [song, chart] = t.board.split("/");
-        const d = await fetch(`${worker}/scores/${encodeURIComponent(song)}/${encodeURIComponent(chart)}`).then((r) => (r.ok ? r.json() : null)).catch(() => null);
-        opening = false;
-        const e = d && (d.entries || []).find((x) => x.playerId === p.id);
-        if (e && Math.abs((Number(e.accuracy) || 0) - (Number(t.acc) || 0)) < 0.02 && String(e.mods || "") === String(t.mods || "")) {
-          s.score = e.score; s.counts = e.counts; s.maxCombo = e.maxCombo; if (e.date) s.date = e.date;
-        }
+        boardAsks.set(t.board, fetch(`${worker}/scores/${encodeURIComponent(song)}/${encodeURIComponent(chart)}`).then((r) => (r.ok ? r.json() : null)).catch(() => null));
       }
-      showcaseDetails(s);
+      return boardAsks.get(t.board);
+    };
+    const openPlay = (t) => {
+      const s = { title: t.title, difficulty: t.difficulty, keys: t.keys, stars: t.stars, grade: t.grade, cover: t.pic, score: t.score, acc: t.acc,
+        pp: t.pp, maxCombo: t.maxCombo, fullCombo: t.fc, counts: t.counts, mods: t.mods, date: t.at, workshopId: t.item, loading: !!missing(t) };
+      const popup = showcaseDetails(s);
+      if (!s.loading) return;
+      boardOf(t).then((d) => {
+        const e = d && (d.entries || []).find((x) => x.playerId === p.id);
+        const same = e && Math.abs((Number(e.accuracy) || 0) - (Number(t.acc) || 0)) < 0.02 && String(e.mods || "") === String(t.mods || "");
+        popup.update(same ? { score: e.score, counts: e.counts, maxCombo: e.maxCombo ?? s.maxCombo } : {});
+      });
     };
     const row = (t, i) => {
       const top = mode === "top";
@@ -872,7 +882,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const thumb = h("span.pl-thumb", { "aria-hidden": "true" });
       if (t.pic) { const img = h("img", { src: t.pic, alt: "", loading: "lazy" }); img.onerror = () => img.remove(); thumb.append(img); }
       return h("div.pl-row.linked", { "data-place": top ? i + 1 : null, role: "button", tabindex: "0", title: "Details",
-        onclick: () => openPlay(t), onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openPlay(t); } } },
+        onclick: () => openPlay(t), onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openPlay(t); } },
+        onpointerenter: () => { if (missing(t)) boardOf(t); }, onfocus: () => { if (missing(t)) boardOf(t); } },
         h("span.pl-rank", { text: top ? "#" + (i + 1) : "" }),
         h("span.pl-grade", { text: t.grade || "–", style: `--g:${GRADE_COL[t.grade] || "#8a8aa0"}`, title: t.fc ? "Full combo" : null }, t.fc ? h("i", { text: "FC" }) : null),
         thumb,
@@ -3177,9 +3188,9 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   // ---------------------------------------------------------------- achievements (public, from the player's card)
   let achDefs = null;
-  const loadAchDefs = () => achDefs ??= fetch("data/achievements.json?v=1.5.0-1").then((r) => r.json()).catch(() => []);
-  const ACH_COLOURS = { Milestones: "#8b7bff", Skill: "#4fd6e8", Supporter: "#ff6fae", "OCTIVE Remixes": "#f2c14e", Community: "#5865f2" };
-  const ACH_ICONS = { Milestones: "★", Skill: "✔", Supporter: "♥", "OCTIVE Remixes": "♪", Community: "☺" };
+  const loadAchDefs = () => achDefs ??= fetch("data/achievements.json?v=2.2.2-1").then((r) => r.json()).catch(() => []);
+  const ACH_COLOURS = { Milestones: "#8b7bff", Skill: "#4fd6e8", Supporter: "#ff6fae", "OCTIVE Remixes": "#f2c14e", Community: "#5865f2", Ranked: "#ff9f43" };
+  const ACH_ICONS = { Milestones: "★", Skill: "✔", Supporter: "♥", "OCTIVE Remixes": "♪", Community: "☺", Ranked: "♛" };
 
   function achievementsSection(p) {
     const box = h("section.ach-section", {}, h("p.panel-sub", { text: "Loading achievements…" }));
