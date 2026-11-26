@@ -2914,7 +2914,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       giftList.textContent = "";
       const term = giftSearch.value.trim().toLowerCase();
       if (!term || !data) return;
-      for (const p of data.players.filter((x) => (x.name || "").toLowerCase().includes(term) && (!me || x.id !== me.playerId)).slice(0, 8))
+      for (const p of data.players.filter((x) => (x.name || "").toLowerCase().includes(term) && (!me || x.id !== me.playerId) && !(x.supporter && x.supporter.lifetime)) /* (2.2.1) months do nothing for lifetime supporters */.slice(0, 8))
         giftList.append(h("button.gift-pick", { type: "button", onclick: () => { giftTo = p.id; paintGift(); } }, h("span", { text: p.name }), h("span.dim", { text: "#" + fmt0.format(p.rank) })));
       if (/^[A-Za-z0-9_-]{20,64}$/.test(giftSearch.value.trim()))
         giftList.append(h("button.gift-pick", { type: "button", onclick: () => { giftTo = giftSearch.value.trim(); paintGift(); } }, h("span", { text: "Use this player ID" }), h("span.dim", { text: giftSearch.value.trim().slice(0, 10) + "…" })));
