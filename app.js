@@ -1091,13 +1091,15 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function home() {
     const players = data ? data.players : [];
     const online = players.filter((p) => p.online).length;
-    const best = players[0];
     const stat = (label, value, cls) => h("div.hm-stat" + (cls ? "." + cls : ""), {}, h("b", { text: value }), h("span", { text: label }));
     const ver = stat("Latest version", "…");
+    // (2.2.2) the Workshop's verified charts (checked by OCTIVE: global leaderboards and full PR), where Top performance used to be
+    const verified = h("a.hm-stat", { href: "workshop?verified=1", title: "Charts checked by OCTIVE: global leaderboards and full PR" },
+      h("b", { text: "…" }), h("span", { text: "Verified charts" }));
     const strip = h("section.hm-stats", {},
       stat("Online now", data ? fmt0.format(online) : "…", "on"),
       stat("On the global ranking", data ? fmt0.format(players.length) : "…"),
-      stat("Top performance", best ? fmt0.format(best.pp || 0) + " PR" : "—"),
+      verified,
       ver);
     const update = h("aside.hm-update", {}, h("p.empty", { text: "Loading the latest update…" }));
     const hero = h("section.hm-hero", {},
@@ -1120,6 +1122,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("div.section-head", {}, h("h2.section-title", { text: "Most liked charts" }), h("a.more", { href: "workshop?sort=liked" }, "Workshop")),
       liked);
     fetch(worker + "/api/items?type=charts&sort=liked", { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+      // the same answer has the number of verified charts (for the stat above)
+      verified.querySelector("b").textContent = d && Number.isFinite(d.verifiedCharts) ? fmt0.format(d.verifiedCharts) : "—";
       if (!liked.isConnected) return;
       const items = ((d && d.items) || []).filter((x) => (x.likes || 0) > 0).slice(0, 8);
       if (!items.length) { liked.replaceChildren(h("p.empty", { text: "No likes yet: like a chart in the Workshop, here or in the game." })); return; }
@@ -1274,6 +1278,9 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     // #/workshop?sort=liked (the home page's Most liked charts link)
     const wantSort = new URLSearchParams((routeHash().split("?")[1] || "")).get("sort");
     if (wantSort && /^(new|popular|liked|hardest|easiest|pr|title|oldest)$/.test(wantSort)) { wsSort = wantSort; wsType = "charts"; }
+    // #/workshop?verified=1 (the home page's Verified charts)
+    const wantVer = new URLSearchParams((routeHash().split("?")[1] || "")).get("verified");
+    if (wantVer === "1" || wantVer === "0") { wsVerified = wantVer; wsType = "charts"; }
     document.title = "Workshop · OCTIVE";
     const tabs = h("div.ws-tabs");
     const grid = h("div.ws-grid", {}, h("p.empty", { text: "Loading…" }));
