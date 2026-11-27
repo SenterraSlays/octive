@@ -3385,6 +3385,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       ["The notes feel early or late", "Use Settings → Calibration: tap along to the clicks and apply the suggested audio offset. The visual offset moves only what you see."],
     ]],
     ["Scoring, PR and mods", [
+      ["What are OCTIVE's timing windows (ms)?", "Every chart uses the same hit windows: how far off you can be, early or late, for each judgement (Marvelous ±30 ms, Perfect ±55, Great ±85, Good ±120, Bad ±150). A note you haven't hit 150 ms after it is a Miss, and a press more than 150 ms early is a ghost tap. Long note releases get 1.5× the windows. The osu! Timing mod uses osu!mania's OD windows instead.", () => timingWindows()],
       ["What is PR?", "PR is your performance rating (it used to be called PP). It works like osu!'s performance points."],
       ["How is PR worked out?", "Like osu!mania: each chart has a star rating, and a play's PR grows with the stars and needs high accuracy (osu!mania accuracy: Marvelous 320, Perfect 300, Great 200, Good 100, Bad 50). Your total adds up the best play on every chart, each at its full PR, so every chart you play well counts."],
       ["Why did my PR change?", "Version 1.3.3 reworked PR: vibro and spam charts are rated more fairly and accuracy counts more. Your past plays were recalculated the first time you opened the new version."],
@@ -3446,6 +3447,25 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     ]],
   ];
 
+  /** (2.2.2) The Help page's timing table: OCTIVE's hit windows (Engine/Judgement/Judge.cs), releases, mods, osu! Timing. */
+  function timingWindows() {
+    const rows = [[30, 45], [55, 82.5], [85, 127.5], [120, 180], [150, 225]];
+    const ms = (v) => "±" + (Number.isInteger(v) ? v : v.toFixed(1)) + " ms";
+    const table = h("table.timing-table", {},
+      h("thead", {}, h("tr", {}, h("th", { text: "Judgement" }), h("th", { text: "Hit" }), h("th", { text: "Long note release" }))),
+      h("tbody", {}, ...rows.map(([hit, rel], i) => {
+        const [name, col] = JUDGEMENTS[i];
+        return h("tr", {}, h("td", {}, h("span.timing-name", { text: name, style: `--j:${col}` })), h("td", { text: ms(hit) }), h("td", { text: ms(rel) }));
+      }), h("tr.timing-miss", {}, h("td", {}, h("span.timing-name", { text: "Miss", style: `--j:${JUDGEMENTS[5][1]}` })), h("td", { text: "over 150 ms late" }), h("td", { text: "over 225 ms late" }))));
+    const od = (v) => [16, 64 - 3 * v, 97 - 3 * v, 127 - 3 * v, 151 - 3 * v, 188 - 3 * v].join(" / ");
+    return h("div.timing-help", {}, table,
+      h("ul.timing-notes", {},
+        h("li", { text: "Too early: a press more than 150 ms before a note is a ghost tap and does nothing." }),
+        h("li", { text: "Mods: Easy makes every window 1.4× wider, Hard Rock 1.4× tighter." }),
+        h("li", { text: `osu! Timing (OT) uses osu!mania's windows from the chart's OD: MAX ±16 ms, 300 ±(64 − 3·OD), 200 ±(97 − 3·OD), 100 ±(127 − 3·OD), 50 ±(151 − 3·OD), and a miss at 188 − 3·OD. At OD 8 that's ${od(8)} ms.` }),
+        h("li", { text: "Chart makers can widen or tighten single notes (0.25× to 4×) with a note's window scale." })));
+  }
+
   function helpPage() {
     document.title = "Help · OCTIVE";
     const q = h("input.help-search", { type: "search", placeholder: "Search the questions…", "aria-label": "Search help" });
@@ -3456,7 +3476,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         const shown = items.filter(([a, b]) => !term || (a + " " + b).toLowerCase().includes(term));
         if (!shown.length) return null;
         return h("section.help-group", {}, h("h2", { text: group }),
-          ...shown.map(([a, b]) => h("details.help-item", term ? { open: true } : {}, h("summary", { text: a }), h("p", { text: b }))));
+          ...shown.map(([a, b, more]) => h("details.help-item", term ? { open: true } : {}, h("summary", { text: a }), h("p", { text: b }), more ? more() : null)));
       }).filter(Boolean));
       if (!list.children.length) list.append(h("p.empty", { text: "No questions match. Try other words, or ask in the Discord." }));
     };
