@@ -43,7 +43,7 @@
 <body class="loading">
   <div id="stage"><canvas id="game" tabindex="-1" aria-label="OCTIVE"></canvas></div>
   <div class="bar">
-    <a href="../#/">← Website</a>
+    <a href="../">← Website</a>
     <button type="button" id="fullscreen">Fullscreen</button>
   </div>
   <div id="loading" role="status" aria-live="polite">
@@ -52,7 +52,7 @@
       <div class="word">OCTIVE</div>
       <div class="track"><div class="fill" id="fill"></div></div>
       <div class="status" id="status">Finding the latest version…</div>
-      <div class="hint">Playing in the browser: import .oct or osu! (.osz / .osu) beatmaps from Song Select; they stay saved in this browser. For the best timing, use the <a href="../#/download" style="color:#8b7bff">Windows or Android app</a>.</div>
+      <div class="hint">Playing in the browser: import .oct or osu! (.osz / .osu) beatmaps from Song Select; they stay saved in this browser. For the best timing, use the <a href="../downloads" style="color:#8b7bff">Windows or Android app</a>.</div>
     </div>
   </div>
 
@@ -89,7 +89,7 @@
     // imported songs and scores live in this browser's storage: ask the browser to keep it
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
-    if (!window.WebAssembly) { fail('Your browser can\'t run OCTIVE (no WebAssembly). Try a current Chrome, Edge or Firefox, or <a href="../#/download">download the game</a>.'); return; }
+    if (!window.WebAssembly) { fail('Your browser can\'t run OCTIVE (no WebAssembly). Try a current Chrome, Edge or Firefox, or <a href="../downloads">download the game</a>.'); return; }
 
     // Testers (signed in on the website) can load the test build instead, the same choice as the app's
     // "Swap to Test Build" button (the game saves it in octive.webChannel and reloads this page).
@@ -121,7 +121,7 @@
       .then(([latest, test]) => {
         const m = test || latest;
         const label = test ? `${test.version}-test${test.test}` : (m.web && m.web.version);
-        if (!m.web) { fail('The browser version isn\'t out yet. <a href="../#/download">Download OCTIVE</a> for Windows or Android instead.'); return; }
+        if (!m.web) { fail('The browser version isn\'t out yet. <a href="../downloads">Download OCTIVE</a> for Windows or Android instead.'); return; }
         const w = m.web, base = `${WORKER}/web/${w.version}/~${w.build || String(m.published || "").replace(/[^0-9]/g, "")}`;
         document.title = `OCTIVE ${label} · Play in your browser`;
         status.textContent = test ? `Loading test build ${label}…` : `Loading OCTIVE ${label}…`;

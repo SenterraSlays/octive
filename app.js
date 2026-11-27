@@ -1,4 +1,4 @@
-// OCTIVE website: home (#/), global ranking (#/rankings), player profiles (u/<playerId or link>, no # since 2.2.2), downloads
+// OCTIVE website: home, global ranking (rankings), player profiles (u/<playerId or link>), workshop, crews… (no # since 2.2.2)
 // (#/download), sign-in and profile editing (#/account) and password resets (#/reset). Reads the ranking
 // and releases from the Worker. No build step, no dependencies.
 (() => {
@@ -71,6 +71,31 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   const BASE_PATH = new URL(document.baseURI).pathname.replace(/[^/]*$/, "");
   /** A profile's address (relative to the site's folder): u/<player id or link>. */
   const profileHref = (key) => "u/" + encodeURIComponent(key || "");
+  // (2.2.2) every page has an address without a #: senterraslays.github.io/octive/workshop/<id>, …/crew/<id>,
+  // …/account?tab=preferences. GitHub Pages serves the page's own file (written by the Worker, with its picture for
+  // link previews) or 404.html (this same site). The site's in-page download page is "downloads" (download.html is
+  // the search engines' page). Old #/ links still open and move to the new address.
+  /** The page's route as "#/workshop/…?…", which is what the pages read. */
+  function routeHash() {
+    if (location.pathname.startsWith(BASE_PATH)) {
+      const rest = location.pathname.slice(BASE_PATH.length).replace(/\.html$/, "").replace(/\/+$/, "");
+      if (rest && rest !== "index" && rest !== "404") return "#/" + (rest === "downloads" ? "download" : rest) + location.search;
+    }
+    return location.hash.startsWith("#/") ? location.hash : "#/";
+  }
+  /** A route ("#/download", "account?tab=x") as the part of the address after the site's folder. */
+  const routePath = (to) => {
+    let rest = String(to || "").replace(/^#\/?/, "").replace(/^\/+/, "");
+    if (rest === "download" || rest.startsWith("download?")) rest = "downloads" + rest.slice(8);
+    return rest;
+  };
+  /** Opens a page of the site without loading the site again. */
+  function go(to) {
+    const url = BASE_PATH + routePath(to);
+    if (url === location.pathname + location.search) history.replaceState(history.state, "", url);
+    else history.pushState(null, "", url);
+    route(true);
+  }
   // (2.2.2) supporters' own profile links (u/Senterra): link (lower case) → player id ("" when nobody has it)
   const linkIds = {};
   /** The link to share for a profile: it shows their card in Discord and others, and opens the profile here. */
@@ -602,7 +627,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   }
   const JUDGEMENTS = [["Marvelous", "#9ef0ff"], ["Perfect", "#ffe08a"], ["Great", "#7ee39a"], ["Good", "#7fb6ff"], ["Bad", "#c79bff"], ["Miss", "#ff6b7a"]];
   function showcaseLink(s) {
-    if (s.workshopId) return { href: `#/workshop/${encodeURIComponent(s.workshopId)}`, text: "View in the Workshop" };
+    if (s.workshopId) return { href: `workshop/${encodeURIComponent(s.workshopId)}`, text: "View in the Workshop" };
     if (s.osuSet) return { href: `https://osu.ppy.sh/beatmapsets/${encodeURIComponent(s.osuSet)}`, text: "View on osu!", target: "_blank", rel: "noopener" };
     return null;
   }
@@ -717,7 +742,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       return;
     }
     if (!p) {
-      app.innerHTML = '<a class="back" href="#/rankings">← All players</a><p class="empty">That player isn\'t in the ranking (yet).</p>';
+      app.innerHTML = '<a class="back" href="rankings">← All players</a><p class="empty">That player isn\'t in the ranking (yet).</p>';
       setTimeout(giftPopup, 400);
       return;
     }
@@ -785,7 +810,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     loadCosmetics().then((cs) => {
       const cr = cs && cs.players && cs.players[p.id] && cs.players[p.id].crew;
       if (!cr || !cr.id || !card.isConnected) return;
-      sub.append(h("a.crew-chip", { href: "#/crew/" + encodeURIComponent(cr.id), title: "Their crew" }, crewTag(cr), h("span", { text: "Crew →" })));
+      sub.append(h("a.crew-chip", { href: "crew/" + encodeURIComponent(cr.id), title: "Their crew" }, crewTag(cr), h("span", { text: "Crew →" })));
     });
 
     // ranks, the rank graph and the numbers
@@ -868,7 +893,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     if (sup) overview.append(sup);
     overview.append(achievementsSection(p));
     // what they shared to the Workshop
-    const uploads = h("section.ws-profile", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: "Workshop uploads" }), h("a.more", { href: "#/workshop" }, "Workshop →")), h("div.ws-grid"));
+    const uploads = h("section.ws-profile", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: "Workshop uploads" }), h("a.more", { href: "workshop" }, "Workshop →")), h("div.ws-grid"));
     overview.append(uploads);
     fetch(`${worker}/api/items?creator=${encodeURIComponent(p.id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
       const items = (d && d.items) || [];
@@ -890,7 +915,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     }
     openTab("overview");
     social.addEventListener("open-list", (e) => { openTab(e.detail); tabs.scrollIntoView({ behavior: "smooth", block: "start" }); });
-    app.replaceChildren(h("a.back", { href: "#/rankings" }, "← All players"), h("div.pf", {}, card, stats, bar), tabs, pane);
+    app.replaceChildren(h("a.back", { href: "rankings" }, "← All players"), h("div.pf", {}, card, stats, bar), tabs, pane);
     document.title = `${p.name} · OCTIVE`;
     setTimeout(giftPopup, 400);
     window.scrollTo(0, 0);
@@ -1080,19 +1105,19 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("h1.hm-name", {}, h("img", { src: "logo.svg", alt: "", width: 52, height: 52 }), h("span.hm-word", { text: "OCTIVE" })),
         h("p.hm-lead", { text: "A free vertical scrolling rhythm game for 1 to 20 keys, on Windows, Android and in your browser. Bring your osu!mania maps, grab charts other players made from the Workshop, or make your own." }),
         h("div.cta", {},
-          h("a.btn.primary.big", { href: "#/download" }, "Download"),
+          h("a.btn.primary.big", { href: "downloads" }, "Download"),
           h("a.btn.big", { href: "play/" }, "Play in the browser"))),
       update);
 
     const shelf = h("div.hm-shelf", {}, h("p.empty", { text: "Loading the Workshop…" }));
     const workshop = h("section.hm-sec", {},
-      h("div.section-head", {}, h("h2.section-title", { text: "New in the Workshop" }), h("a.more", { href: "#/workshop" }, "See all")),
+      h("div.section-head", {}, h("h2.section-title", { text: "New in the Workshop" }), h("a.more", { href: "workshop" }, "See all")),
       shelf);
 
     // (2.1.2) the charts players like most (the same likes as the game's Workshop), where Top players used to be
     const liked = h("ol.hm-top.hm-liked", {}, h("p.empty", { text: "Loading…" }));
     const board = h("div.hm-col", {},
-      h("div.section-head", {}, h("h2.section-title", { text: "Most liked charts" }), h("a.more", { href: "#/workshop?sort=liked" }, "Workshop")),
+      h("div.section-head", {}, h("h2.section-title", { text: "Most liked charts" }), h("a.more", { href: "workshop?sort=liked" }, "Workshop")),
       liked);
     fetch(worker + "/api/items?type=charts&sort=liked", { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
       if (!liked.isConnected) return;
@@ -1101,7 +1126,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       liked.replaceChildren(...items.map((x, i) => {
         const pic = h("span.hm-cover");
         if (x.preview) { const img = h("img", { src: x.preview, alt: "", loading: "lazy" }); img.onerror = () => img.remove(); pic.append(img); }
-        return h("li", {}, h("a", { href: "#/workshop/" + x.id, "data-place": i + 1 },
+        return h("li", {}, h("a", { href: "workshop/" + x.id, "data-place": i + 1 },
           h("span.hm-rank", { text: "#" + (i + 1) }),
           pic,
           h("span.hm-who", {}, h("span.name", { text: x.title, title: x.title }),
@@ -1115,7 +1140,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
     const liveStrip = h("section.hm-sec.hm-live", { hidden: true });
     const dailyRow = h("section.hm-sec.hm-daily", {},
-      h("div.section-head", {}, h("h2.section-title", { text: "Today's daily charts" }), h("a.more", { href: "#/daily" }, "Scores and more")),
+      h("div.section-head", {}, h("h2.section-title", { text: "Today's daily charts" }), h("a.more", { href: "daily" }, "Scores and more")),
       h("div.hm-daily-row", {}, h("p.empty", { text: "Loading today's charts…" })));
     app.replaceChildren(hero, liveStrip, strip, workshop, dailyRow, h("section.hm-sec.hm-two", {}, board, about));
     paintLiveStrip();
@@ -1132,7 +1157,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("p.hm-kicker", { text: "Latest update" + (when ? ", " + when : "") }),
         h("h2", { text: "OCTIVE " + x.version }),
         h("p", { text: releaseSummary(x) }),
-        h("a", { href: "#/updates/" + x.version }, "Read the patch notes"));
+        h("a", { href: "updates/" + x.version }, "Read the patch notes"));
     });
     fetch(worker + "/api/items?sort=new", { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
       if (!shelf.isConnected) return;
@@ -1189,13 +1214,13 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     if (it.verified && it.type === "charts") pic.append(h("span.ws-verified", { text: "✓ VERIFIED", title: "Verified by OCTIVE: global leaderboards and full PR" }));
     if (it.type === "charts" && it.topStars > 0) pic.append(h("span.ws-stars", { text: "★ " + it.topStars.toFixed(2), style: `background:${starColor(it.topStars)}` }));
     if (it.customizable && (it.type === "skins" || it.type === "styles")) pic.append(h("span.ws-custom", { text: "CUSTOMIZABLE", title: "Its maker allows changes" }));
-    pic.addEventListener("click", () => { location.hash = "#/workshop/" + it.id; });
+    pic.addEventListener("click", () => go("workshop/" + it.id));
     pic.title = "Details";
     return h("article.ws-card", {},
       pic,
       h("div.ws-body", {},
         h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
-        h("h3", {}, h("a", { href: "#/workshop/" + it.id, text: it.title, title: it.title })),
+        h("h3", {}, h("a", { href: "workshop/" + it.id, text: it.title, title: it.title })),
         h("a.ws-by", { href: profileHref(it.creatorId || "") }, "by " + (it.creator || "someone")),
         it.type === "charts" ? h("p.ws-facts", {},
           it.topPR > 0 ? h("b", { text: `${fmt0.format(Math.round(it.topPR))} PR`, title: it.verified ? "The most PR its hardest difficulty gives" : "The most PR its hardest difficulty gives. Not verified yet, so a third of it counts toward totals and the global ranking." }) : null,
@@ -1219,7 +1244,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       window.removeEventListener("blur", away);
       if (left || document.hidden) return;
       const note = h("div.open-hint", {}, h("b", { text: "Didn't open?" }), " Open in OCTIVE needs OCTIVE 1.5 or newer installed on Windows or Android. ",
-        h("a", { href: "#/download" }, "Download OCTIVE"), h("button.btn.ghost.small", { type: "button", onclick: () => note.remove() }, "OK"));
+        h("a", { href: "downloads" }, "Download OCTIVE"), h("button.btn.ghost.small", { type: "button", onclick: () => note.remove() }, "OK"));
       document.querySelector(".open-hint")?.remove();
       document.body.append(note);
       setTimeout(() => note.remove(), 9000);
@@ -1228,9 +1253,9 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   /** #/open/workshop/<id>: a web address for "Open in OCTIVE" (Discord only links to web pages). */
   function openPage() {
-    const m = (location.hash || "").match(/^#\/open\/workshop\/([a-z0-9]{16,40})/);
+    const m = routeHash().match(/^#\/open\/workshop\/([a-z0-9]{16,40})/);
     document.title = "Open in OCTIVE";
-    if (!m) { location.hash = "#/workshop"; return; }
+    if (!m) { go("workshop"); return; }
     const link = `octive://workshop/${m[1]}`;
     app.replaceChildren(h("section.open-page", {},
       h("img", { src: "logo.svg", alt: "", width: 72, height: 72 }),
@@ -1239,15 +1264,15 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("div.open-actions", {},
         h("a.btn.primary", { href: link, onclick: () => openHint() }, "Open in OCTIVE"),
         h("a.btn", { href: `${worker}/api/download/${m[1]}?redirect=1` }, "Download the file"),
-        h("a.btn.ghost", { href: "#/download" }, "Get OCTIVE"))));
+        h("a.btn.ghost", { href: "downloads" }, "Get OCTIVE"))));
     setTimeout(() => { location.href = link; openHint(); }, 400);
   }
 
   function workshopPage() {
-    const one = (location.hash.match(/^#\/workshop\/([a-z0-9]{16,40})/) || [])[1];
+    const one = (routeHash().match(/^#\/workshop\/([a-z0-9]{16,40})/) || [])[1];
     if (one) { workshopItemPage(one); return; }
     // #/workshop?sort=liked (the home page's Most liked charts link)
-    const wantSort = new URLSearchParams((location.hash.split("?")[1] || "")).get("sort");
+    const wantSort = new URLSearchParams((routeHash().split("?")[1] || "")).get("sort");
     if (wantSort && /^(new|popular|liked|hardest|easiest|pr|title|oldest)$/.test(wantSort)) { wsSort = wantSort; wsType = "charts"; }
     document.title = "Workshop · OCTIVE";
     const tabs = h("div.ws-tabs");
@@ -1346,7 +1371,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function workshopItemPage(id) {
     document.title = "Workshop · OCTIVE";
     const box = h("div.ws-item", {}, h("p.empty", { text: "Loading…" }));
-    app.replaceChildren(h("div.ws-page", {}, h("a.back", { href: "#/workshop" }, "← Workshop"), box));
+    app.replaceChildren(h("div.ws-page", {}, h("a.back", { href: "workshop" }, "← Workshop"), box));
     fetch(`${worker}/api/items/${id}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
       if (!box.isConnected) return;
       const it = d && d.item;
@@ -1480,7 +1505,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       likeBtn.title = !signedInHere() ? "Sign in to like it" : s.liked ? "You like this. Press again to take it back." : "Like it (the uploader is told once)";
     };
     likeBtn.addEventListener("click", async () => {
-      if (!signedInHere()) { location.hash = "#/account"; return; }
+      if (!signedInHere()) { go("account"); return; }
       if (busy) return;
       busy = true;
       const was = { likes: s.likes, liked: s.liked };
@@ -1499,7 +1524,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     };
     const stars = (n) => h("span.rv-stars", { title: `${n} star${n === 1 ? "" : "s"}` }, "★".repeat(n), h("i", { text: "★".repeat(5 - n) }));
     function form() {
-      if (!signedInHere()) return h("p.rv-signin", {}, h("a", { href: "#/account" }, "Sign in"), " to like it and write a review.");
+      if (!signedInHere()) return h("p.rv-signin", {}, h("a", { href: "account" }, "Sign in"), " to like it and write a review.");
       let rating = s.mine?.rating || 0;
       const text = h("textarea.rv-text", { maxlength: 300, rows: 3, placeholder: s.mine ? "Change your review" : "A short review (up to 300 letters)" });
       text.value = s.mine?.text || "";
@@ -1668,7 +1693,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       el.hidden = !ids.length;
       if (!ids.length) el.replaceChildren();
       else {
-        const more = h("a.btn.small.live-more-btn", { href: "#/live", hidden: true }, "Watch more →");
+        const more = h("a.btn.small.live-more-btn", { href: "live", hidden: true }, "Watch more →");
         const row = h("div.live-row.one-row", {}, ...ids.map(liveCard));
         el.replaceChildren(h("div.section-head", {}, h("h2.section-title", {}, h("span.live-pulse"), `Live on Twitch now · ${ids.length}`), more), row);
         fitLiveRow();
@@ -1702,7 +1727,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function livePage() {
     document.title = "Live now · OCTIVE";
     app.replaceChildren(h("div.live-page", {},
-      h("a.back", { href: "#/" }, "← Home"),
+      h("a.back", { href: "./" }, "← Home"),
       h("section.page-head", {}, h("h1", {}, h("span.live-pulse"), " Live on Twitch"),
         h("p.sub", { text: "OCTIVE players streaming right now, most viewers first. Link your own Twitch in the game (Settings → Account → Twitch) to show up here while you're live." }),
         h("div.ph-chips", {}, h("span.ph-chip.live-count", { text: "…" }))),
@@ -1733,7 +1758,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       box.querySelector(".hm-daily-row").replaceChildren(...tiers.map((t) => {
         const col = TIER_COLOR[t.tier] || "#b69bff";
         const best = (t.top || [])[0];
-        return h("a.hd-card", { href: "#/daily", style: `--c:${col}` },
+        return h("a.hd-card", { href: "daily", style: `--c:${col}` },
           h("span.hd-pic", {}, t.preview ? h("img", { src: t.preview, alt: "", loading: "lazy", onerror: (e) => e.currentTarget.remove() }) : null, h("span.hd-tier", { text: t.name })),
           h("span.hd-body", {},
             h("b", { text: t.title, title: t.title }),
@@ -1783,7 +1808,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
               t.notes ? h("span", { text: `${fmt0.format(t.notes)} notes` }) : null,
               t.durationUs ? h("span", { text: fmtLength(t.durationUs) }) : null),
             h("div.dp-actions", {},
-              t.itemId ? h("a.btn.small", { href: "#/workshop/" + t.itemId }, "View chart") : null,
+              t.itemId ? h("a.btn.small", { href: "workshop/" + t.itemId }, "View chart") : null,
               t.itemId ? h("a.btn.small.primary", { href: `octive://workshop/${t.itemId}`, onclick: () => openHint() }, "Open in OCTIVE") : null),
             h("h3.dp-board-head", { text: `Today's scores · ${fmt0.format(t.players || 0)}` }),
             list));
@@ -2011,7 +2036,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   function signOut() {
     store.set("octive.token", null, true); store.set("octive.session", null); me = null;
-    updateAccountNav(); location.hash = "#/account"; account();
+    updateAccountNav(); go("account");
   }
 
   function updateAccountNav() {
@@ -2021,7 +2046,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const name = a.querySelector(".side-name"), av = a.querySelector(".side-av");
       if (name) name.replaceChildren(me ? me.name : "Sign in", me ? checkEl({ id: me.playerId, check: me.check }) : null);
       else a.textContent = me ? me.name : "Sign in";
-      a.setAttribute("href", me && me.hasCard && !me.banned ? profileHref(me.playerId) : "#/account");
+      a.setAttribute("href", me && me.hasCard && !me.banned ? profileHref(me.playerId) : "account");
       a.dataset.nav = me && me.hasCard && !me.banned ? "me" : "account";
       a.title = me ? "Your public profile" : "Sign in";
       if (av) {
@@ -2062,7 +2087,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         me = await callApi("me", undefined, true);
       } catch (e) { if (e.status === 401) { store.set("octive.token", null, true); store.set("octive.session", null); } }
       updateAccountNav();
-      if (!location.hash.startsWith("#/account")) return;
+      if (!routeHash().startsWith("#/account")) return;
     }
     if (!me) return signInPage();
     profilePage();
@@ -2092,7 +2117,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("p.sub", { text: "Use the same username and password as in the game." }),
       field("Username", user), field("Password", pass),
       out, btn,
-      h("div.auth-links", {}, h("a", { href: "#/reset" }, "Forgot your password?"), h("span", { text: "No account? Make one in the game: Profile → Sign up." })));
+      h("div.auth-links", {}, h("a", { href: "reset" }, "Forgot your password?"), h("span", { text: "No account? Make one in the game: Profile → Sign up." })));
     app.replaceChildren(h("div.auth-wrap", {}, form));
     setTimeout(() => user.focus(), 30);
   }
@@ -2484,7 +2509,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const tw = twitchPanel();
     const more = section("Messages and friends", "Read and send messages to your friends, see who follows you, and manage who you follow.",
       h("div.panel-actions", { style: "justify-content:flex-start;gap:10px;flex-wrap:wrap" },
-        h("a.btn.primary", { href: "#/messages" }, "Open messages"),
+        h("a.btn.primary", { href: "messages" }, "Open messages"),
         h("a.btn", { href: profileHref(me.playerId) }, "My public profile")));
     const game = section("In the game", "Discord status, appearing offline, who can watch you play and notifications are set in OCTIVE: Settings → Profile.");
     return h("div", {}, conn, tw, more, game);
@@ -2549,7 +2574,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function resetPage() {
     document.title = "Reset password · OCTIVE";
     // a reset link from Senterra or Octive: just the new password
-    const link = ((location.hash.split("?")[1] || "").match(/(?:^|&)link=([a-f0-9]{40})/) || [])[1];
+    const link = ((routeHash().split("?")[1] || "").match(/(?:^|&)link=([a-f0-9]{40})/) || [])[1];
     if (link) {
       const out = msg();
       const pass = h("input", { type: "password", autocomplete: "new-password", maxlength: 30 });
@@ -2557,7 +2582,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const go = h("button.btn.primary.wide", { type: "button", onclick: () => {
         if (pass.value !== again.value) return setMsg(out, "The passwords don't match.");
         busy(go, async () => {
-          try { const r = await callApi("reset/link", { token: link, newPassword: pass.value }); setMsg(out, r.message, true); setTimeout(() => { location.hash = "#/account"; }, 2200); }
+          try { const r = await callApi("reset/link", { token: link, newPassword: pass.value }); setMsg(out, r.message, true); setTimeout(() => { go("account"); }, 2200); }
           catch (e) { setMsg(out, e.message); }
         });
       } }, "Set new password");
@@ -2592,7 +2617,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         try {
           const r = await callApi("reset/finish", { username: user.value.trim(), code: code.value.trim(), newPassword: pass.value });
           setMsg(out, r.message, true); step2.hidden = true;
-          setTimeout(() => { location.hash = "#/account"; }, 2200);
+          setTimeout(() => { go("account"); }, 2200);
         } catch (e) { setMsg(out, e.message); }
       });
     } }, "Set new password");
@@ -2610,7 +2635,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("h1", { text: "Reset your password" }),
       h("p.sub", { text: "We email a code to the address linked to your account. No email linked? Sign in and add one in Account first." }),
       field("Username", user), send, viaDiscord, step2, out,
-      h("div.auth-links", {}, h("a", { href: "#/account" }, "← Back to sign in")));
+      h("div.auth-links", {}, h("a", { href: "account" }, "← Back to sign in")));
     app.replaceChildren(h("div.auth-wrap", {}, form));
     setTimeout(() => user.focus(), 30);
   }
@@ -2658,8 +2683,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   const wasSupporter = (p) => !!(p && p.supporter && !p.supporter.active && (p.supporter.days || 0) > 0);
 
   function hashQuery() {
-    const i = location.hash.indexOf("?");
-    return new URLSearchParams(i >= 0 ? location.hash.slice(i + 1) : "");
+    const r = routeHash(), i = r.indexOf("?");
+    return new URLSearchParams(i >= 0 ? r.slice(i + 1) : "");
   }
 
   /** A supporter's name in their colours (bio codes), or plain. */
@@ -2859,7 +2884,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       followBtn.title = isOwner ? "Every player follows the OCTIVE developer" : !me ? "Sign in to follow players" : youFollow ? "Click to unfollow" : "";
     };
     followBtn.addEventListener("click", async () => {
-      if (!me) { location.hash = "#/account"; return; }
+      if (!me) { go("account"); return; }
       const want = !youFollow;
       followBtn.disabled = true;
       try {
@@ -2869,10 +2894,10 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       followBtn.disabled = false; paint();
     });
     // the official account messages anyone, and anyone can message it (no friendship needed)
-    const msgBtn = h("a.btn.msg", { href: "#/messages/" + encodeURIComponent(p.id), hidden: true, title: "Send a message" }, "✉ Message");
+    const msgBtn = h("a.btn.msg", { href: "messages/" + encodeURIComponent(p.id), hidden: true, title: "Send a message" }, "✉ Message");
     msgBtn.hidden = !(me && me.playerId !== p.id && (me.playerId === OFFICIAL_ID || p.id === OFFICIAL_ID));
-    msgBtn.addEventListener("click", (e) => { if (!me) { e.preventDefault(); location.hash = "#/account"; } else dmNames[p.id] = p.name; });
-    const gift = h("a.btn.gift", { href: "#/supporter?gift=" + encodeURIComponent(p.id), hidden: !!(me && me.playerId === p.id) || !!(p.supporter && p.supporter.lifetime) }, "♥ Gift supporter");
+    msgBtn.addEventListener("click", (e) => { if (!me) { e.preventDefault(); go("account"); } else dmNames[p.id] = p.name; });
+    const gift = h("a.btn.gift", { href: "supporter?gift=" + encodeURIComponent(p.id), hidden: !!(me && me.playerId === p.id) || !!(p.supporter && p.supporter.lifetime) }, "♥ Gift supporter");
     const friends = h("b", { text: "…" });
     let row;
     // their links: the creator's socials now, their Discord and Twitch once the profile loads
@@ -2950,7 +2975,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
               try { await callApi("/follow", { playerId: x.id, follow: false }, true); row.remove(); } catch (err) { e.target.disabled = false; alert(err.message); }
             } }, "Unfollow"));
           if (mine && kind === "friends") {
-            actions.append(h("a.btn", { href: "#/messages/" + encodeURIComponent(x.id) }, "Message"));
+            actions.append(h("a.btn", { href: "messages/" + encodeURIComponent(x.id) }, "Message"));
             // the official OCTIVE account is everyone's friend: it can't be removed
             if (x.id !== OFFICIAL_ID) actions.append(h("button.btn", { type: "button", onclick: async (e) => {
               if (!confirm(`Remove ${x.name || "this player"} from your friends? Your game removes the friendship the next time it's open.`)) return;
@@ -3131,7 +3156,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
     const paintMe = () => {
       signHint.textContent = me ? `Signed in as ${me.name}.` : "";
-      if (!me) signHint.append(h("a", { href: "#/account" }, "Sign in"), " with your game account to buy.");
+      if (!me) signHint.append(h("a", { href: "account" }, "Sign in"), " with your game account to buy.");
       status.textContent = "";
       const s = me && me.supporter;
       // already lifetime: nothing to buy here
@@ -3176,7 +3201,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     if (!s.active) {
       return section("Supporter", s.days > 0 ? `You supported OCTIVE for ${monthsText(s.days)}. Thank you! Your badges stay; support again to get the perks back.` : "3× daily points, 10% off in the points shop, a coloured name, banner, profile effects, animated picture, a profile link of your own and more.",
         me.link ? h("p.field-hint", { text: `Your profile link stays yours: ${SITE_URL}u/${me.link}` }) : null,
-        h("div.panel-actions", {}, h("a.btn.primary", { href: "#/supporter" }, "Become a supporter")));
+        h("div.panel-actions", {}, h("a.btn.primary", { href: "supporter" }, "Become a supporter")));
     }
     const looks = me.looks || {};
     const out = msg();
@@ -3247,7 +3272,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           field("Profile link (yours to keep, even after your supporter time)", h("div.link-row", {}, h("span.link-pre", { text: "/u/" }), linkIn, linkSave), "3 to 20 letters, numbers, - and _. Nothing offensive, and not another player's name."), linkShow,
           h("span.field-label", { text: "Animated picture (GIF, up to 8 MB)" }), h("div.pic-row", {}, gifPrev, gifBtn, looks.gif ? gifDel : null, gifIn))),
       out,
-      h("div.panel-actions", {}, h("a.btn", { href: "#/supporter" }, "Add more time")));
+      h("div.panel-actions", {}, h("a.btn", { href: "supporter" }, "Add more time")));
   }
 
   /** Redraws the Account page's header card with the latest looks. */
@@ -3552,7 +3577,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         }
         return card;
       }));
-      const anchor = location.hash.match(/^#\/updates\/(.+)$/);
+      const anchor = routeHash().split("?")[0].match(/^#\/updates\/(.+)$/);
       if (anchor) document.getElementById("v" + anchor[1])?.scrollIntoView({ behavior: "smooth" });
     });
   }
@@ -3596,10 +3621,10 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       app.replaceChildren(h("div.dm-signin", {},
         h("h1", { text: "Messages" }),
         h("p.sub", { text: "Sign in with your OCTIVE account to read and send messages to your friends." }),
-        h("a.btn.primary", { href: "#/account" }, "Sign in")));
+        h("a.btn.primary", { href: "account" }, "Sign in")));
       return;
     }
-    const openId = (location.hash.match(/^#\/messages\/([A-Za-z0-9_-]{8,64})/) || [])[1] || null;
+    const openId = (routeHash().match(/^#\/messages\/([A-Za-z0-9_-]{8,64})/) || [])[1] || null;
     const list = h("div.dm-list");
     const pane = h("section.dm-pane");
     const root = h("div.dm-page" + (openId ? ".dm-open" : ""), {}, h("aside.dm-side", {}, h("h1", { text: "Messages" }), list), pane);
@@ -3613,7 +3638,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const rows = [];
       for (const t of box?.threads || []) {
         seen.add(t.with);
-        rows.push(h("a.dm-row" + (t.with === openId ? ".active" : "") + (t.unread ? ".unread" : ""), { href: "#/messages/" + encodeURIComponent(t.with) },
+        rows.push(h("a.dm-row" + (t.with === openId ? ".active" : "") + (t.unread ? ".unread" : ""), { href: "messages/" + encodeURIComponent(t.with) },
           dmAvatar(t.with, t.name),
           h("span.dm-row-main", {}, h("span.dm-row-name", { text: t.name || "Player" }), h("span.dm-row-last", { text: (t.fromMe ? "You: " : "") + (t.preview || "") })),
           h("span.dm-row-side", {}, h("span.dm-when", { text: t.last ? dmWhen(t.last) : "" }), t.unread ? h("span.dm-count", { text: String(t.unread) }) : null)));
@@ -3622,7 +3647,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (others.length) {
         rows.push(h("p.dm-cap", { text: "Friends" }));
         for (const f of others)
-          rows.push(h("a.dm-row" + (f.id === openId ? ".active" : ""), { href: "#/messages/" + encodeURIComponent(f.id) },
+          rows.push(h("a.dm-row" + (f.id === openId ? ".active" : ""), { href: "messages/" + encodeURIComponent(f.id) },
             dmAvatar(f.id, f.name), h("span.dm-row-main", {}, h("span.dm-row-name", { text: f.name || "Player" }), h("span.dm-row-last", { text: "Start a conversation" }))));
       }
       if (!rows.length)
@@ -3693,7 +3718,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
       input.addEventListener("input", () => { input.style.height = ""; input.style.height = Math.min(input.scrollHeight, 160) + "px"; });
       const head = h("div.dm-head", {},
-        h("a.dm-back", { href: "#/messages", "aria-label": "All messages" }, "←"),
+        h("a.dm-back", { href: "messages", "aria-label": "All messages" }, "←"),
         dmAvatar(openId, nameOf(openId)),
         h("a.dm-head-name", { href: profileHref(openId) }, nameOf(openId)));
       pane.replaceChildren(head, feed,
@@ -3721,13 +3746,13 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     return h("span.crew-tag" + (big ? ".big" : ""), { text: c.tag || "?", style: `color:${col};background:${col}22;border-color:${col}99` });
   }
   function crewsPage() {
-    const one = (location.hash.match(/^#\/crew\/([a-z0-9]{10,24})/) || [])[1];
+    const one = (routeHash().match(/^#\/crew\/([a-z0-9]{10,24})/) || [])[1];
     if (one) return crewPage(one);
     document.title = "Crews · OCTIVE";
     const podium = h("div.cw-podium");
     const list = h("div.crew-list", {}, h("p.empty", { text: "Loading the crew board…" }));
     app.replaceChildren(h("section.cw-board", {},
-      h("div.section-head", {}, h("h1.section-title", { text: "Crew board" }), h("a.more", { href: "#/rankings" }, "Players →")),
+      h("div.section-head", {}, h("h1.section-title", { text: "Crew board" }), h("a.more", { href: "rankings" }, "Players →")),
       h("p.panel-sub.crew-intro", { text: "Crews are teams of up to 12 players. A crew's score is its five best members' PR added up. Make or join one in the game: Profile → Crew." }),
       podium, list));
     fetch(`${worker}/play/crews`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
@@ -3738,14 +3763,14 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const members = (c) => `${c.members} member${c.members === 1 ? "" : "s"}`;
       // the top three on a podium (2nd, 1st, 3rd), like the game's crew board
       podium.replaceChildren(...[1, 0, 2].map((i) => crews[i]).filter(Boolean).map((c) =>
-        h("a.cw-pod", { href: "#/crew/" + encodeURIComponent(c.id), "data-place": c.rank, style: `--crew:${crewCol(c.color)}` },
+        h("a.cw-pod", { href: "crew/" + encodeURIComponent(c.id), "data-place": c.rank, style: `--crew:${crewCol(c.color)}` },
           h("span.cw-place", { text: ["", "1st", "2nd", "3rd"][c.rank] || "#" + c.rank }),
           crewTag(c, true),
           h("b.cw-pod-name", { text: c.name }),
           h("span.cw-pod-score", { text: fmt0.format(Math.round(c.score || 0)) + " PR" }),
           h("span.cw-pod-members", { text: members(c) }))));
       // everyone else, with a bar for their score next to the best crew's
-      list.replaceChildren(...crews.slice(3).map((c) => h("a.crew-row", { href: "#/crew/" + encodeURIComponent(c.id), style: `--crew:${crewCol(c.color)}` },
+      list.replaceChildren(...crews.slice(3).map((c) => h("a.crew-row", { href: "crew/" + encodeURIComponent(c.id), style: `--crew:${crewCol(c.color)}` },
         h("span.crew-rank", { text: "#" + c.rank }),
         crewTag(c),
         h("span.crew-name", { text: c.name }),
@@ -3757,7 +3782,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function crewPage(id) {
     document.title = "Crew · OCTIVE";
     const box = h("div", {}, h("p.empty", { text: "Loading the crew…" }));
-    app.replaceChildren(h("div.crew-page", {}, h("a.back", { href: "#/crews" }, "← Crew board"), box));
+    app.replaceChildren(h("div.crew-page", {}, h("a.back", { href: "crews" }, "← Crew board"), box));
     fetch(`${worker}/play/crews/of?id=${encodeURIComponent(id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
       if (!box.isConnected) return;
       const c = d && d.crew;
@@ -3812,15 +3837,17 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   }
   function tidyAddress() {
     const hash = location.hash;
-    if (/^#\/u\/./.test(hash)) history.replaceState(history.state, "", BASE_PATH + "u/" + hash.slice(4));
-    else if (location.pathname !== BASE_PATH && hash.length > 2 && hash.startsWith("#/")) history.replaceState(history.state, "", BASE_PATH + hash);
-    else if (location.pathname !== BASE_PATH && !profileKey() && location.pathname.startsWith(BASE_PATH)) history.replaceState(history.state, "", BASE_PATH + (hash || "#/"));
+    if (hash.startsWith("#/")) {
+      // an old #/ link: its page at its own address (a query before the #, like ?twitch=linked#/account, comes along)
+      let rest = routePath(hash);
+      if (!rest.includes("?") && location.search) rest += location.search;
+      history.replaceState(history.state, "", BASE_PATH + rest);
+    } else if (/^(index|404)(\.html)?$/.test(location.pathname.slice(BASE_PATH.length))) history.replaceState(history.state, "", BASE_PATH + location.search);
   }
 
   function page() {
     if (profileKey()) return "player";
-    const hash = location.hash || "#/";
-    const m = hash.match(/^#\/([a-z]+)/);
+    const m = routeHash().match(/^#\/([a-z]+)/);
     return m ? m[1] : "home";
   }
 
@@ -3851,7 +3878,9 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   }
 
   window.addEventListener("hashchange", () => { route(true); document.body.classList.remove("menu-open"); document.querySelector(".nav-more")?.classList.remove("open"); });
-  // (2.2.2) moving between a profile (u/…) and the other pages (#/…) without loading the site again
+  // (2.2.2) moving between the site's pages without loading the site again (links to its own files, like about.html
+  // or play/, load as usual)
+  const SITE_ROUTES = new Set(["", "u", "rankings", "ranked", "crews", "crew", "workshop", "daily", "downloads", "updates", "supporter", "help", "account", "reset", "messages", "live", "open"]);
   window.addEventListener("popstate", () => route(true));
   document.addEventListener("click", (e) => {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -3860,11 +3889,12 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const u = new URL(a.href, document.baseURI);
     if (u.origin !== location.origin || !u.pathname.startsWith(BASE_PATH)) return;
     const rest = u.pathname.slice(BASE_PATH.length);
-    const toProfile = /^u\/[^/]+$/.test(rest), toPage = rest === "" && (u.hash === "" || u.hash.startsWith("#/"));
-    if (!toProfile && !toPage) return;
-    if (toPage && location.pathname === BASE_PATH) return; // a # change: hashchange does it
+    let to;
+    if (u.hash.startsWith("#/")) to = BASE_PATH + routePath(u.hash);
+    else if (SITE_ROUTES.has(rest.split("/")[0]) && !/\.[a-z0-9]+$/i.test(rest)) to = u.pathname + u.search;
+    else return;
     e.preventDefault();
-    history.pushState(null, "", toProfile ? u.pathname : BASE_PATH + (u.hash || "#/"));
+    if (to === location.pathname + location.search) history.replaceState(history.state, "", to); else history.pushState(null, "", to);
     route(true);
     document.body.classList.remove("menu-open");
     document.querySelector(".nav-more")?.classList.remove("open");
