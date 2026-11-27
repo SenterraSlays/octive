@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- (2.2.2) the site's folder: profiles are at /octive/u/<player> (these pages and 404.html are this same file) -->
+  <base href="/octive/">
+  <script>
+    // OCTIVE's site only runs as itself: shown in a frame by another site, it goes to a page that links to the official site
+    (function () {
+      var framed = false;
+      try { framed = window.top !== window.self && window.top.location.hostname !== location.hostname; } catch (e) { framed = true; }
+      if (framed) location.replace("framed.html");
+    })();
+  </script>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RoughSketch - 666 · OCTIVE Workshop</title>
+  <meta name="description" content="A chart by Senterra on the OCTIVE Workshop · 4K. Free to download.">
+  <meta name="google-site-verification" content="yngV5t94MXj8bNjN3yjLn3hdydf7LavHSZnfnTIwQ0I" />
+  <link rel="canonical" href="https://senterraslays.github.io/octive/workshop/e49c864fe2d64d829163">
+  <meta name="theme-color" content="#1b1631">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="OCTIVE">
+  <meta property="og:title" content="RoughSketch - 666 · OCTIVE Workshop">
+  <meta property="og:description" content="A chart by Senterra on the OCTIVE Workshop · 4K. Free to download.">
+  <meta property="og:url" content="https://senterraslays.github.io/octive/workshop/e49c864fe2d64d829163">
+  <meta property="og:image" content="https://octive-rankings-api.lunalazum18.workers.dev/card/ws/e49c864fe2d64d829163.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="600">
+  <meta property="og:image:alt" content="RoughSketch - 666 · OCTIVE Workshop">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="RoughSketch - 666 · OCTIVE Workshop">
+  <meta name="twitter:description" content="A chart by Senterra on the OCTIVE Workshop · 4K. Free to download.">
+  <meta name="twitter:image" content="https://octive-rankings-api.lunalazum18.workers.dev/card/ws/e49c864fe2d64d829163.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=2.2-colour41">
+  <link rel="icon" href="logo.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="logo-512.png">
+</head>
+<body class="has-side">
+  <noscript>
+    <h1>OCTIVE: a free vertical scrolling rhythm game</h1>
+    <p>OCTIVE is a free rhythm game (VSRG) for Windows, Android and the browser. Play 4K, 7K and other key counts, import your osu!mania maps,
+    climb the global performance ranking and Ranked, take on daily charts and dans, and share charts, skins and packs in the Workshop.</p>
+    <p><a href="about.html">About OCTIVE</a> · <a href="osu-mania.html">osu!mania maps</a> · <a href="fnf.html">FNF charts</a> · <a href="download.html">Download</a> · <a href="play/">Play in your browser</a> · <a href="privacy.html">Privacy</a> · <a href="terms.html">Terms</a></p>
+  </noscript>
+  <!-- 1.5: the menu is a sidebar (a drawer on phones) -->
+  <header class="mtop">
+    <a class="brand" href="./"><img src="logo.svg" alt="" width="28" height="28"><span>OCTIVE</span></a>
+    <button class="menu-btn" type="button" aria-label="Menu"><span></span><span></span><span></span></button>
+  </header>
+  <aside class="side" aria-label="Menu">
+    <a class="brand" href="./"><img src="logo.svg" alt="" width="30" height="30"><span>OCTIVE</span></a>
+    <nav class="side-nav">
+      <a href="./" data-nav="home"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg><span>Home</span></a>
+      <a href="rankings" data-nav="rankings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0zM17 6h3v2a3 3 0 0 1-3 3M7 6H4v2a3 3 0 0 0 3 3"/></svg><span>Rankings</span></a>
+      <a href="ranked" data-nav="ranked"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.8l7.8 4.5v9.4L12 21.2l-7.8-4.5V7.3z"/><path d="M12 8.2l1.2 2.5 2.7.4-2 1.9.5 2.7-2.4-1.3-2.4 1.3.5-2.7-2-1.9 2.7-.4z"/></svg><span>Ranked</span></a>
+      <a href="crews" data-nav="crews"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 21V4"/><path d="M6 5h12l-2.5 4L18 13H6"/></svg><span>Crews</span></a>
+      <a href="workshop" data-nav="workshop"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>Workshop</span></a>
+      <a href="daily" data-nav="daily"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/><path d="M12 13l1 2 2.2.3-1.6 1.5.4 2.2-2-1-2 1 .4-2.2-1.6-1.5L11 15z"/></svg><span>Daily</span></a>
+      <a href="downloads" data-nav="download"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5M4 21h16"/></svg><span>Download</span></a>
+      <a href="play/"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M10 8.5l6 3.5-6 3.5z"/></svg><span>Play in browser</span></a>
+      <div class="side-group">Community</div>
+      <a href="messages" data-nav="messages" class="nav-msg" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v11H8l-4 4z"/></svg><span class="nav-msg-label">Messages</span></a>
+      <a href="updates" data-nav="updates"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v5l3 2"/><circle cx="12" cy="12" r="9"/></svg><span>Updates</span></a>
+      <a href="supporter" data-nav="supporter" class="nav-support"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20s-7-4.4-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.6-7 10-7 10z"/></svg><span>Supporter</span></a>
+      <div class="side-group">Info</div>
+      <a href="about.html"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5h.01"/></svg><span>About OCTIVE</span></a>
+      <a href="help" data-nav="help"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 0 1 4.9.7c0 1.7-2.4 2.1-2.4 3.8M12 17h.01"/></svg><span>Help</span></a>
+      <a href="privacy.html"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5M10 13h6M10 17h6"/></svg><span>Privacy</span></a>
+      <a href="terms.html"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5M10 13h6M10 17h6"/></svg><span>Terms</span></a>
+    </nav>
+    <div class="side-me">
+      <a href="account" data-nav="account" class="nav-account"><span class="side-av"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></span><span class="side-name">Sign in</span></a>
+      <a href="account" class="nav-settings" data-nav="settings" title="Account settings" aria-label="Account settings" hidden><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></a>
+    </div>
+    <span class="updated" id="updated"></span>
+  </aside>
+  <div class="side-scrim"></div>
+
+  <main id="app" aria-live="polite"></main>
+
+  <footer class="foot">
+    <span>OCTIVE · a free vertical scrolling rhythm game</span>
+    <span><a href="help">Help</a> · <a href="privacy.html">Privacy</a> · <a href="terms.html">Terms</a></span>
+  </footer>
+
+  <template id="tpl-rankings">
+    <section class="hero">
+      <div>
+        <h1>Performance Ranking</h1>
+        <p class="sub">Every player with an OCTIVE account, ranked by total performance rating (PR).</p>
+      </div>
+      <div class="hero-side">
+        <div class="stat"><span class="stat-label">Players</span><span class="stat-value" data-count>0</span></div>
+        <div class="stat"><span class="stat-label">Online</span><span class="stat-value online-count" data-online>0</span></div>
+        <label class="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>
+          <input type="search" placeholder="Find a player" data-search autocomplete="off">
+        </label>
+      </div>
+    </section>
+    <div class="notice" data-sample hidden>Showing sample data: the live ranking appears after the first update runs.</div>
+    <div class="table" role="table" aria-label="Global performance ranking">
+      <div class="thead" role="row">
+        <span role="columnheader">Rank</span>
+        <span role="columnheader">Player</span>
+        <span role="columnheader" class="num">Accuracy</span>
+        <span role="columnheader" class="num hide-sm">Level</span>
+        <span role="columnheader" class="num hide-sm">Plays</span>
+        <span role="columnheader" class="num">Performance</span>
+      </div>
+      <div data-rows></div>
+    </div>
+    <p class="empty" data-empty hidden>Nobody is on the global ranking yet. Make an account in the game's Profile screen and finish a chart.</p>
+  </template>
+
+  <template id="tpl-row">
+    <a class="row" role="row">
+      <span class="rank" role="cell"></span>
+      <span class="player" role="cell">
+        <span class="avatar"><img alt="" loading="lazy" hidden><span class="initial"></span><span class="dot" hidden></span></span>
+        <span class="name"></span>
+        <span class="badge" hidden></span>
+      </span>
+      <span class="num acc" role="cell"></span>
+      <span class="num lvl hide-sm" role="cell"></span>
+      <span class="num plays hide-sm" role="cell"></span>
+      <span class="num pp" role="cell"></span>
+    </a>
+  </template>
+
+  <script src="app.js?v=2.2-colour41"></script>
+</body>
+</html>
