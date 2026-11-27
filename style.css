@@ -2258,3 +2258,21 @@ main .crew-hero.cw-hero h1 { background: linear-gradient(90deg, #fff 35%, color-
 /* ---- 2.2.2: the graph's box fits its tabs and chart (it was 72px with ~100px inside, so the line ran over the numbers under it) */
 .pf-graph { height: auto; min-height: 72px; }
 .pf-graphs .pf-chart { height: 72px; }
+
+/* ---- 2.2.2: pencils on your own picture and banner (shown on hover), the share button, the supporter link field */
+.pf-cover { position: relative; }
+.pf-edit { position: absolute; top: 8px; right: 8px; z-index: 3; width: 32px; height: 32px; padding: 0; display: grid; place-items: center; border-radius: 50%; border: 1px solid #ffffff40; background: #0d0b16cc; color: #fff; cursor: pointer; opacity: 0; transform: scale(.85); transition: opacity .15s, transform .15s, background .15s; box-shadow: 0 4px 14px #0007; }
+.pf-edit svg { width: 16px; height: 16px; }
+.pf-cover .pf-edit { top: 12px; right: 14px; }
+.pf-cover:hover > .pf-edit, .card-avatar:hover > .pf-edit, .pf-edit:focus-visible, .pf-edit.busy { opacity: 1; transform: none; }
+.pf-edit:hover { background: var(--pink); border-color: transparent; }
+.pf-edit.busy { cursor: progress; animation: pf-edit-pulse 1s ease-in-out infinite; }
+@keyframes pf-edit-pulse { 50% { opacity: .5; } }
+@media (hover: none) { .pf-edit { opacity: .9; transform: none; } }
+.pf-side-low { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.pf-share { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: 999px; border: 1px solid #ffffff26; background: #ffffff0d; color: var(--text); font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; transition: background .15s, border-color .15s; }
+.pf-share::before { content: ""; width: 14px; height: 14px; background: currentColor; -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E") center / contain no-repeat; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M10 14a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1M14 10a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E") center / contain no-repeat; }
+.pf-share:hover { background: #ff4d9d26; border-color: var(--pink); }
+.link-row { display: flex; align-items: center; gap: 8px; }
+.link-row input { flex: 1; min-width: 0; }
+.link-pre { color: var(--dim); font-weight: 700; }

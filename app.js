@@ -66,6 +66,12 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   const xpFor = (lv) => lv <= 1 ? 0 : Math.round(100000 * (Math.pow(1.07, lv - 1) - 1) / 0.07);
 
   const worker = WORKER_URL.replace(/\/+$/, "");
+  const SITE_URL = "https://senterraslays.github.io/octive/";
+  // (2.2.2) supporters' own profile links (#/u/Senterra): link (lower case) → player id ("" when nobody has it)
+  const linkIds = {};
+  /** The link to share for a profile: it shows their card in Discord and others, and opens the profile here. */
+  const shareLink = (key) => `${worker}/u/${encodeURIComponent(key)}`;
+  const PENCIL_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M13.5 6.5l4 4" stroke="currentColor" stroke-width="2"/></svg>';
 
 
   async function load() {
@@ -696,7 +702,16 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   }
 
   function player(id) {
-    const p = findPlayer(id);
+    const p = findPlayer(id) || (linkIds[String(id).toLowerCase()] ? findPlayer(linkIds[String(id).toLowerCase()]) : null);
+    // (2.2.2) a supporter's own link (#/u/Senterra): asked who it is once, then their profile shows at that address
+    if (!p && worker && id && String(id).length <= 20 && !(String(id).toLowerCase() in linkIds)) {
+      app.replaceChildren(h("p.empty", { text: "Loading…" }));
+      fetch(`${worker}/links/${encodeURIComponent(id)}`).then((r) => (r.ok ? r.json() : null)).catch(() => null).then((d) => {
+        linkIds[String(id).toLowerCase()] = (d && d.id) || "";
+        if (decodeURIComponent(location.hash.slice(4)) === id) player(id);
+      });
+      return;
+    }
     if (!p) {
       app.innerHTML = '<a class="back" href="#/rankings">← All players</a><p class="empty">That player isn\'t in the ranking (yet).</p>';
       setTimeout(giftPopup, 400);
@@ -724,6 +739,44 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const tick = setInterval(() => { if (!status.isConnected) { clearInterval(tick); return; } status.textContent = "● " + statusText(p); }, 1000);
     }
     decorateCard(card, p);
+    // (2.2.2) your own profile: a pencil on the picture (and on the banner, a supporter perk) to change it, shown when
+    // the pointer is over it
+    if (me && me.playerId === p.id && !me.banned && !official) {
+      const pencil = (title, onPick) => {
+        const b = h("button.pf-edit", { type: "button", title, "aria-label": title });
+        b.innerHTML = PENCIL_SVG;
+        b.addEventListener("click", async (e) => {
+          e.preventDefault(); e.stopPropagation();
+          if (b.classList.contains("busy")) return;
+          const out = msg();
+          b.classList.add("busy");
+          try { await onPick(out); } finally { b.classList.remove("busy"); }
+          if (out.textContent) toast(out.textContent);
+        });
+        return b;
+      };
+      if (!me.avatarLocked) avatar.append(pencil("Change your picture", async (out) => {
+        const full = await newPicture(out);
+        if (!full) return;
+        const img = avatar.querySelector("img"); img.src = "data:image/jpeg;base64," + full; img.hidden = false;
+        avatar.querySelector(".initial").hidden = true;
+      }));
+      if (me.supporter && me.supporter.active) card.querySelector(".pf-cover").append(pencil("Change your banner", async (out) => {
+        const b64 = await newBanner(out);
+        if (!b64) return;
+        card.style.setProperty("--banner", `url("data:image/jpeg;base64,${b64}")`);
+        card.classList.add("has-banner");
+      }));
+    }
+    // (2.2.2) the link to share: it shows their card (rank, PR, accuracy) where it's pasted, like Discord
+    const shareBtn = h("button.pf-share", { type: "button", title: "Copy a link to this profile. Pasted in Discord (and other apps) it shows a card with their stats." }, h("span", { text: "Share profile" }));
+    shareBtn.addEventListener("click", async () => {
+      let key = p.id;
+      try { const d = await fetch(`${worker}/links/of/${encodeURIComponent(p.id)}`).then((r) => (r.ok ? r.json() : null)); if (d && d.link) key = d.link; } catch { /* their id */ }
+      const url = shareLink(key);
+      try { await navigator.clipboard.writeText(url); toast("Link copied. Paste it in Discord to show their card."); }
+      catch { prompt("Copy this link:", url); }
+    });
     // (2.0.2) their crew, a link to its page
     loadCosmetics().then((cs) => {
       const cr = cs && cs.players && cs.players[p.id] && cs.players[p.id].crew;
@@ -777,7 +830,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     // their linked Discord sits at the bottom right of the head
     // and a live-on-Twitch box at the top right, above it
     const dcSlot = h("div.pf-discord");
-    card.querySelector(".pf-id").append(h("div.pf-side", {}, h("div.pf-liveslot"), dcSlot));
+    card.querySelector(".pf-id").append(h("div.pf-side", {}, h("div.pf-liveslot"), h("div.pf-side-low", {}, worker && !official ? shareBtn : null, dcSlot)));
     const social = socialRow(p, (s) => markLive(card, avatar, s.twitch), dcSlot);
     const bar = h("section.pf-bar", {}, social, level);
 
@@ -2203,39 +2256,77 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     });
   }
 
+  // (2.2.2) choosing a new picture or banner, from the Account page or the pencils on your own profile
+  /** A file from the system's picker (null when it's closed without one). */
+  function pickFile(accept) {
+    return new Promise((resolve) => {
+      const input = h("input", { type: "file", accept, hidden: true });
+      const done = (f) => { input.remove(); resolve(f); };
+      input.addEventListener("change", () => done((input.files && input.files[0]) || null));
+      input.addEventListener("cancel", () => done(null));
+      document.body.append(input);
+      input.click();
+    });
+  }
+  const runBusy = (btn, fn) => (btn ? busy(btn, fn) : fn());
+  /** A new profile picture: picked, cropped round, saved. Its JPEG (base64), or null. */
+  async function newPicture(out, btn) {
+    const file = await pickFile("image/png,image/jpeg,image/webp,image/gif");
+    if (!file) return null;
+    if (file.size > 15 * 1048576) { setMsg(out, "That picture is too big (15 MB at most)."); return null; }
+    let bmp;
+    try { bmp = await createImageBitmap(file); } catch { setMsg(out, "That picture couldn't be read."); return null; }
+    const crop = await cropPicture(bmp, { title: "Crop your picture", aspect: 1, round: true });
+    if (!crop) return null;
+    let saved = null;
+    await runBusy(btn, async () => {
+      try {
+        const square = (size, q) => {
+          const cv = document.createElement("canvas"); cv.width = cv.height = size;
+          const c2 = cv.getContext("2d"); c2.imageSmoothingQuality = "high";
+          c2.drawImage(bmp, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, size, size);
+          return cv.toDataURL("image/jpeg", q).split(",")[1];
+        };
+        const full = square(256, 0.9), small = square(128, 0.85);
+        if (await saveProfile({ avatar: full, avatarSmall: small }, out, "Picture saved.")) saved = full;
+      } catch { setMsg(out, "That picture couldn't be read."); }
+    });
+    return saved;
+  }
+  /** A new supporter banner: picked, cropped 3:1, saved. Its JPEG (base64), or null. */
+  async function newBanner(out, btn) {
+    const file = await pickFile("image/png,image/jpeg,image/webp");
+    if (!file) return null;
+    let bmp;
+    try { bmp = await createImageBitmap(file); } catch { setMsg(out, "That picture couldn't be read."); return null; }
+    const crop = await cropPicture(bmp, { title: "Crop your banner", aspect: 3, round: false });
+    if (!crop) return null;
+    let saved = null;
+    await runBusy(btn, async () => {
+      try {
+        const W = 1200, H = 400, cv = document.createElement("canvas"); cv.width = W; cv.height = H;
+        const c2 = cv.getContext("2d"); c2.imageSmoothingQuality = "high";
+        c2.drawImage(bmp, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, W, H);
+        const b64 = cv.toDataURL("image/jpeg", 0.85).split(",")[1];
+        if (await saveLooks({ banner: b64 }, out, "Banner saved.")) saved = b64;
+      } catch { setMsg(out, "That picture couldn't be read."); }
+    });
+    return saved;
+  }
+
   function picturePanel() {
     const out = msg();
-    const input = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", hidden: true });
     const preview = h("div.pic-preview", {}, h("img", { alt: "", hidden: true }), h("span.initial", { text: me.name.charAt(0).toUpperCase() }));
     if (me.avatarHash) { const img = preview.querySelector("img"); img.src = `${worker}/avatar/${encodeURIComponent(me.playerId)}?v=${encodeURIComponent(me.avatarHash)}`; img.hidden = false; preview.querySelector(".initial").hidden = true; }
-    const btn = h("button.btn", { type: "button", onclick: () => input.click(), disabled: me.avatarLocked }, "Choose a picture…");
-    input.addEventListener("change", async () => {
-      const file = input.files && input.files[0];
-      input.value = "";
-      if (!file) return;
-      if (file.size > 15 * 1048576) return setMsg(out, "That picture is too big (15 MB at most).");
-      let bmp, crop;
-      try { bmp = await createImageBitmap(file); } catch { return setMsg(out, "That picture couldn't be read."); }
-      crop = await cropPicture(bmp, { title: "Crop your picture", aspect: 1, round: true });
-      if (!crop) return;
-      await busy(btn, async () => {
-        try {
-          const square = (size, q) => {
-            const cv = document.createElement("canvas"); cv.width = cv.height = size;
-            const c2 = cv.getContext("2d"); c2.imageSmoothingQuality = "high";
-            c2.drawImage(bmp, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, size, size);
-            return cv.toDataURL("image/jpeg", q).split(",")[1];
-          };
-          const full = square(256, 0.9), small = square(128, 0.85);
-          if (await saveProfile({ avatar: full, avatarSmall: small }, out, "Picture saved.")) {
-            const img = preview.querySelector("img"); img.src = "data:image/jpeg;base64," + full; img.hidden = false; preview.querySelector(".initial").hidden = true;
-            const big = document.querySelector(".me-card .card-avatar img"); if (big) { big.src = img.src; big.hidden = false; big.nextElementSibling.hidden = true; }
-          }
-        } catch (e) { setMsg(out, "That picture couldn't be read."); }
-      });
+    const btn = h("button.btn", { type: "button", disabled: me.avatarLocked }, "Choose a picture…");
+    btn.addEventListener("click", async () => {
+      const full = await newPicture(out, btn);
+      if (!full) return;
+      const img = preview.querySelector("img"); img.src = "data:image/jpeg;base64," + full; img.hidden = false; preview.querySelector(".initial").hidden = true;
+      const big = document.querySelector(".me-card .card-avatar img"); if (big) { big.src = img.src; big.hidden = false; big.nextElementSibling.hidden = true; }
     });
     return section("Picture", me.avatarLocked ? "A developer set your picture, so it can't be changed." : "Choose a picture, then move and zoom it to pick what shows.",
-      h("div.pic-row", {}, preview, btn, input), out);
+      h("div.pic-row", {}, preview, btn), out);
   }
 
   function bioPanel() {
@@ -3079,7 +3170,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   function supporterPanel() {
     const s = me.supporter || {};
     if (!s.active) {
-      return section("Supporter", s.days > 0 ? `You supported OCTIVE for ${monthsText(s.days)}. Thank you! Your badges stay; support again to get the perks back.` : "3× daily points, 10% off in the points shop, a coloured name, banner, profile effects, animated picture and more.",
+      return section("Supporter", s.days > 0 ? `You supported OCTIVE for ${monthsText(s.days)}. Thank you! Your badges stay; support again to get the perks back.` : "3× daily points, 10% off in the points shop, a coloured name, banner, profile effects, animated picture, a profile link of your own and more.",
+        me.link ? h("p.field-hint", { text: `Your profile link stays yours: ${SITE_URL}#/u/${me.link}` }) : null,
         h("div.panel-actions", {}, h("a.btn.primary", { href: "#/supporter" }, "Become a supporter")));
     }
     const looks = me.looks || {};
@@ -3097,28 +3189,21 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const effPrev = h("div.effect-preview", {}, effectLayer(effSel.value), h("span", { text: "Preview" }));
     effSel.addEventListener("change", () => { effPrev.firstChild.replaceWith(effectLayer(effSel.value)); busy(saveName, () => saveLooks({ effect: effSel.value }, out, "Effect saved.")); });
     // banner
-    const bannerIn = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", hidden: true });
     const bannerPrev = h("div.banner-preview");
     if (looks.banner) bannerPrev.style.backgroundImage = `url("${worker}/looks/banner/${encodeURIComponent(me.playerId)}?v=${looks.banner}")`;
-    const bannerBtn = h("button.btn", { type: "button", onclick: () => bannerIn.click() }, "Choose banner…");
+    const bannerBtn = h("button.btn", { type: "button" }, "Choose banner…");
+    bannerBtn.addEventListener("click", async () => { const b64 = await newBanner(out, bannerBtn); if (b64) bannerPrev.style.backgroundImage = `url("data:image/jpeg;base64,${b64}")`; });
     const bannerDel = h("button.btn.ghost", { type: "button", onclick: () => busy(bannerDel, async () => { if (await saveLooks({ banner: "" }, out, "Banner removed.")) bannerPrev.style.backgroundImage = ""; }) }, "Remove");
-    bannerIn.addEventListener("change", async () => {
-      const file = bannerIn.files && bannerIn.files[0]; bannerIn.value = "";
-      if (!file) return;
-      let bmp, crop;
-      try { bmp = await createImageBitmap(file); } catch { return setMsg(out, "That picture couldn't be read."); }
-      crop = await cropPicture(bmp, { title: "Crop your banner", aspect: 3, round: false });
-      if (!crop) return;
-      await busy(bannerBtn, async () => {
-        try {
-          const W = 1200, H = 400, cv = document.createElement("canvas"); cv.width = W; cv.height = H;
-          const c2 = cv.getContext("2d"); c2.imageSmoothingQuality = "high";
-          c2.drawImage(bmp, crop.sx, crop.sy, crop.sw, crop.sh, 0, 0, W, H);
-          const b64 = cv.toDataURL("image/jpeg", 0.85).split(",")[1];
-          if (await saveLooks({ banner: b64 }, out, "Banner saved.")) bannerPrev.style.backgroundImage = `url("data:image/jpeg;base64,${b64}")`;
-        } catch { setMsg(out, "That picture couldn't be read."); }
-      });
-    });
+    // (2.2.2) their own profile link: /u/<link> on the website, and a link that shows their card where it's shared
+    const linkIn = h("input", { type: "text", maxlength: 20, spellcheck: "false", autocomplete: "off", placeholder: me.name.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 20) || "YourName" });
+    linkIn.value = me.link || "";
+    const linkShow = h("p.field-hint");
+    const paintLink = () => { linkShow.textContent = me.link ? `${SITE_URL}#/u/${me.link}` : "No link of your own yet: your profile's address has your player id."; };
+    paintLink();
+    const linkSave = h("button.btn", { type: "button", onclick: () => busy(linkSave, async () => {
+      try { const r = await callApi("/support/link", { link: linkIn.value.trim() }, true); me.link = r.link; linkIn.value = r.link || ""; paintLink(); setMsg(out, r.link ? "Profile link saved." : "Profile link removed.", true); }
+      catch (e) { setMsg(out, e.message); }
+    }) }, "Save link");
     // GIF picture
     const gifIn = h("input", { type: "file", accept: "image/gif", hidden: true });
     const gifPrev = h("div.pic-preview", {}, h("img", { alt: "", hidden: !looks.gif, src: looks.gif ? `${worker}/looks/gif/${encodeURIComponent(me.playerId)}?v=${looks.gif}` : undefined }));
@@ -3154,7 +3239,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           h("div.name-row", {}, h("div.name-preview-box", {}, namePrev), saveName),
           field("Profile effect", effSel), effPrev),
         h("div.sup-col", {},
-          h("span.field-label", { text: "Banner" }), bannerPrev, h("div.panel-actions.left", {}, bannerBtn, looks.banner ? bannerDel : null, bannerIn),
+          h("span.field-label", { text: "Banner" }), bannerPrev, h("div.panel-actions.left", {}, bannerBtn, looks.banner ? bannerDel : null),
+          field("Profile link (yours to keep, even after your supporter time)", h("div.link-row", {}, h("span.link-pre", { text: "/u/" }), linkIn, linkSave), "3 to 20 letters, numbers, - and _. Nothing offensive, and not another player's name."), linkShow,
           h("span.field-label", { text: "Animated picture (GIF, up to 8 MB)" }), h("div.pic-row", {}, gifPrev, gifBtn, looks.gif ? gifDel : null, gifIn))),
       out,
       h("div.panel-actions", {}, h("a.btn", { href: "#/supporter" }, "Add more time")));
