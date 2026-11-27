@@ -1,4 +1,4 @@
-// OCTIVE website: home (#/), global ranking (#/rankings), player profiles (#/u/<playerId>), downloads
+// OCTIVE website: home (#/), global ranking (#/rankings), player profiles (u/<playerId or link>, no # since 2.2.2), downloads
 // (#/download), sign-in and profile editing (#/account) and password resets (#/reset). Reads the ranking
 // and releases from the Worker. No build step, no dependencies.
 (() => {
@@ -67,10 +67,14 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   const worker = WORKER_URL.replace(/\/+$/, "");
   const SITE_URL = "https://senterraslays.github.io/octive/";
-  // (2.2.2) supporters' own profile links (#/u/Senterra): link (lower case) → player id ("" when nobody has it)
+  // the site's folder (index.html has <base href="/octive/">): profiles are at BASE_PATH + "u/<key>"
+  const BASE_PATH = new URL(document.baseURI).pathname.replace(/[^/]*$/, "");
+  /** A profile's address (relative to the site's folder): u/<player id or link>. */
+  const profileHref = (key) => "u/" + encodeURIComponent(key || "");
+  // (2.2.2) supporters' own profile links (u/Senterra): link (lower case) → player id ("" when nobody has it)
   const linkIds = {};
   /** The link to share for a profile: it shows their card in Discord and others, and opens the profile here. */
-  const shareLink = (key) => `${worker}/u/${encodeURIComponent(key)}`;
+  const shareLink = (key) => SITE_URL + profileHref(key);
   const PENCIL_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4L19 9l-4-4L4 16v4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M13.5 6.5l4 4" stroke="currentColor" stroke-width="2"/></svg>';
 
 
@@ -270,7 +274,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   /** One of the top three on a podium: big picture in a medal ring, name and badges, the main number and a line under it. */
   function lbPod(p, place, value, sub, extra, color) {
-    const a = h("a.lb-pod", { href: "#/u/" + encodeURIComponent(p.id), "data-place": place, style: color ? `--pc:${color}` : null },
+    const a = h("a.lb-pod", { href: profileHref(p.id), "data-place": place, style: color ? `--pc:${color}` : null },
       h("span.lb-place", { text: ["", "1st", "2nd", "3rd"][place] || "#" + place }),
       h("span.avatar", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial"), h("span.dot", { hidden: true })),
       h("span.lb-pod-name", {}, h("span.name"), h("span.badge", { hidden: true })),
@@ -309,7 +313,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     if (worker) fetch(worker + "/play/gainers?limit=10", { cache: "no-cache" }).then((r) => r.json()).then((g) => {
       const list = (g && g.players) || [];
       if (!list.length) { gainList.replaceChildren(h("p.gain-empty", { text: "Nobody has gained PR this week yet." })); return; }
-      gainList.replaceChildren(...list.map((p) => h("a.gain-row", { href: "#/u/" + encodeURIComponent(p.playerId) },
+      gainList.replaceChildren(...list.map((p) => h("a.gain-row", { href: profileHref(p.playerId) },
         h("span.gain-rank", { text: "#" + p.rank }), h("span.gain-name", { text: p.name || "Player" }),
         h("b.gain-amt", { text: "+" + fmt0.format(p.gain || 0) + " PR" }), h("small.gain-total", { text: fmt0.format(p.pp || 0) + " PR" }))));
     }).catch(() => gainList.replaceChildren(h("p.gain-empty", { text: "Couldn't load this week's gainers." })));
@@ -328,7 +332,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (!list.length && q) empty.textContent = `Nobody called "${filter.trim()}" is ranked.`;
       for (const p of list) {
         const r = clone("tpl-row").firstElementChild;
-        r.href = "#/u/" + encodeURIComponent(p.id);
+        r.href = profileHref(p.id);
         r.dataset.place = String(p.rank);
         r.querySelector(".rank").textContent = isOfficial(p) ? INF : "#" + fmt0.format(p.rank);
         nameInto(r.querySelector(".name"), p);
@@ -506,7 +510,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const known = byId.get(x.id);
       const p = known || { id: x.id, name: x.name };
       const r = clone("tpl-row").firstElementChild;
-      r.href = "#/u/" + encodeURIComponent(x.id);
+      r.href = profileHref(x.id);
       r.dataset.place = String(x.place);
       r.querySelector(".rank").textContent = "#" + fmt0.format(x.place);
       nameInto(r.querySelector(".name"), p);
@@ -703,12 +707,12 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   function player(id) {
     const p = findPlayer(id) || (linkIds[String(id).toLowerCase()] ? findPlayer(linkIds[String(id).toLowerCase()]) : null);
-    // (2.2.2) a supporter's own link (#/u/Senterra): asked who it is once, then their profile shows at that address
+    // (2.2.2) a supporter's own link (u/Senterra): asked who it is once, then their profile shows at that address
     if (!p && worker && id && String(id).length <= 20 && !(String(id).toLowerCase() in linkIds)) {
       app.replaceChildren(h("p.empty", { text: "Loading…" }));
       fetch(`${worker}/links/${encodeURIComponent(id)}`).then((r) => (r.ok ? r.json() : null)).catch(() => null).then((d) => {
         linkIds[String(id).toLowerCase()] = (d && d.id) || "";
-        if (decodeURIComponent(location.hash.slice(4)) === id) player(id);
+        if (profileKey() === id) player(id);
       });
       return;
     }
@@ -1192,7 +1196,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("div.ws-body", {},
         h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
         h("h3", {}, h("a", { href: "#/workshop/" + it.id, text: it.title, title: it.title })),
-        h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
+        h("a.ws-by", { href: profileHref(it.creatorId || "") }, "by " + (it.creator || "someone")),
         it.type === "charts" ? h("p.ws-facts", {},
           it.topPR > 0 ? h("b", { text: `${fmt0.format(Math.round(it.topPR))} PR`, title: it.verified ? "The most PR its hardest difficulty gives" : "The most PR its hardest difficulty gives. Not verified yet, so a third of it counts toward totals and the global ranking." }) : null,
           (it.keys || []).length ? h("span", { text: (it.topPR > 0 ? " · " : "") + it.keys.map((k) => k + "K").join(" ") }) : null) : null,
@@ -1385,7 +1389,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("div.wsi-head", {},
           h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
           h("h1", { text: it.title }),
-          h("a.ws-by", { href: "#/u/" + encodeURIComponent(it.creatorId || "") }, "by " + (it.creator || "someone")),
+          h("a.ws-by", { href: profileHref(it.creatorId || "") }, "by " + (it.creator || "someone")),
           stats, tags,
           h("div.wsi-actions", {},
             h("a.btn.primary", { href: `octive://workshop/${it.id}`, onclick: () => openHint() }, "Open in OCTIVE"),
@@ -1534,7 +1538,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const long = (r.text || "").length > 220;
       const body = h("p.rv-body" + (long ? ".clamp" : ""), { text: r.text || "" });
       const head = h("div.rv-head", {},
-        h("a.rv-name", { href: "#/u/" + encodeURIComponent(r.by || ""), text: r.name || "Player" }),
+        h("a.rv-name", { href: profileHref(r.by || ""), text: r.name || "Player" }),
         r.rating ? stars(r.rating) : null,
         h("span.rv-when", { text: date(r.at) + (r.edited ? " · edited" : "") }),
         h("span.rv-grow"),
@@ -1621,7 +1625,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     if (!entries.length) { panel.replaceChildren(h("p.empty", { text: "No scores yet: be the first to set one in the game." })); return; }
     let shown = 10;
     const paint = () => {
-      const rows = entries.slice(0, shown).map((e) => h("a.wb-row", { href: "#/u/" + encodeURIComponent(e.playerId), "data-place": e.rank },
+      const rows = entries.slice(0, shown).map((e) => h("a.wb-row", { href: profileHref(e.playerId), "data-place": e.rank },
         h("span.wb-rank", { text: "#" + e.rank }),
         smallAvatar(e.playerId, e.name, e.avatarHash),
         h("span.wb-name", {}, h("b", { text: e.name || "Player" }), e.mods ? h("span.wb-mods", { text: e.mods }) : null),
@@ -1652,7 +1656,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const mins = lv.startedAt ? Math.max(0, Math.round((Date.now() - Date.parse(lv.startedAt)) / 60000)) : null;
     const since = mins == null ? "" : mins < 60 ? `${mins} min` : `${Math.floor(mins / 60)} h ${mins % 60} min`;
     return h("article.live-card", {},
-      h("a.live-who", { href: "#/u/" + encodeURIComponent(id) }, av, h("span", {}, h("b", { text: name }), h("small", { text: [`${fmt0.format(lv.viewers || 0)} watching`, since && `live for ${since}`].filter(Boolean).join(" · ") }))),
+      h("a.live-who", { href: profileHref(id) }, av, h("span", {}, h("b", { text: name }), h("small", { text: [`${fmt0.format(lv.viewers || 0)} watching`, since && `live for ${since}`].filter(Boolean).join(" · ") }))),
       h("p.live-title", { text: [lv.title, lv.game].filter(Boolean).join(" · ") || `twitch.tv/${lv.login}`, title: lv.title || "" }),
       h("a.btn.small.live-watch", { href: `https://www.twitch.tv/${lv.login}`, target: "_blank", rel: "noopener" }, "Watch stream ▶"));
   }
@@ -1760,7 +1764,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         const paint = () => {
           const top = t.top || [];
           list.replaceChildren(
-            ...(top.length ? top.slice(0, shown).map((s, i) => h("a.dp-row", { href: "#/u/" + encodeURIComponent(s.id), "data-place": i + 1 },
+            ...(top.length ? top.slice(0, shown).map((s, i) => h("a.dp-row", { href: profileHref(s.id), "data-place": i + 1 },
               h("span.wb-rank", { text: "#" + (i + 1) }), smallAvatar(s.id, s.name), h("b", { text: s.name || "Player" }),
               h("span.dp-acc", { text: (Number(s.acc) || 0).toFixed(2) + "%" }), h("span.dp-pts", { text: fmt0.format(s.points || 0) + " pts" })))
               : [h("p.empty", { text: "Nobody has played it yet today." })]),
@@ -1880,7 +1884,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   // ---------------------------------------------------------------- Workshop search: players too
   function playerChip(p) {
-    const a = h("a.ws-person", { href: "#/u/" + encodeURIComponent(p.id) },
+    const a = h("a.ws-person", { href: profileHref(p.id) },
       smallAvatar(p.id, p.name),
       h("span", {}, h("b", { text: p.name || "Player" }), h("small", { text: `#${fmt0.format(p.rank || 0)} · ${fmt0.format(Math.round(p.pp || 0))} PR` })));
     return a;
@@ -2017,7 +2021,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const name = a.querySelector(".side-name"), av = a.querySelector(".side-av");
       if (name) name.replaceChildren(me ? me.name : "Sign in", me ? checkEl({ id: me.playerId, check: me.check }) : null);
       else a.textContent = me ? me.name : "Sign in";
-      a.setAttribute("href", me && me.hasCard && !me.banned ? "#/u/" + encodeURIComponent(me.playerId) : "#/account");
+      a.setAttribute("href", me && me.hasCard && !me.banned ? profileHref(me.playerId) : "#/account");
       a.dataset.nav = me && me.hasCard && !me.banned ? "me" : "account";
       a.title = me ? "Your public profile" : "Sign in";
       if (av) {
@@ -2115,7 +2119,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           h("div", {}, h("dt", { text: "Level" }), h("dd", { text: "Lv" + c.level })),
           h("div", {}, h("dt", { text: "Plays" }), h("dd", { text: fmt0.format(c.playCount) }))) : h("p.panel-sub", { text: "Play a chart in the game while signed in and your stats show up here." })),
       h("div.me-actions", {},
-        me.hasCard && !me.banned ? h("a.btn", { href: "#/u/" + encodeURIComponent(me.playerId) }, "Public profile") : null,
+        me.hasCard && !me.banned ? h("a.btn", { href: profileHref(me.playerId) }, "Public profile") : null,
         h("button.btn.ghost", { type: "button", onclick: signOut }, "Sign out")));
     setAvatar(head.querySelector(".card-avatar"), p);
     setRole(head, head.querySelector(".badge"), p);
@@ -2481,7 +2485,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const more = section("Messages and friends", "Read and send messages to your friends, see who follows you, and manage who you follow.",
       h("div.panel-actions", { style: "justify-content:flex-start;gap:10px;flex-wrap:wrap" },
         h("a.btn.primary", { href: "#/messages" }, "Open messages"),
-        h("a.btn", { href: "#/u/" + encodeURIComponent(me.playerId) }, "My public profile")));
+        h("a.btn", { href: profileHref(me.playerId) }, "My public profile")));
     const game = section("In the game", "Discord status, appearing offline, who can watch you play and notifications are set in OCTIVE: Settings → Profile.");
     return h("div", {}, conn, tw, more, game);
   }
@@ -2934,7 +2938,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         ...list.map((x) => {
           const actions = h("span.people-actions");
           const row = h("div.person", {},
-            h("a.person-main", { href: "#/u/" + encodeURIComponent(x.id) },
+            h("a.person-main", { href: profileHref(x.id) },
               dmAvatar(x.id, x.name, "person-av"),
               h("span.person-text", {}, h("span.person-name", { text: x.name || "Player" }),
                 h("span.person-sub", { text: [x.rank ? "#" + fmt0.format(x.rank) : null, x.pp ? fmt0.format(x.pp) + " PR" : null, x.level ? "Lv" + x.level : null].filter(Boolean).join(" · ") || "not ranked yet" })),
@@ -3156,7 +3160,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         wall.textContent = "";
         for (const [id, s] of list) {
           const p = (data && data.players.find((x) => x.id === id)) || { id, name: "Supporter" };
-          const a = h("a.wall-item", { href: "#/u/" + encodeURIComponent(id) }, h("img", { src: `badges/supporter-${milestoneArt(s.months || 0)[1]}.png`, alt: "" }), h("span.wall-name"));
+          const a = h("a.wall-item", { href: profileHref(id) }, h("img", { src: `badges/supporter-${milestoneArt(s.months || 0)[1]}.png`, alt: "" }), h("span.wall-name"));
           nameInto(a.querySelector(".wall-name"), { ...p, supporter: s });
           wall.append(a);
         }
@@ -3171,7 +3175,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const s = me.supporter || {};
     if (!s.active) {
       return section("Supporter", s.days > 0 ? `You supported OCTIVE for ${monthsText(s.days)}. Thank you! Your badges stay; support again to get the perks back.` : "3× daily points, 10% off in the points shop, a coloured name, banner, profile effects, animated picture, a profile link of your own and more.",
-        me.link ? h("p.field-hint", { text: `Your profile link stays yours: ${SITE_URL}#/u/${me.link}` }) : null,
+        me.link ? h("p.field-hint", { text: `Your profile link stays yours: ${SITE_URL}u/${me.link}` }) : null,
         h("div.panel-actions", {}, h("a.btn.primary", { href: "#/supporter" }, "Become a supporter")));
     }
     const looks = me.looks || {};
@@ -3198,7 +3202,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const linkIn = h("input", { type: "text", maxlength: 20, spellcheck: "false", autocomplete: "off", placeholder: me.name.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 20) || "YourName" });
     linkIn.value = me.link || "";
     const linkShow = h("p.field-hint");
-    const paintLink = () => { linkShow.textContent = me.link ? `${SITE_URL}#/u/${me.link}` : "No link of your own yet: your profile's address has your player id."; };
+    const paintLink = () => { linkShow.textContent = me.link ? `${SITE_URL}u/${me.link}` : "No link of your own yet: your profile's address has your player id."; };
     paintLink();
     const linkSave = h("button.btn", { type: "button", onclick: () => busy(linkSave, async () => {
       try { const r = await callApi("/support/link", { link: linkIn.value.trim() }, true); me.link = r.link; linkIn.value = r.link || ""; paintLink(); setMsg(out, r.link ? "Profile link saved." : "Profile link removed.", true); }
@@ -3331,7 +3335,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   let giftPopupOpen = false;
   function giftPopup() {
     if (giftPopupOpen || !me || !(me.gifts && me.gifts.length)) return;
-    const own = page() === "account" || location.hash === "#/u/" + encodeURIComponent(me.playerId) || location.hash === "#/u/" + me.playerId;
+    const own = page() === "account" || profileKey() === me.playerId || (!!me.link && String(profileKey() || "").toLowerCase() === me.link.toLowerCase());
     if (!own) return;
     giftPopupOpen = true;
     const gifts = me.gifts;
@@ -3671,7 +3675,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const head = h("div.dm-head", {},
         h("a.dm-back", { href: "#/messages", "aria-label": "All messages" }, "←"),
         dmAvatar(openId, nameOf(openId)),
-        h("a.dm-head-name", { href: "#/u/" + encodeURIComponent(openId) }, nameOf(openId)));
+        h("a.dm-head-name", { href: profileHref(openId) }, nameOf(openId)));
       pane.replaceChildren(head, feed,
         h("form.dm-send", { onsubmit: (e) => { e.preventDefault(); send(); } }, input, sendBtn), note);
     } else pane.replaceChildren(h("div.dm-empty", {}, h("p", { text: "Pick a conversation or a friend." })));
@@ -3762,7 +3766,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         const av = h("span.avatar.crew-av", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial", { text: (m.name || "?").charAt(0).toUpperCase() }), h("span.dot", { hidden: true }));
         const rp = findPlayer(m.id);
         if (rp) setAvatar(av, rp);
-        return h("a.crew-member", { href: "#/u/" + encodeURIComponent(m.id), style: `--crew:${col}` },
+        return h("a.crew-member", { href: profileHref(m.id), style: `--crew:${col}` },
           h("span.cw-pos", { text: String(i + 1) }),
           av,
           h("span.cw-who", {}, h("span.crew-name", { text: m.name || "Player" }), m.joined ? h("span.cw-joined", { text: "joined " + date(m.joined) }) : null),
@@ -3777,20 +3781,37 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     });
   }
 
+  // (2.2.2) profiles have addresses without a #: senterraslays.github.io/octive/u/<player id or link>. GitHub Pages serves
+  // u/<key>.html (written by the Worker, with the player's card for link previews) or, for anyone else, 404.html (this
+  // same site); the page is picked from the path. Old #/u/ links are moved to the new address.
+  function profileKey() {
+    if (!location.pathname.startsWith(BASE_PATH)) return null;
+    const m = location.pathname.slice(BASE_PATH.length).match(/^u\/([^/]+?)(?:\.html)?\/?$/);
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]); } catch { return m[1]; }
+  }
+  function tidyAddress() {
+    const hash = location.hash;
+    if (/^#\/u\/./.test(hash)) history.replaceState(history.state, "", BASE_PATH + "u/" + hash.slice(4));
+    else if (location.pathname !== BASE_PATH && hash.length > 2 && hash.startsWith("#/")) history.replaceState(history.state, "", BASE_PATH + hash);
+    else if (location.pathname !== BASE_PATH && !profileKey() && location.pathname.startsWith(BASE_PATH)) history.replaceState(history.state, "", BASE_PATH + (hash || "#/"));
+  }
+
   function page() {
+    if (profileKey()) return "player";
     const hash = location.hash || "#/";
-    if (/^#\/u\//.test(hash)) return "player";
     const m = hash.match(/^#\/([a-z]+)/);
     return m ? m[1] : "home";
   }
 
   function route(fromHashChange) {
+    tidyAddress();
     const pg = page();
-    const mine = pg === "player" && me && decodeURIComponent(location.hash.slice(4)) === me.playerId;
+    const mine = pg === "player" && me && (profileKey() === me.playerId || (!!me.link && String(profileKey()).toLowerCase() === me.link.toLowerCase()));
     const navKey = pg === "player" ? (mine ? "me" : "rankings") : pg === "account" ? "settings" : pg === "crew" ? "crews" : pg;
     for (const a of document.querySelectorAll("[data-nav]")) a.classList.toggle("active", a.dataset.nav === navKey || (navKey === "settings" && a.dataset.nav === "account"));
     if ((pg === "rankings" || pg === "player" || pg === "ranked") && !data) { app.replaceChildren(h("p.empty", { text: "Loading the ranking…" })); return; }
-    if (pg === "player") player(decodeURIComponent(location.hash.slice(4)));
+    if (pg === "player") player(profileKey());
     else if (pg === "rankings") rankings();
     else if (pg === "ranked") rankedPage();
     else if (pg === "download") download();
@@ -3810,6 +3831,24 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   }
 
   window.addEventListener("hashchange", () => { route(true); document.body.classList.remove("menu-open"); document.querySelector(".nav-more")?.classList.remove("open"); });
+  // (2.2.2) moving between a profile (u/…) and the other pages (#/…) without loading the site again
+  window.addEventListener("popstate", () => route(true));
+  document.addEventListener("click", (e) => {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    const a = e.target.closest && e.target.closest("a[href]");
+    if (!a || (a.target && a.target !== "_self") || a.hasAttribute("download")) return;
+    const u = new URL(a.href, document.baseURI);
+    if (u.origin !== location.origin || !u.pathname.startsWith(BASE_PATH)) return;
+    const rest = u.pathname.slice(BASE_PATH.length);
+    const toProfile = /^u\/[^/]+$/.test(rest), toPage = rest === "" && (u.hash === "" || u.hash.startsWith("#/"));
+    if (!toProfile && !toPage) return;
+    if (toPage && location.pathname === BASE_PATH) return; // a # change: hashchange does it
+    e.preventDefault();
+    history.pushState(null, "", toProfile ? u.pathname : BASE_PATH + (u.hash || "#/"));
+    route(true);
+    document.body.classList.remove("menu-open");
+    document.querySelector(".nav-more")?.classList.remove("open");
+  });
   // the More menu opens on click too (touch screens), and closes when you click elsewhere
   const more = document.querySelector(".nav-more");
   if (more) {
