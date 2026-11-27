@@ -1642,8 +1642,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   }
 
   // ---------------------------------------------------------------- Live on Twitch (home page strip)
-  /** Everyone streaming right now, most viewers first. */
-  const liveIds = () => Object.keys(LIVE_NOW || {}).sort((x, y) => (LIVE_NOW[y].viewers || 0) - (LIVE_NOW[x].viewers || 0));
+  /** Everyone streaming right now, most viewers first (the developer, Senterra, always first while live). */
+  const liveIds = () => Object.keys(LIVE_NOW || {}).sort((x, y) => (y === ROLE_OWNER) - (x === ROLE_OWNER) || (LIVE_NOW[y].viewers || 0) - (LIVE_NOW[x].viewers || 0));
   /** One stream: their picture with the play mark, name, viewers, how long, the title and Watch stream. */
   function liveCard(id) {
     const lv = LIVE_NOW[id] || {};
