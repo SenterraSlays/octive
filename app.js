@@ -1925,16 +1925,23 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("div.dl-head", {}, h("span.dl-icon", {}, iconSvg), h("div", {}, h("span.dl-os", { text: os }), h("h3", { text: title }))),
       h("p.dl-desc", { text: desc }), ...rest);
     const svg = (paths) => { const s = document.createElement("span"); s.innerHTML = `<svg viewBox="0 0 24 24">${paths}</svg>`; return s.firstChild; };
-    const winBtn = h("a.btn.primary.wide", { href: worker + "/releases/OCTIVE-Installer.exe" }, "Download the installer");
-    // (2.2.1) or OCTIVE from the Microsoft Store: no Windows warning, and the Store keeps it updated
-    const bag = svg('<path d="M4.5 8h15l-1.3 12.5H5.8z"/><path d="M9 8V6.5a3 3 0 0 1 6 0V8"/>');
-    for (const [k, v] of Object.entries({ width: 18, height: 18, fill: "none", stroke: "currentColor", "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" })) bag.setAttribute(k, v);
-    const storeBtn = h("a.btn.wide", { href: "https://apps.microsoft.com/detail/9NWSQ5L9XWB7", target: "_blank", rel: "noopener" }, bag, "Get it from the Microsoft Store");
+    // (2.2.1) the installer or OCTIVE from the Microsoft Store (no Windows warning, and the Store keeps it updated):
+    // two matching buttons side by side, one under the other on narrow screens
+    const btnIcon = (paths) => {
+      const s = svg(paths);
+      for (const [k, v] of Object.entries({ width: 18, height: 18, fill: "none", stroke: "currentColor", "stroke-width": 2.2, "stroke-linejoin": "round", "stroke-linecap": "round" })) s.setAttribute(k, v);
+      return s;
+    };
+    const winBtn = h("a.btn.primary.wide", { href: worker + "/releases/OCTIVE-Installer.exe", style: "flex:1 1 190px" },
+      btnIcon('<path d="M12 4v11M7 10.5l5 5 5-5M5 20h14"/>'), "Download installer");
+    const storeBtn = h("a.btn.primary.wide", { href: "https://apps.microsoft.com/detail/9NWSQ5L9XWB7", target: "_blank", rel: "noopener", style: "flex:1 1 190px" },
+      btnIcon('<path d="M4.5 8h15l-1.3 12.5H5.8z"/><path d="M9 8V6.5a3 3 0 0 1 6 0V8"/>'), "Microsoft Store");
+    const winBtns = h("div.dl-btns", { style: "display:flex;gap:10px;flex-wrap:wrap" }, winBtn, storeBtn);
     const apkBtn = h("a.btn.primary.wide", { href: "#" }, "Download the APK");
     const winSize = h("span.dl-size"), apkSize = h("span.dl-size");
     const win = card("win" + (!isAndroid ? ".suggested" : ""), "Windows", svg('<path d="M3 5.5l7.5-1v7H3zM11.5 4.4L21 3v8.5h-9.5zM3 12.5h7.5v7L3 18.5zM11.5 12.5H21V21l-9.5-1.4z"/>'),
       "Windows 10 and 11", "The installer downloads the newest version, puts OCTIVE in your Start menu and starts it. The game updates itself after that.",
-      winBtn, h("div.dl-foot", {}, winSize), storeBtn,
+      winBtns, h("div.dl-foot", {}, winSize),
       h("p.dl-note", { text: "Windows may say it protected your PC, because the installer is new. Click More info, then Run anyway. The Microsoft Store version doesn't show this, and the Store keeps it updated." }));
     const android = card("android" + (isAndroid ? ".suggested" : ""), "Android", svg('<path d="M7 9h10v8a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1z"/><path d="M7 8a5 5 0 0 1 10 0z"/><path d="M9 18v3M15 18v3M4.5 10v5M19.5 10v5M8.5 4L7 2M15.5 4L17 2"/>'),
       "Phones and tablets", "Android 8 or newer (64-bit). Open the APK after it downloads; you may need to allow your browser to install apps.",
