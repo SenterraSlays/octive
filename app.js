@@ -120,21 +120,51 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (worker && p.avatarHash) p.avatar = `${worker}/avatar/${encodeURIComponent(p.id)}?v=${encodeURIComponent(p.avatarHash)}`;
     if (data.updated) {
       const when = new Date(data.updated);
-      document.getElementById("updated").textContent = "Updated " + when.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+      const upd = document.getElementById("updated");
+      if (upd) upd.textContent = "Updated " + when.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
     }
-    if (["home", "rankings", "player", "ranked"].includes(page())) route();
+    paintSideStatus();
+    if (app && ["home", "rankings", "player", "ranked"].includes(page())) route();
   }
 
   function clone(id) { return document.getElementById(id).content.cloneNode(true); }
 
+  /** (3.0) A player's own colour for the placeholder behind their picture (the same every time). */
+  const AV_TINTS = ["#ff4d9d", "#ff9a3d", "#ffd23f", "#3ee089", "#36d6ff", "#5b7cff", "#a764ff", "#2fe0c0", "#ff5a6e"];
+  function avatarTint(key) {
+    let n = 0;
+    for (const ch of String(key || "")) n = (n * 31 + ch.charCodeAt(0)) >>> 0;
+    return AV_TINTS[n % AV_TINTS.length];
+  }
+  /** The picture fades in over the first letter once it has loaded; the letter stays if it can't load. */
+  function waitForPicture(box, img, initial, src) {
+    if (!src || img.getAttribute("src") === src && !box.classList.contains("av-wait")) return;
+    box.classList.add("av-wait");
+    img.hidden = false; if (initial) initial.hidden = false;
+    // it fades in over the letter, then the letter goes
+    img.onload = () => { box.classList.add("av-in"); setTimeout(() => { box.classList.remove("av-wait", "av-in"); if (initial) initial.hidden = true; }, 380); };
+    img.onerror = () => { box.classList.remove("av-wait"); img.hidden = true; if (initial) initial.hidden = false; };
+    img.src = src;
+  }
+  /** (3.0) A shimmer where a picture will be, until it has loaded (then it fades in); nothing is left blank. */
+  function waitPic(holder, img) {
+    if (!img) return img;
+    holder.classList.add("pic-wait");
+    const done = () => holder.classList.remove("pic-wait");
+    img.addEventListener("load", done, { once: true });
+    img.addEventListener("error", () => { done(); img.remove(); holder.classList.add("pic-none"); }, { once: true });
+    if (img.complete && img.naturalWidth) done();
+    return img;
+  }
+
   function setAvatar(box, p) {
     const img = box.querySelector("img"), initial = box.querySelector(".initial");
     initial.textContent = (p.name || "?").charAt(0).toUpperCase();
+    box.style.setProperty("--av", avatarTint(p.id || p.name));
     const gif = isSupporter(p) && p.supporter.gif ? avatarUrl(p) : null;
     if (gif || p.avatar) {
-      img.src = gif || (p.avatar.includes("?") || !p.avatarHash ? p.avatar : p.avatar + "?v=" + encodeURIComponent(p.avatarHash));
-      img.hidden = false; initial.hidden = true;
-      img.onerror = () => { img.hidden = true; initial.hidden = false; };
+      // (3.0) their first letter, in a colour of their own, stays until the picture has arrived (no blank box)
+      waitForPicture(box, img, initial, gif || (p.avatar.includes("?") || !p.avatarHash ? p.avatar : p.avatar + "?v=" + encodeURIComponent(p.avatarHash)));
     }
     const dot = box.querySelector(".dot");
     if (dot) {
@@ -297,7 +327,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
   // ---------------------------------------------------------------- pages
 
-  /** One of the top three on a podium: big picture in a medal ring, name and badges, the main number and a line under it. */
+  /** One of the top three on a podium: big picture in a medal ring, name and badges, the main number and a line under it.
+   *  (3.0) It stands on a step with its place on it, like the Discord card's podium. */
   function lbPod(p, place, value, sub, extra, color) {
     const a = h("a.lb-pod", { href: profileHref(p.id), "data-place": place, style: color ? `--pc:${color}` : null },
       h("span.lb-place", { text: ["", "1st", "2nd", "3rd"][place] || "#" + place }),
@@ -305,7 +336,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       h("span.lb-pod-name", {}, h("span.name"), h("span.badge", { hidden: true })),
       extra || null,
       h("b.lb-pod-value", { text: value }),
-      sub ? h("span.lb-pod-sub", { text: sub }) : null);
+      sub ? h("span.lb-pod-sub", { text: sub }) : null,
+      h("span.lb-step", { "aria-hidden": "true" }, h("span", { text: String(place) })));
     nameInto(a.querySelector(".name"), p);
     addLbIcon(a.querySelector(".name"), p.id);
     setAvatar(a.querySelector(".avatar"), p);
@@ -313,12 +345,68 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     return a;
   }
 
+  // ---------------------------------------------------------------- 3.2: the top three without a podium
+  // The user: "I'm not a fan of the podium thing". The leader gets a big card on the left and second and third a card each
+  // beside it, in gold, silver and bronze, with the number that matters big on the right of each (Rankings, Countries,
+  // Ranked and Crews all use it).
+  /** One card. x: { place, href, art, name, tags, sub, value, note, extra, color, stats: [[label, value]], onCard(el) } */
+  function t3Card(x, lead) {
+    const el = h("a.t3-card" + (lead ? ".t3-lead" : ""), { href: x.href, "data-place": x.place, style: x.color ? `--ac:${x.color}` : null },
+      h("span.t3-num", { "aria-hidden": "true", text: String(x.place) }),
+      x.art ? h("span.t3-art", {}, x.art) : null,
+      h("span.t3-main", {},
+        h("span.t3-place", { text: ["", "1st", "2nd", "3rd"][x.place] || "#" + x.place }),
+        h("span.t3-name", {}, x.name),
+        x.tags || null,
+        x.sub ? h("span.t3-sub", { text: x.sub }) : null,
+        lead && x.stats && x.stats.length ? h("span.t3-stats", {}, ...x.stats.map(([k, v]) => h("span", {}, h("small", { text: k }), h("b", { text: v })))) : null),
+      h("span.t3-val", {}, x.extra || null, h("b", { text: x.value }), x.note ? h("small", { text: x.note }) : null));
+    if (x.onCard) x.onCard(el);
+    return el;
+  }
+  /** The top three ([first, second, third]): the leader's card, and the other two beside it. */
+  function topThree(list) {
+    if (!list.length) return null;
+    return h("div.t3" + (list.length === 1 ? ".t3-solo" : ""), {}, t3Card(list[0], true),
+      list.length > 1 ? h("div.t3-rest", {}, ...list.slice(1, 3).map((x) => t3Card(x, false))) : null);
+  }
+  /** A player for topThree: their picture, coloured name and badges (x: the rest of the card). */
+  function t3Player(p, x) {
+    const art = h("span.avatar", {}, h("img", { alt: "", loading: "lazy", hidden: true }), h("span.initial"), h("span.dot", { hidden: true }));
+    setAvatar(art, p);
+    const name = h("span.name");
+    nameInto(name, p);
+    addLbIcon(name, p.id);
+    const badge = h("span.badge", { hidden: true });
+    const tags = h("span.t3-tags", {}, badge);
+    if (isSupporter(p) || wasSupporter(p)) tags.append(supporterPill(p, true));
+    return { href: profileHref(p.id), art, name, tags, ...x,
+      onCard: (el) => { setRole(el, badge, p); if (![...tags.children].some((c) => !c.hidden)) tags.remove(); } };
+  }
+
+  /** (3.0) Players | Countries, above the ranking. */
+  function rankTabs(view) {
+    return h("nav.rk-tabs", { "aria-label": "Ranking" },
+      h("a.ws-tab" + (view === "players" ? ".on" : ""), { href: "rankings" }, "Players"),
+      h("a.ws-tab" + (view === "countries" ? ".on" : ""), { href: "rankings?view=countries" }, "Countries"));
+  }
+
   function rankings() {
+    const q = hashQuery();
+    if (q.get("view") === "countries") { countriesPage(); return; }
+    // (3.0) rankings?country=US: that country's players, with their place in it
+    const country = /^[A-Z]{2}$/.test(q.get("country") || "") ? q.get("country") : "";
+    const pool = country ? data.players.filter((p) => p.country === country && !isOfficial(p)) : data.players;
     const view = clone("tpl-rankings");
     const rows = view.querySelector("[data-rows]");
     const search = view.querySelector("[data-search]");
-    view.querySelector("[data-count]").textContent = fmt0.format(data.players.length);
-    view.querySelector("[data-online]").textContent = fmt0.format(data.players.filter((p) => p.online).length);
+    view.querySelector("[data-count]").textContent = fmt0.format(pool.length);
+    view.querySelector("[data-online]").textContent = fmt0.format(pool.filter((p) => p.online).length);
+    view.querySelector(".hero > div").prepend(h("p.eyebrow", { text: country ? "Country ranking" : "Global ranking" }));
+    if (country) {
+      view.querySelector(".hero h1").textContent = regionName(country);
+      view.querySelector(".hero .sub").textContent = `Every player from ${regionName(country)}, ranked by total performance rating (PR). Their place in the world is beside their name.`;
+    }
     const notice = view.querySelector("[data-sample]");
     if (data.error) {
       notice.textContent = data.players.length
@@ -328,38 +416,56 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     } else notice.hidden = !data.sample;
     const empty = view.querySelector("[data-empty]");
     const table = view.querySelector(".table");
-    const podium = h("div.lb-podium");
-    table.before(podium);
-    const topPR = Math.max(1, ...data.players.map((p) => p.pp || 0));
-    // (2.2.0) the players who gained the most PR in the last 7 days
+    const bar = h("div.rk-bar", {}, rankTabs("players"),
+      country ? h("a.rk-filter", { href: "rankings", title: "Show every country" }, h("span.flag-chip", { text: country }), regionName(country), h("span.rk-x", { text: "✕" })) : null);
+    view.querySelector(".hero").after(bar);
+    // (3.2) the top three on cards, then the ranking with "Climbing this week" beside it
+    const podium = h("div.t3-wrap");
+    const layout = h("div.rk-layout");
+    table.before(layout);
+    layout.before(podium);
+    const topPR = Math.max(1, ...pool.map((p) => p.pp || 0));
+    // (2.2.0) the players who gained the most PR in the last 7 days. (3.0) One row you can scroll, so on phones the ranking
+    // starts right after it instead of under a tall box.
     const gainList = h("div.gain-list", {}, h("p.gain-empty", { text: "Loading…" }));
-    const gainers = h("section.gainers", {}, h("div.gain-head", {}, h("h2", { text: "Top gainers this week" }), h("small", { text: "Most PR gained in the last 7 days" })), gainList);
-    podium.before(gainers);
-    if (worker) fetch(worker + "/play/gainers?limit=10", { cache: "no-cache" }).then((r) => r.json()).then((g) => {
+    const gainers = h("aside.gainers", {}, h("div.gain-head", {}, h("h2", {}, h("span.gain-arrow", { text: "▲" }), "Climbing this week"), h("small", { text: "Most PR gained in the last 7 days" })), gainList);
+    layout.append(h("div.rk-main", {}, table, empty), gainers);
+    if (worker && !country) fetch(worker + "/play/gainers?limit=10", { cache: "no-cache" }).then((r) => r.json()).then((g) => {
       const list = (g && g.players) || [];
       if (!list.length) { gainList.replaceChildren(h("p.gain-empty", { text: "Nobody has gained PR this week yet." })); return; }
       gainList.replaceChildren(...list.map((p) => h("a.gain-row", { href: profileHref(p.playerId) },
-        h("span.gain-rank", { text: "#" + p.rank }), h("span.gain-name", { text: p.name || "Player" }),
-        h("b.gain-amt", { text: "+" + fmt0.format(p.gain || 0) + " PR" }), h("small.gain-total", { text: fmt0.format(p.pp || 0) + " PR" }))));
+        h("span.gain-rank", { text: "#" + p.rank }), smallAvatar(p.playerId, p.name),
+        h("span.gain-who", {}, h("span.gain-name", { text: p.name || "Player" }), h("small.gain-total", { text: fmt0.format(p.pp || 0) + " PR" })),
+        h("b.gain-amt", { text: "+" + fmt0.format(p.gain || 0) }))));
     }).catch(() => gainList.replaceChildren(h("p.gain-empty", { text: "Couldn't load this week's gainers." })));
-    else gainers.hidden = true;
+    else { gainers.hidden = true; layout.classList.add("solo"); }
 
     function render(filter) {
       rows.textContent = "";
-      const q = (filter || "").trim().toLowerCase();
-      const top = q ? [] : data.players.slice(0, 3);
-      podium.replaceChildren(...top.map((p) => lbPod(p, p.rank, fmt0.format(p.pp || 0) + " PR", `${fmt2.format(p.accuracy || 0)}% · Lv${p.level || 1}`)));
-      podium.hidden = !top.length;
-      const list = q ? data.players.filter((p) => (p.name || "").toLowerCase().includes(q)) : data.players.slice(3);
-      if (q && data.official && ("octive".includes(q) || (data.official.name || "").toLowerCase().includes(q))) list.unshift(data.official);
-      table.hidden = !list.length && !q;
+      const qq = (filter || "").trim().toLowerCase();
+      const top = qq ? [] : pool.slice(0, 3);
+      const t3 = topThree(top.map((p, i) => {
+        const other = top[i === 0 ? 1 : 0], gap = other ? Math.abs((p.pp || 0) - (other.pp || 0)) : 0;
+        const where = /^[A-Z]{2}$/.test(p.country || "") ? regionName(p.country) : "";
+        return t3Player(p, { place: country ? i + 1 : p.rank, value: fmt0.format(p.pp || 0) + " PR",
+          sub: i === 0 ? (country ? `#${fmt0.format(p.rank)} in the world` : where) : `${fmt2.format(p.accuracy || 0)}% · Lv${p.level || 1}${country ? ` · #${fmt0.format(p.rank)} in the world` : ""}`,
+          note: other ? (i === 0 ? `+${fmt0.format(gap)} PR ahead` : `${fmt0.format(gap)} PR behind first`) : "",
+          stats: [["Accuracy", fmt2.format(p.accuracy || 0) + "%"], ["Level", String(p.level || 1)], ["Plays", fmt0.format(p.playCount || 0)]] });
+      }));
+      podium.replaceChildren(...(t3 ? [t3] : []));
+      podium.hidden = !t3;
+      const list = qq ? pool.filter((p) => (p.name || "").toLowerCase().includes(qq)) : pool.slice(3);
+      if (qq && !country && data.official && ("octive".includes(qq) || (data.official.name || "").toLowerCase().includes(qq))) list.unshift(data.official);
+      table.hidden = !list.length && !qq;
       empty.hidden = list.length > 0 || top.length > 0;
-      if (!list.length && q) empty.textContent = `Nobody called "${filter.trim()}" is ranked.`;
+      if (!list.length && qq) empty.textContent = `Nobody called "${filter.trim()}" is ranked${country ? " in " + regionName(country) : ""}.`;
       for (const p of list) {
         const r = clone("tpl-row").firstElementChild;
+        const place = country ? pool.indexOf(p) + 1 : p.rank;
         r.href = profileHref(p.id);
-        r.dataset.place = String(p.rank);
-        r.querySelector(".rank").textContent = isOfficial(p) ? INF : "#" + fmt0.format(p.rank);
+        r.dataset.place = String(place);
+        r.querySelector(".rank").textContent = isOfficial(p) ? INF : "#" + fmt0.format(place);
+        if (country) r.querySelector(".rank").title = `#${fmt0.format(p.rank)} in the world`;
         nameInto(r.querySelector(".name"), p);
         addLbIcon(r.querySelector(".name"), p.id);
         setAvatar(r.querySelector(".avatar"), p);
@@ -394,8 +500,68 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     search.addEventListener("input", () => render(search.value));
     render("");
     app.replaceChildren(view);
-    document.title = "OCTIVE Rankings";
+    document.title = country ? `${regionName(country)} · OCTIVE Rankings` : "OCTIVE Rankings";
   }
+
+  // ---------------------------------------------------------------- 3.0: countries, ranked by their players' PR
+  let countrySort = "total";
+  function countriesPage() {
+    document.title = "Countries · OCTIVE Rankings";
+    const groups = new Map();
+    for (const p of data.players) {
+      if (isOfficial(p) || !/^[A-Z]{2}$/.test(p.country || "")) continue;
+      if (!groups.has(p.country)) groups.set(p.country, []);
+      groups.get(p.country).push(p);
+    }
+    const rowsData = [...groups].map(([code, ps]) => {
+      ps.sort((a, b) => a.rank - b.rank);
+      const total = ps.reduce((s, p) => s + (p.pp || 0), 0);
+      return { code, name: regionName(code), players: ps, total, avg: total / ps.length,
+        acc: ps.reduce((s, p) => s + (p.accuracy || 0), 0) / ps.length, online: ps.filter((p) => p.online).length, best: ps[0] };
+    });
+    const sorters = { total: (a, b) => b.total - a.total, avg: (a, b) => b.avg - a.avg, players: (a, b) => b.players.length - a.players.length || b.total - a.total };
+    const placed = data.players.filter((p) => !isOfficial(p) && /^[A-Z]{2}$/.test(p.country || "")).length;
+    const head = h("section.hero", {},
+      h("div", {}, h("p.eyebrow", { text: "Around the world" }), h("h1", { text: "Countries" }),
+        h("p.sub", { text: "Every country with an OCTIVE player, ranked by its players' PR added up. Pick one to see its own ranking." })),
+      h("div.hero-side", {},
+        h("div.stat", {}, h("span.stat-label", { text: "Countries" }), h("span.stat-value", { text: fmt0.format(rowsData.length) })),
+        h("div.stat", {}, h("span.stat-label", { text: "Players" }), h("span.stat-value", { text: fmt0.format(placed) }))));
+    const sortBar = h("div.ct-sort");
+    const podium = h("div.t3-wrap");
+    const list = h("div.ct-list", { role: "table", "aria-label": "Countries" });
+    const pr = (n) => fmt0.format(Math.round(n)) + " PR";
+    function paint() {
+      const sorted = rowsData.slice().sort(sorters[countrySort]);
+      const what = (c) => countrySort === "avg" ? pr(c.avg) : countrySort === "players" ? `${fmt0.format(c.players.length)} player${c.players.length === 1 ? "" : "s"}` : pr(c.total);
+      sortBar.replaceChildren(h("span.ct-sort-cap", { text: "Ranked by" }), ...[["total", "Total PR"], ["avg", "PR per player"], ["players", "Players"]].map(([k, label]) =>
+        h("button.chip" + (k === countrySort ? ".on" : ""), { type: "button", onclick: () => { countrySort = k; paint(); } }, label)));
+      // (3.2) the top three on cards
+      const t3 = topThree(sorted.slice(0, 3).map((c, i) => ({ place: i + 1, href: "rankings?country=" + c.code,
+        art: h("span.t3-code", { text: c.code }), name: h("span", { text: c.name }),
+        sub: `${fmt0.format(c.players.length)} player${c.players.length === 1 ? "" : "s"} · best: ${c.best.name || "Player"}`,
+        value: what(c), note: c.online ? `${fmt0.format(c.online)} online now` : "",
+        stats: [["Players", fmt0.format(c.players.length)], ["Accuracy", fmt2.format(c.acc) + "%"], ["PR per player", fmt0.format(Math.round(c.avg))]] })));
+      podium.replaceChildren(...(t3 ? [t3] : []));
+      const max = Math.max(1, ...sorted.map((c) => countrySort === "avg" ? c.avg : countrySort === "players" ? c.players.length : c.total));
+      list.replaceChildren(
+        h("div.ct-head", { role: "row" }, ...["#", "Country", "Players", "Accuracy", "Best player", countrySort === "avg" ? "PR per player" : countrySort === "players" ? "Players" : "Total PR"].map((t) => h("span", { role: "columnheader", text: t }))),
+        ...sorted.map((c, i) => {
+          const v = countrySort === "avg" ? c.avg : countrySort === "players" ? c.players.length : c.total;
+          return h("a.ct-row", { href: "rankings?country=" + c.code, role: "row", "data-place": i + 1 },
+            h("span.ct-rank", { text: "#" + (i + 1) }),
+            h("span.ct-name", {}, h("span.flag-chip", { text: c.code }), h("b", { text: c.name }), c.online ? h("small.ct-on", { text: `${c.online} online` }) : null),
+            h("span.ct-num", { text: fmt0.format(c.players.length) }),
+            h("span.ct-num", { text: fmt2.format(c.acc) + "%" }),
+            h("span.ct-best", {}, smallAvatar(c.best.id, c.best.name, c.best.avatarHash), h("span", { text: c.best.name || "Player" })),
+            h("span.ct-val", {}, h("b", { text: what(c) }), h("span.lb-prbar", {}, h("span", { style: `width:${Math.max(3, Math.round(v / max * 100))}%` }))));
+        }));
+    }
+    paint();
+    app.replaceChildren(h("div.ct-page", {}, head, h("div.rk-bar", {}, rankTabs("countries"), sortBar), podium, list,
+      rowsData.length ? null : h("p.empty", { text: "No countries yet." })));
+  }
+
 
   // ---------------------------------------------------------------- Ranked (2.0): this season's ranked board
 
@@ -490,12 +656,17 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         h("div", {}, h("h1", { text: "Ranked" }),
           h("p.sub", { text: "1v1 matches in OCTIVE 2.0, best of 3, on a 4K and a 7K ladder: climb from Contender to Legend. Everyone placed this season, best first." })),
         h("div.hero-side", {}, stat("Season", "data-rk-season"), stat("Placed", "data-rk-count"), stat("Season ends", "data-rk-ends"))),
-      h("div.rk-modes", {}, ...[4, 7].map((m) => h("button.chip" + (m === rankedMode ? ".on" : ""), { type: "button", onclick: () => { if (rankedMode !== m) { rankedMode = m; rankedPage(); } } }, `${m}K ladder`))),
-      h("div.rk-ranks", {}, ...RK_GROUPS.map(([name, t, stars]) =>
-        h("div.rk-rank", { title: `${name}: charts around ${stars}`, style: `--rc:${RK_COLORS[rkGroup(t)]}` }, rankEmblem(t >= 16 ? t : t + 2, 40),
-          h("span", { text: name, style: `color:${RK_COLORS[rkGroup(t)]}` }), h("small", { text: stars })))),
+      h("nav.rk-tabs.rk-modes", { "aria-label": "Ladder" }, ...[4, 7].map((m) => h("button.ws-tab" + (m === rankedMode ? ".on" : ""),
+        { type: "button", "aria-pressed": String(m === rankedMode), onclick: () => { if (rankedMode !== m) { rankedMode = m; rankedPage(); } } }, `${m}K ladder`))),
+      // (3.2) the ranks as a ladder, lowest first, with how many players are on each this season
+      h("ol.rk-ladder", { "aria-label": "The ranks, lowest first" }, ...RK_GROUPS.map(([name, t, stars]) =>
+        h("li.rk-step", { title: `${name}: charts around ${stars}`, style: `--rc:${RK_COLORS[rkGroup(t)]}` },
+          rankEmblem(t >= 16 ? t : t + 2, 44),
+          h("span.rk-step-name", { text: name }),
+          h("small", { text: stars }),
+          h("b.rk-step-n", { "data-rk-n": String(rkGroup(t)), text: "–" })))),
       h("div.notice", { "data-rk-error": true, hidden: true }),
-      h("div.lb-podium", { "data-rk-podium": true, hidden: true }),
+      h("div.t3-wrap", { "data-rk-podium": true, hidden: true }),
       h("div.table.ranked-table", { role: "table", "aria-label": "Ranked board" },
         h("div.thead", { role: "row" }, col("Rank"), col("Player"), col("Division", ".num"), col("Matches", ".num.hide-sm"), col("Win rate", ".num.hide-sm"), col("Progress", ".num")),
         h("div", { "data-rows": true }, h("p.empty", { text: "Loading the ranked board…" }))));
@@ -518,18 +689,29 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     view.querySelector("[data-rk-ends]").textContent = !b.ends ? "–" : left <= 0 ? "now" : left >= 2 * 86400e3 ? `in ${Math.floor(left / 86400e3)} days` : left >= 3600e3 ? `in ${Math.floor(left / 3600e3)} h` : "soon";
     const rows = view.querySelector("[data-rows]");
     rows.replaceChildren();
+    // how many players are on each rank
+    const per = new Map();
+    for (const x of list) per.set(rkGroup(x.tier), (per.get(rkGroup(x.tier)) || 0) + 1);
+    view.querySelectorAll("[data-rk-n]").forEach((el) => {
+      const n = per.get(Number(el.dataset.rkN)) || 0;
+      el.textContent = n ? `${fmt0.format(n)} player${n === 1 ? "" : "s"}` : "nobody yet";
+      el.closest(".rk-step").classList.toggle("none", !n);
+    });
     if (!list.length) { rows.append(h("p.empty", { text: "Nobody is placed this season yet: play your three placement songs in OCTIVE 2.0 to be the first." })); return; }
     // the same rows as the global ranking: picture, name, badges, supporter look
     const byId = new Map(((data && data.players) || []).map((p) => [p.id, p]));
-    // the top three on a podium, with their rank's emblem and colour
+    // (3.2) the top three on cards, with their rank's emblem and colour
     const podium = view.querySelector("[data-rk-podium]");
-    podium.replaceChildren(...list.slice(0, 3).map((x) => {
-      const games = (x.wins || 0) + (x.losses || 0);
-      return lbPod(byId.get(x.id) || { id: x.id, name: x.name }, x.place, (x.rank || RK_NAMES[x.tier] || "") + (x.legend ? " #" + x.legend : ""),
-        `${fmt0.format(x.wins || 0)}W ${fmt0.format(x.losses || 0)}L${games ? " · " + Math.round(100 * (x.wins || 0) / games) + "%" : ""}`,
-        rankEmblem(x.tier, 54), RK_COLORS[rkGroup(x.tier)]);
+    const t3 = topThree(list.slice(0, 3).map((x, i) => {
+      const wins = x.wins || 0, games = wins + (x.losses || 0), pct = Math.max(0, Math.min(100, x.progress || 0));
+      return t3Player(byId.get(x.id) || { id: x.id, name: x.name }, { place: x.place, color: RK_COLORS[rkGroup(x.tier)],
+        value: (x.rank || RK_NAMES[x.tier] || "") + (x.legend ? " #" + x.legend : ""), extra: rankEmblem(x.tier, i === 0 ? 64 : 46),
+        sub: `${fmt0.format(wins)}W ${fmt0.format(x.losses || 0)}L${games ? " · " + Math.round(100 * wins / games) + "% won" : ""}`,
+        note: x.tier >= 17 ? "ordered by rating" : `${pct}% to ${RK_NAMES[x.tier + 1] || "the next rank"}`,
+        stats: [["Matches", fmt0.format(games)], ["Wins", fmt0.format(wins)], ["Win rate", games ? Math.round(100 * wins / games) + "%" : "–"]] });
     }));
-    podium.hidden = false;
+    podium.replaceChildren(...(t3 ? [t3] : []));
+    podium.hidden = !t3;
     view.querySelector(".ranked-table").hidden = list.length <= 3;
     for (const x of list.slice(3)) {
       const known = byId.get(x.id);
@@ -559,6 +741,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       div.classList.add("rk-cell");
       div.style.color = color;
       div.replaceChildren(rankEmblem(x.tier, 28), h("span.rk-name", { text: (x.rank || RK_NAMES[x.tier] || "") + (x.legend ? " #" + x.legend : "") }));
+      div.title = (x.rank || RK_NAMES[x.tier] || "") + (x.legend ? " #" + x.legend : "");
       const games = (x.wins || 0) + (x.losses || 0);
       r.querySelector(".lvl").textContent = `${fmt0.format(x.wins || 0)}W ${fmt0.format(x.losses || 0)}L`;
       r.querySelector(".plays").textContent = games ? Math.round(100 * (x.wins || 0) / games) + "%" : "–";
@@ -730,6 +913,25 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     return box;
   }
 
+  // (3.0) answers the profile asks for more than once (plays, progress, Workshop picks), kept a few minutes so the page
+  // can redraw (it does every 90 s while you're at the top) without asking the server again
+  const jsonCache = new Map();
+  function cachedJson(url, ttl = 300_000) {
+    const hit = jsonCache.get(url);
+    if (hit && Date.now() - hit.at < ttl) return hit.p;
+    const p = fetch(url, { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    jsonCache.set(url, { at: Date.now(), p });
+    return p;
+  }
+  const playsOf = (id) => (worker ? cachedJson(`${worker}/play/plays?player=${encodeURIComponent(id)}`) : Promise.resolve(null));
+  const progressOf = (id) => (worker ? cachedJson(`${worker}/play/progress?player=${encodeURIComponent(id)}`) : Promise.resolve(null));
+  /** A profile's link to share (a supporter's own link when they have one). */
+  async function profileLinkKey(p) {
+    try { const d = await fetch(`${worker}/links/of/${encodeURIComponent(p.id)}`).then((r) => (r.ok ? r.json() : null)); if (d && d.link) return d.link; } catch { /* their id */ }
+    return p.id;
+  }
+  const ICON = (paths) => { const s = document.createElement("span"); s.className = "ic"; s.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${paths}</svg>`; return s; };
+
   function player(id) {
     const p = findPlayer(id) || (linkIds[String(id).toLowerCase()] ? findPlayer(linkIds[String(id).toLowerCase()]) : null);
     // (2.2.2) a supporter's own link (u/Senterra): asked who it is once, then their profile shows at that address
@@ -746,15 +948,19 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       setTimeout(giftPopup, 400);
       return;
     }
+    // (3.0) u/<player>?vs=<other>: the two side by side
+    const vs = hashQuery().get("vs");
+    if (vs != null) { comparePage(p, vs); return; }
     const official = isOfficial(p);
     const players = data ? data.players : [];
+    setCrumb(p.name || "Player");
 
     // the head: cover, picture, name, country and crew
     const avatar = h("div.card-avatar", {}, h("img", { alt: "", hidden: true }), h("span.initial"), h("span.dot", { hidden: true }));
     const nameEl = h("h1.card-name");
     const nameRow = h("div.card-name-row", {}, nameEl, h("span.badge", { hidden: true }));
     const titleEl = h("div.card-title", { hidden: true });
-    const sub = h("div.pf-sub", {}, p.country && /^[A-Z]{2}$/.test(p.country) ? h("span", { text: regionName(p.country) }) : null);
+    const sub = h("div.pf-sub", {}, p.country && /^[A-Z]{2}$/.test(p.country) ? h("a.pf-country", { href: "rankings?country=" + p.country, title: "Their country's ranking" }, h("span.flag-chip", { text: p.country }), regionName(p.country)) : null);
     const status = h("div.card-status");
     const card = h("article.card.pf-head", {}, h("div.pf-cover"), h("div.pf-id", {}, avatar, h("div.pf-idtext", {}, nameRow, titleEl, sub, status)));
     nameInto(nameEl, p);
@@ -798,14 +1004,20 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       }));
     }
     // (2.2.2) the link to share: it shows their card (rank, PR, accuracy) where it's pasted, like Discord
-    const shareBtn = h("button.pf-share", { type: "button", title: "Copy a link to this profile. Pasted in Discord (and other apps) it shows a card with their stats." }, h("span", { text: "Share profile" }));
+    const shareBtn = h("button.pf-act", { type: "button", title: "Copy a link to this profile. Pasted in Discord (and other apps) it shows a card with their stats." },
+      ICON('<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>'), h("span", { text: "Share" }));
     shareBtn.addEventListener("click", async () => {
-      let key = p.id;
-      try { const d = await fetch(`${worker}/links/of/${encodeURIComponent(p.id)}`).then((r) => (r.ok ? r.json() : null)); if (d && d.link) key = d.link; } catch { /* their id */ }
-      const url = shareLink(key);
+      const url = shareLink(await profileLinkKey(p));
       try { await navigator.clipboard.writeText(url); toast("Link copied. Paste it in Discord to show their card."); }
       catch { prompt("Copy this link:", url); }
     });
+    // (3.0) their card as a picture for forums, READMEs and stream panels
+    const embedBtn = h("button.pf-act", { type: "button", title: "Their card as a picture: a link, Markdown, BBCode or HTML", onclick: () => embedModal(p) },
+      ICON('<path d="M8 8l-4 4 4 4M16 8l4 4-4 4M13.5 5l-3 14"/>'), h("span", { text: "Embed" }));
+    // (3.0) the two side by side: you and them when you're signed in, else pick someone
+    const vsKey = me && me.playerId && me.playerId !== p.id && findPlayer(me.playerId) ? me.playerId : "";
+    const compareBtn = h("a.pf-act.pf-act-vs", { href: profileHref(p.id) + "?vs=" + encodeURIComponent(vsKey), title: vsKey ? "Compare them with you" : "Compare them with another player" },
+      ICON(QS_ICON.vs), h("span", { text: vsKey ? "Compare with you" : "Compare" }));
     // (2.0.2) their crew, a link to its page
     loadCosmetics().then((cs) => {
       const cr = cs && cs.players && cs.players[p.id] && cs.players[p.id].crew;
@@ -813,71 +1025,82 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       sub.append(h("a.crew-chip", { href: "crew/" + encodeURIComponent(cr.id), title: "Their crew" }, crewTag(cr), h("span", { text: "Crew →" })));
     });
 
-    // ranks, the rank graph and the numbers
-    const countryRank = p.country ? players.filter((x) => x.country === p.country && !isOfficial(x)).sort((a, b) => a.rank - b.rank).findIndex((x) => x.id === p.id) + 1 : 0;
-    const big = (label, value) => h("div.pf-big", {}, h("span", { text: label }), h("b", { text: value }));
-    const small = (label, value) => h("div.pf-small", {}, h("span", { text: label }), h("b", { text: value }));
-    const graph = h("div.pf-graph");
-    // (2.2.2) achievements count the ones the game has now, like the achievements section
-    const achSmall = small("Achievements", fmt0.format(Object.keys(p.achievements || {}).length));
-    if (!official) loadAchDefs().then((defs) => { if (defs.length) achSmall.lastChild.textContent = fmt0.format(defs.filter((d) => (p.achievements || {})[d.id]).length); });
-    const main = h("div.pf-main", {},
-      h("div.pf-bigs", {},
-        big("Global ranking", official ? INF : "#" + fmt0.format(p.rank)),
-        countryRank > 0 && !official ? big("Country ranking", "#" + fmt0.format(countryRank)) : null),
-      graph,
-      h("div.pf-smalls", {},
-        achSmall,
-        small("Performance", official ? INF + " PR" : fmt0.format(p.pp || 0) + " PR"),
-        small("Play time", official ? INF : p.playTimeMs ? playTime(p.playTimeMs) : "—")));
-    const row = (label, value) => h("div", {}, h("dt", { text: label }), h("dd", { text: value }));
-    const panel = h("dl.pf-panel", {},
-      row("Accuracy", official ? "100.00%" : fmt2.format(p.accuracy || 0) + "%"),
-      row("Total score", official ? INF : fmt0.format(p.totalScore || 0)),
-      row("Play count", official ? INF : fmt0.format(p.playCount || 0)),
-      row("Full combos", official ? INF : fmt0.format(p.fullCombos || 0)),
-      row("Max combo", official ? INF + "x" : p.maxCombo ? fmt0.format(p.maxCombo) + "x" : "—"),
-      row("Experience", official ? INF : fmt0.format(p.xp || 0)));
-    const stats = h("section.pf-stats", {}, main, panel);
-    if (worker && !official) {
-      fetch(`${worker}/play/progress?player=${encodeURIComponent(p.id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
-        if (!graph.isConnected) return;
-        const days = ((d && d.days) || []).filter((x) => Array.isArray(x) && x[3] > 0).slice(-90);
-        graph.replaceChildren(days.length >= 2 ? progressGraphs(days) : h("p.pf-graph-none", { text: "The graphs fill in after a couple of days on the ranking." }));
-        const sk = d && d.skills;
-        if (sk && (sk.axes || []).length >= 3 && sk.plays > 0 && skillsSlot.isConnected) skillsSlot.replaceWith(skillsSection(sk));
-      });
-    }
+    // (3.0) their place, big, in the head: the world and their country, like the Discord card
+    const ranked = players.filter((x) => !isOfficial(x));
+    const countryRank = p.country ? ranked.filter((x) => x.country === p.country).sort((a, b) => a.rank - b.rank).findIndex((x) => x.id === p.id) + 1 : 0;
+    const topPct = !official && ranked.length ? Math.max(1, Math.ceil(p.rank / ranked.length * 100)) : 0;
+    const rankBox = (label, value, col, extra) => h("div.pf-rk", { style: `--s:${col}` }, h("small", { text: label }), h("b", { text: value }), extra || null);
+    const ranks = h("div.pf-ranks", {},
+      rankBox("Global rank", official ? INF : "#" + fmt0.format(p.rank), "var(--yellow)", topPct ? h("span.pf-top", { text: `Top ${topPct}%` }) : null),
+      countryRank > 0 && !official ? rankBox("Country rank", "#" + fmt0.format(countryRank), "var(--cyan)", h("span.pf-top", { text: regionName(p.country) })) : null);
+    card.querySelector(".pf-id").append(ranks);
 
-    // followers and the level
+    // the numbers, in one row of tiles
+    const achN = h("small.prof-tab-n", { text: fmt0.format(Object.keys(p.achievements || {}).length) });
+    // (2.2.2) achievements count the ones the game has now, like the achievements section
+    if (!official) loadAchDefs().then((defs) => { if (defs.length) achN.textContent = fmt0.format(defs.filter((d) => (p.achievements || {})[d.id]).length); });
+    const tile = (label, value, col) => h("div.pf-tile", { style: `--s:${col}` }, h("small", { text: label }), typeof value === "string" ? h("b", { text: value }) : value);
+    const strip = h("section.pf-strip", {},
+      tile("Performance", official ? INF + " PR" : fmt0.format(p.pp || 0) + " PR", "var(--pink)"),
+      tile("Accuracy", official ? "100.00%" : fmt2.format(p.accuracy || 0) + "%", "var(--cyan)"),
+      tile("Play count", official ? INF : fmt0.format(p.playCount || 0), "var(--green)"),
+      tile("Play time", official ? INF : p.playTimeMs ? playTime(p.playTimeMs) : "—", "var(--orange)"),
+      tile("Max combo", official ? INF + "x" : p.maxCombo ? fmt0.format(p.maxCombo) + "x" : "—", "var(--yellow)"),
+      // (3.2) the level here (the graph and the level box are on the Stats tab now)
+      tile("Level", h("span.pf-tlv", { title: official ? "Max level" : `${fmt0.format(Math.round((xpFor((p.level || 1) + 1) - xpFor(p.level || 1)) * (1 - Math.max(0, Math.min(1, p.levelProgress || 0)))))} xp to level ${(p.level || 1) + 1}` },
+        h("b", { text: official ? "1000" : String(p.level || 1) }),
+        h("i.pf-tlvbar", {}, h("i", { style: `width:${official ? 100 : Math.round(Math.max(0, Math.min(1, p.levelProgress || 0)) * 100)}%` }))), "var(--purple)"));
+
+    // the graph, and the level beside it
+    const graph = h("div.pf-graph");
     const lv = official ? 1000 : (p.level || 1);
     const prog = official ? 1 : Math.max(0, Math.min(1, p.levelProgress || 0));
     const toNext = Math.round((xpFor(lv + 1) - xpFor(lv)) * (1 - prog));
     const level = h("div.pf-level", { title: official ? "Max level" : `${fmt0.format(toNext)} xp to level ${lv + 1}` },
-      h("div.pf-lvbar", {}, h("div.pf-lvfill", { style: `width:${Math.round(prog * 100)}%` }), h("span", { text: Math.round(prog * 100) + "%" })),
-      h("div.pf-oct", {}, h("span", { text: String(lv) })));
-    // their linked Discord sits at the bottom right of the head
-    // and a live-on-Twitch box at the top right, above it
-    const dcSlot = h("div.pf-discord");
-    card.querySelector(".pf-id").append(h("div.pf-side", {}, h("div.pf-liveslot"), h("div.pf-side-low", {}, worker && !official ? shareBtn : null, dcSlot)));
-    const social = socialRow(p, (s) => markLive(card, avatar, s.twitch), dcSlot);
-    const bar = h("section.pf-bar", {}, social, level);
+      h("div.pf-oct", {}, h("span", { text: String(lv) })),
+      h("div.pf-lvtext", {}, h("small", { text: "Level" }), h("b", { text: official ? "Max level" : `${fmt0.format(toNext)} xp to level ${lv + 1}` })),
+      h("div.pf-lvbar", {}, h("div.pf-lvfill", { style: `width:${Math.round(prog * 100)}%` }), h("span", { text: Math.round(prog * 100) + "%" })));
+    const row = (label, value) => h("div", {}, h("dt", { text: label }), h("dd", { text: value }));
+    const panel = h("dl.pf-panel", {},
+      row("Total score", official ? INF : fmt0.format(p.totalScore || 0)),
+      row("Full combos", official ? INF : fmt0.format(p.fullCombos || 0)),
+      row("Experience", official ? INF : fmt0.format(p.xp || 0)));
+    const stats = h("section.pf-stats", {}, h("div.pf-main", {}, graph), h("div.pf-lvcol", {}, level, panel));
+    const skillsSlot = h("div.pf-skills-slot");
+    let skillsAsked = false;
+    if (worker && !official) {
+      progressOf(p.id).then((d) => {
+        const days = ((d && d.days) || []).filter((x) => Array.isArray(x) && x[3] > 0).slice(-90);
+        graph.replaceChildren(days.length >= 2 ? progressGraphs(days) : h("p.pf-graph-none", { text: "The graphs fill in after a couple of days on the ranking." }));
+        const sk = d && d.skills;
+        skillsAsked = true;
+        if (sk && (sk.axes || []).length >= 3 && sk.plays > 0) skillsSlot.replaceChildren(skillsSection(sk));
+      });
+    } else graph.replaceChildren(h("p.pf-graph-none", { text: official ? "The official OCTIVE account isn't ranked." : "" }));
 
-    // everything else, in sections
-    const overview = h("div.prof-overview");
-    if (p.devFriend && !ROLES[p.id]) overview.append(h("div.devfriend", {}, h("span.heart", { text: "♥" }), " Friends with DEV ", h("span.devfriend-sub", { text: "· friends with the developer of OCTIVE" })));
+    // followers and their links; their linked Discord and live box sit in the head
+    const dcSlot = h("div.pf-discord");
+    card.querySelector(".pf-id").append(h("div.pf-side", {}, h("div.pf-liveslot"), h("div.pf-acts", {}, worker && !official ? shareBtn : null, worker && !official ? embedBtn : null, !official ? compareBtn : null), dcSlot));
+    const social = socialRow(p, (s) => markLive(card, avatar, s.twitch), dcSlot);
+    const bar = h("section.pf-bar", {}, social);
+
+    // (3.2) the profile in tabs, so it isn't one long scroll (the user: "it requires too much scrolling"): Profile (about,
+    // showcase, their five best plays, rivals), Plays, Stats (skills and play stats), Achievements (with their support),
+    // Workshop (what they shared), and who they follow / are followed by / are friends with. "Charts for them" is gone (the
+    // user didn't like it).
+    const mainCol = h("div.pf-col-main"), sideCol = h("aside.pf-col-side");
+    const overview = h("div.prof-overview.pf-two", {}, mainCol, sideCol);
+    if (p.devFriend && !ROLES[p.id]) mainCol.append(h("div.devfriend", {}, h("span.heart", { text: "♥" }), " Friends with DEV ", h("span.devfriend-sub", { text: "· friends with the developer of OCTIVE" })));
     if (p.bio && p.bio.trim()) {
       const text = h("p.bio-text");
       renderBio(text, p.bio);
-      overview.append(h("section.bio", {}, h("h2", { text: "About me" }), text));
+      mainCol.append(h("section.bio", {}, h("h2", { text: "About me" }), text));
     }
     // the title bought in the points shop (under the name) and the showcase
     const showcase = h("section.showcase", { hidden: true }, h("h2", { text: "Showcase" }), h("div.sc-row"));
-    overview.append(showcase);
-    const skillsSlot = h("div.pf-skills-slot");
-    overview.append(skillsSlot);
-    // (2.1.4) their top plays and recent plays, as the global ranking counts them
-    if (!official) overview.append(playsSection(p));
+    mainCol.append(showcase);
+    // their five best plays here; every play on the Plays tab
+    if (!official) mainCol.append(playsSection(p, { limit: 5, more: () => { openTab("plays"); tabs.scrollIntoView({ behavior: "smooth", block: "start" }); } }));
     loadCosmetics().then((cz) => {
       const mine = cz.players[p.id] || {};
       const title = mine.title && cz.titles[mine.title];
@@ -889,37 +1112,342 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       for (let i = 0; i < 3; i++) scRow.append(songs[i] ? showcaseCard(songs[i]) : h("div.sc-empty", { text: "Empty" }));
       showcase.hidden = false;
     });
-    const sup = supporterSection(p);
-    if (sup) overview.append(sup);
-    overview.append(achievementsSection(p));
-    // what they shared to the Workshop
-    const uploads = h("section.ws-profile", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: "Workshop uploads" }), h("a.more", { href: "workshop" }, "Workshop →")), h("div.ws-grid"));
-    overview.append(uploads);
-    fetch(`${worker}/api/items?creator=${encodeURIComponent(p.id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
-      const items = (d && d.items) || [];
-      if (!items.length || !uploads.isConnected) return;
-      uploads.querySelector(".section-title").textContent = `Workshop uploads · ${items.length}`;
-      uploads.querySelector(".ws-grid").replaceChildren(...items.map(workshopCard));
-      uploads.hidden = false;
-    });
-
-    // the profile, and who they follow / are followed by / are friends with
+    if (!official) { const rv = rivalsSection(p); if (rv) sideCol.append(rv); }
+    if (!mainCol.children.length && !sideCol.children.length) mainCol.append(h("p.empty", { text: "Nothing here yet." }));
+    // what they shared to the Workshop (asked for now, so its tab can say how many)
+    const uploads = worker && !official ? cachedJson(`${worker}/api/items?creator=${encodeURIComponent(p.id)}`) : Promise.resolve(null);
+    // the other tabs are made the first time they're opened
+    const makers = {
+      plays: () => playsSection(p),
+      stats: () => {
+        const none = h("p.empty.pf-stats-none", { text: "Their stats show up after a few plays on the ranking.", hidden: true });
+        const ps = playStatsSection(p);
+        const box = h("div.pf-stats-wrap", {}, stats, h("div.pf-two.pf-stats-tab", {}, h("div.pf-col-main", {}, skillsSlot, none), h("aside.pf-col-side", {}, ps)));
+        setTimeout(() => { none.hidden = !(skillsAsked && !skillsSlot.children.length && ps.hidden); }, 2500);
+        return box;
+      },
+      achievements: () => h("div.pf-ach-tab", {}, supporterSection(p) || "", achievementsSection(p)),
+      workshop: () => pfWorkshop(p, uploads),
+    };
+    const built = {};
     const pane = h("div.prof-pane");
     const tabBtns = {};
-    const tabs = h("nav.prof-tabs", {}, ...[["overview", "Profile"], ["followers", "Followers"], ["following", "Following"], ["friends", "Friends"]].map(([k, label]) =>
-      (tabBtns[k] = h("button.prof-tab", { type: "button", onclick: () => openTab(k) }, label))));
+    const TABS = [["overview", "Profile"], ...(official ? [] : [["plays", "Plays"], ["stats", "Stats"]]), ["achievements", "Achievements"], ...(official ? [] : [["workshop", "Workshop"]]),
+      ["followers", "Followers"], ["following", "Following"], ["friends", "Friends"]];
+    const tabs = h("nav.prof-tabs", { role: "tablist", "aria-label": "Profile" }, ...TABS.map(([k, label]) =>
+      (tabBtns[k] = h("button.prof-tab", { type: "button", role: "tab", onclick: () => openTab(k) }, label))));
+    if (!official) tabBtns.achievements.append(achN);
+    uploads.then((d) => { const n = ((d && d.items) || []).length; if (n && tabBtns.workshop) tabBtns.workshop.append(h("small.prof-tab-n", { text: fmt0.format(n) })); });
     function openTab(k) {
-      for (const [key, b] of Object.entries(tabBtns)) b.classList.toggle("active", key === k);
-      if (k === "overview") { pane.replaceChildren(overview); return; }
-      pane.replaceChildren(peopleList(p, k));
+      for (const [key, b] of Object.entries(tabBtns)) { b.classList.toggle("active", key === k); b.setAttribute("aria-selected", String(key === k)); }
+      if (k === "overview") pane.replaceChildren(overview);
+      else if (makers[k]) { built[k] = built[k] || makers[k](); pane.replaceChildren(built[k]); }
+      else pane.replaceChildren(peopleList(p, k));
     }
     openTab("overview");
     social.addEventListener("open-list", (e) => { openTab(e.detail); tabs.scrollIntoView({ behavior: "smooth", block: "start" }); });
-    app.replaceChildren(h("a.back", { href: "rankings" }, "← All players"), h("div.pf", {}, card, stats, bar), tabs, pane);
+    app.replaceChildren(h("a.back", { href: "rankings" }, "← All players"), h("div.pf", {}, card, strip, bar), tabs, pane);
     document.title = `${p.name} · OCTIVE`;
     setTimeout(giftPopup, 400);
     window.scrollTo(0, 0);
   }
+
+  // ---------------------------------------------------------------- 3.0: rivals, play stats and charts picked for a player
+  /** The players just above and below on the ranking, how far apart they are, and where this player stands. */
+  function rivalsSection(p) {
+    const list = (data ? data.players : []).filter((x) => !isOfficial(x));
+    const i = list.findIndex((x) => x.id === p.id);
+    if (i < 0 || list.length < 2) return null;
+    const n = list.length;
+    const pct = Math.max(1, Math.ceil(p.rank / n * 100));
+    const near = list.slice(Math.max(0, i - 2), Math.min(n, i + 3));
+    const above = i > 0 ? list[i - 1] : null;
+    const pace = h("p.rv-pace");
+    const rowsEl = h("div.rv-list", {}, ...near.map((x) => {
+      const self = x.id === p.id;
+      const gap = (x.pp || 0) - (p.pp || 0);
+      const txt = self ? "" : gap > 0 ? `+${fmt0.format(Math.max(1, Math.ceil(gap)))}` : `−${fmt0.format(Math.ceil(-gap))}`;
+      const rowEl = h(self ? "div.rv-row.self" : "a.rv-row", self ? {} : { href: profileHref(x.id) },
+        h("span.rv-rank", { text: "#" + fmt0.format(x.rank) }), smallAvatar(x.id, x.name, x.avatarHash),
+        h("span.rv-name", {}, h("b", { text: x.name || "Player" }), h("small", { text: fmt0.format(x.pp || 0) + " PR" })),
+        self ? h("span.rv-you", { text: "here" }) : h("span.rv-gap" + (gap > 0 ? ".up" : ".down"), { text: txt, title: gap > 0 ? `${p.name} needs ${fmt0.format(Math.max(1, Math.ceil(gap)))} PR more to pass them` : `${fmt0.format(Math.ceil(-gap))} PR behind ${p.name}` }));
+      return h("div.rv-item", {}, rowEl, self ? null : h("a.rv-vs", { href: profileHref(p.id) + "?vs=" + encodeURIComponent(x.id), title: `Compare ${p.name} and ${x.name}` }, "vs"));
+    }));
+    const box = h("section.pf-rivals.side-card", {},
+      h("div.side-card-head", {}, h("h2", { text: "Rivals" }), h("span.rv-pct", { text: p.rank === 1 ? "#1 in the world" : `Top ${pct}%` })),
+      h("p.rv-sub", { text: `#${fmt0.format(p.rank)} of ${fmt0.format(n)} ranked players · PR gap beside each` }),
+      rowsEl, pace);
+    // at this week's pace, when would they pass the next one up?
+    if (above) progressOf(p.id).then((d) => {
+      const days = ((d && d.days) || []).filter((x) => Array.isArray(x) && x[1] > 0);
+      if (days.length < 2 || !pace.isConnected) return;
+      const last = days[days.length - 1], weekAgo = days[Math.max(0, days.length - 8)];
+      const span = Math.max(1, Math.round((Date.parse(last[0]) - Date.parse(weekAgo[0])) / 86400000));
+      const perDay = ((last[1] || 0) - (weekAgo[1] || 0)) / span;
+      const gap = (above.pp || 0) - (p.pp || 0);
+      if (perDay <= 0.5) { pace.textContent = "No PR gained in the last week."; return; }
+      const dd = Math.ceil(gap / perDay);
+      pace.replaceChildren("At this week's pace ", h("b", { text: `(+${fmt0.format(perDay)} PR a day)` }), `, ${above.name} is about ${dd <= 1 ? "a day" : fmt0.format(dd) + " days"} away.`);
+    });
+    return box;
+  }
+
+  /** SS/S/A… counts, and how their best plays spread over star ratings and accuracy (from every chart's best play). */
+  function playStatsSection(p) {
+    const box = h("section.pf-pstats.side-card", { hidden: true });
+    playsOf(p.id).then((d) => {
+      const top = (d && d.top) || [];
+      if (!top.length) return;
+      const grades = ["SS", "S", "A", "B", "C", "D"];
+      const count = (g) => top.filter((t) => t.grade === g).length;
+      const fcs = top.filter((t) => t.fc).length;
+      const starB = Array.from({ length: 10 }, (_, i) => top.filter((t) => Math.min(9, Math.floor(Number(t.stars) || 0)) === i).length);
+      const firstStar = Math.max(0, starB.findIndex((c) => c > 0)), lastStar = 9 - [...starB].reverse().findIndex((c) => c > 0);
+      const accB = [[99, 100.01, "99%+"], [98, 99, "98–99%"], [97, 98, "97–98%"], [95, 97, "95–97%"], [90, 95, "90–95%"], [0, 90, "under 90%"]].map(([lo, hi, label]) =>
+        [label, top.filter((t) => (Number(t.acc) || 0) >= lo && (Number(t.acc) || 0) < hi).length]);
+      const maxStar = Math.max(1, ...starB), maxAcc = Math.max(1, ...accB.map((x) => x[1]));
+      const avgAcc = top.reduce((s, t) => s + (Number(t.acc) || 0), 0) / top.length;
+      box.replaceChildren(
+        h("div.side-card-head", {}, h("h2", { text: "Play stats" }), h("span.ps-n", { text: `${fmt0.format(top.length)} charts` })),
+        h("div.ps-grades", {}, ...grades.map((g) => h("div.ps-grade", { style: `--g:${GRADE_COL[g]}` }, h("b", { text: g }), h("span", { text: fmt0.format(count(g)) })))),
+        h("p.ps-line", {}, h("b", { text: fmt0.format(fcs) }), ` full combo${fcs === 1 ? "" : "s"} · `, h("b", { text: fmt2.format(avgAcc) + "%" }), " average accuracy"),
+        h("h3.ps-cap", { text: "Star ratings" }),
+        h("div.ps-stars", {}, ...starB.slice(firstStar, lastStar + 1).map((c, k) => {
+          const st = firstStar + k;
+          return h("div.ps-col", { title: `${c} chart${c === 1 ? "" : "s"} at ${st}–${st + 1}★` },
+            h("span.ps-colbar", {}, h("i", { style: `height:${Math.max(c ? 8 : 0, Math.round(c / maxStar * 100))}%;background:${starColor(st + 0.5)}` })),
+            h("small", { text: st + "★" }), h("b", { text: String(c) }));
+        })),
+        h("h3.ps-cap", { text: "Accuracy" }),
+        h("div.ps-acc", {}, ...accB.map(([label, c]) => h("div.ps-arow", {}, h("span", { text: label }), h("span.ps-abar", {}, h("i", { style: `width:${Math.round(c / maxAcc * 100)}%` })), h("b", { text: String(c) })))));
+      box.hidden = false;
+    });
+    return box;
+  }
+
+  /** (3.2) A profile's Workshop tab: everything they shared, newest first, as the Workshop's cards (one kind at a time
+   *  when they shared several kinds). */
+  function pfWorkshop(p, uploads) {
+    const box = h("section.pf-ws", {}, h("div.wk-grid", {}, ...wkGhosts(2)));
+    uploads.then((d) => {
+      const items = ((d && d.items) || []).slice().sort((x, y) => (y.at || 0) - (x.at || 0));
+      if (!items.length) {
+        box.replaceChildren(h("div.wk-empty", {}, h("b", { text: "Nothing shared yet" }), h("p", { text: "When they share a chart, skin, theme or style from the game, it shows up here." })));
+        return;
+      }
+      const kinds = WS_TYPES.filter(([t]) => items.some((it) => it.type === t));
+      let kind = "";
+      const grid = h("div.wk-grid");
+      const chips = h("div.pf-ws-kinds");
+      const paint = () => {
+        chips.replaceChildren(...(kinds.length > 1 ? [["", "All"], ...kinds].map(([t, name]) =>
+          h("button.wk-chip" + (kind === t ? ".on" : ""), { type: "button", "aria-pressed": String(kind === t), onclick: () => { kind = t; paint(); } },
+            `${name} · ${fmt0.format(t ? items.filter((it) => it.type === t).length : items.length)}`)) : []));
+        grid.replaceChildren(...items.filter((it) => !kind || it.type === kind).map(wkCard));
+      };
+      paint();
+      const likes = items.reduce((n, it) => n + (it.likes || 0), 0), dls = items.reduce((n, it) => n + (it.downloads || 0), 0);
+      box.replaceChildren(
+        h("div.pf-ws-head", {}, h("h2.section-title", { text: "Workshop" }),
+          h("span.pf-ws-sum", { text: `${fmt0.format(items.length)} shared · ${fmt0.format(dls)} download${dls === 1 ? "" : "s"} · ♥ ${fmt0.format(likes)}` }), chips),
+        grid);
+    });
+    return box;
+  }
+
+  // ---------------------------------------------------------------- 3.0: a profile's card as a picture (forums, READMEs, stream panels)
+  async function embedModal(p) {
+    const close = () => { layer.remove(); document.removeEventListener("keydown", esc); };
+    const esc = (e) => { if (e.key === "Escape") close(); };
+    const pic = `${worker}/card/${encodeURIComponent(p.id)}.png`;
+    const rows = h("div.embed-rows", {}, h("p.empty", { text: "…" }));
+    const shot = h("div.embed-pic");
+    shot.append(waitPic(shot, h("img", { src: pic, alt: `${p.name}'s OCTIVE card`, width: 600, height: 300 })));
+    const layer = h("div.modal-layer", { onmousedown: (e) => { if (e.target === layer) close(); } },
+      h("div.embed-modal", { role: "dialog", "aria-modal": "true", "aria-label": "Embed this profile" },
+        h("div.embed-head", {}, h("div", {}, h("p.eyebrow", { text: "Embed" }), h("h2", { text: `${p.name}'s card, anywhere` })), h("button.btn.small.ghost", { type: "button", onclick: close }, "Close")),
+        h("p.embed-sub", { text: "The picture keeps itself up to date: the rank, PR and accuracy change on it as they play. Paste it in a forum signature, a GitHub README or a Twitch panel." }),
+        shot, rows));
+    document.body.append(layer);
+    document.addEventListener("keydown", esc);
+    const link = shareLink(await profileLinkKey(p));
+    const name = String(p.name || "Player").replace(/[[\]<>"]/g, "");
+    const codes = [["Link", link], ["Picture", pic], ["Markdown", `[![${name} on OCTIVE](${pic})](${link})`],
+      ["BBCode", `[url=${link}][img]${pic}[/img][/url]`], ["HTML", `<a href="${link}"><img src="${pic}" alt="${name} on OCTIVE" width="600"></a>`]];
+    rows.replaceChildren(...codes.map(([label, value]) => {
+      const input = h("input.embed-code", { readonly: true, value, "aria-label": label, onfocus: (e) => e.currentTarget.select() });
+      const btn = h("button.btn.small", { type: "button" }, "Copy");
+      btn.addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(value); btn.textContent = "Copied"; } catch { input.select(); btn.textContent = "Press Ctrl C"; }
+        setTimeout(() => { btn.textContent = "Copy"; }, 1600);
+      });
+      return h("div.embed-row", {}, h("span.embed-cap", { text: label }), input, btn);
+    }));
+  }
+
+  // ---------------------------------------------------------------- 3.0: two players side by side
+  function comparePage(a, bKey) {
+    document.title = `Compare · ${a.name} · OCTIVE`;
+    setCrumb("Compare players");
+    const b = bKey && bKey !== "pick" ? (findPlayer(bKey) || findByName(bKey)[0] || null) : null;
+    const picker = comparePicker(a, b);
+    if (!b || b.id === a.id) {
+      app.replaceChildren(h("a.back", { href: profileHref(a.id) }, `← ${a.name}`),
+        h("section.page-head", {}, h("p.eyebrow", { text: "Compare players" }), h("h1", { text: `${a.name} vs …` }), h("p.sub", { text: "Pick a player to put beside them: their stats, graphs and skills side by side, and every chart they've both played." })),
+        picker);
+      picker.querySelector("input")?.focus();
+      return;
+    }
+    const side = (p, cls) => {
+      const av = h("div.card-avatar", {}, h("img", { alt: "", hidden: true }), h("span.initial"), h("span.dot", { hidden: true }));
+      setAvatar(av, p);
+      const nm = h("span.cmp-name"); nameInto(nm, p);
+      return h("a.cmp-side." + cls, { href: profileHref(p.id) }, av, h("div.cmp-who", {}, nm,
+        h("small", { text: isOfficial(p) ? "Official account" : `#${fmt0.format(p.rank)} · ${fmt0.format(p.pp || 0)} PR` + (p.country ? ` · ${regionName(p.country)}` : "") })));
+    };
+    const tally = h("span.cmp-tally", { text: "" });
+    const head = h("section.cmp-head.feature-card", {}, side(a, "a"), h("div.cmp-vs", {}, h("b", { text: "VS" }), tally), side(b, "b"));
+    // stat by stat: the better one lights up
+    const achOf = (p) => Object.keys(p.achievements || {}).length;
+    const STATS = [
+      ["Global rank", (p) => isOfficial(p) ? null : p.rank, (v) => "#" + fmt0.format(v), true],
+      ["Performance", (p) => p.pp || 0, (v) => fmt0.format(v) + " PR"],
+      ["Accuracy", (p) => p.accuracy || 0, (v) => fmt2.format(v) + "%"],
+      ["Level", (p) => p.level || 1, (v) => "Lv" + fmt0.format(v)],
+      ["Play count", (p) => p.playCount || 0, (v) => fmt0.format(v)],
+      ["Play time", (p) => p.playTimeMs || 0, (v) => playTime(v)],
+      ["Max combo", (p) => p.maxCombo || 0, (v) => fmt0.format(v) + "x"],
+      ["Full combos", (p) => p.fullCombos || 0, (v) => fmt0.format(v)],
+      ["Total score", (p) => p.totalScore || 0, (v) => fmtCount(v)],
+      ["Achievements", achOf, (v) => fmt0.format(v)],
+    ];
+    let winsA = 0, winsB = 0;
+    const duelRow = (label, va, vb, fmt, lowerBetter) => {
+      if (va == null || vb == null) return null;
+      const better = va === vb ? 0 : (lowerBetter ? va < vb : va > vb) ? -1 : 1;
+      if (better < 0) winsA++; else if (better > 0) winsB++;
+      const sa = lowerBetter ? 1 / Math.max(1, va) : va, sb = lowerBetter ? 1 / Math.max(1, vb) : vb, mx = Math.max(sa, sb) || 1;
+      return h("div.cmp-row", {},
+        h("b.cmp-v.a" + (better < 0 ? ".win" : ""), { text: fmt(va) }),
+        h("span.cmp-bar.a", {}, h("i", { style: `width:${Math.round(sa / mx * 100)}%` })),
+        h("span.cmp-label", { text: label }),
+        h("span.cmp-bar.b", {}, h("i", { style: `width:${Math.round(sb / mx * 100)}%` })),
+        h("b.cmp-v.b" + (better > 0 ? ".win" : ""), { text: fmt(vb) }));
+    };
+    const duel = h("section.cmp-duel.side-card", {}, ...STATS.map(([label, get, fmt, low]) => duelRow(label, get(a), get(b), fmt, low)));
+    const skillRow = h("div.cmp-skillrow");
+    duel.append(skillRow);
+    const paintTally = () => { tally.textContent = winsA === winsB ? `Level on stats, ${winsA}–${winsB}` : `${winsA > winsB ? a.name : b.name} leads ${Math.max(winsA, winsB)}–${Math.min(winsA, winsB)}`; };
+    paintTally();
+    const graphs = h("section.cmp-graphs.side-card", {}, h("div.side-card-head", {}, h("h2", { text: "Over time" })), h("p.empty", { text: "Loading…" }));
+    const skills = h("section.cmp-skills.side-card", { hidden: true });
+    const common = h("section.cmp-common.side-card", {}, h("div.side-card-head", {}, h("h2", { text: "Charts they've both played" })), h("p.empty", { text: "Loading…" }));
+    app.replaceChildren(h("a.back", { href: profileHref(a.id) }, `← ${a.name}`), head, picker, h("div.cmp-grid", {}, duel, h("div.cmp-col", {}, graphs, skills)), common);
+    window.scrollTo(0, 0);
+    // graphs and skills
+    Promise.all([progressOf(a.id), progressOf(b.id)]).then(([pa, pb]) => {
+      if (!graphs.isConnected) return;
+      const da = ((pa && pa.days) || []).filter((x) => Array.isArray(x) && x[3] > 0).slice(-90), db = ((pb && pb.days) || []).filter((x) => Array.isArray(x) && x[3] > 0).slice(-90);
+      if (da.length + db.length < 3) graphs.replaceChildren(h("div.side-card-head", {}, h("h2", { text: "Over time" })), h("p.empty", { text: "Not enough days on the ranking to draw yet." }));
+      else graphs.replaceChildren(h("div.side-card-head", {}, h("h2", { text: "Over time" }), h("span.cmp-key", {}, h("i.a"), a.name, h("i.b"), b.name)), duoGraphs(da, db));
+      const ka = pa && pa.skills, kb = pb && pb.skills;
+      if (ka && kb && (ka.axes || []).length >= 3 && (kb.axes || []).length >= 3) {
+        skills.replaceChildren(h("div.side-card-head", {}, h("h2", { text: "Skills" }), h("span.cmp-key", {}, h("i.a"), a.name, h("i.b"), b.name)), duoRadar(ka, kb));
+        skills.hidden = false;
+        const r = duelRow("Skill level", Number(ka.overall) || 0, Number(kb.overall) || 0, (v) => "★" + v.toFixed(1));
+        if (r) { skillRow.replaceWith(r); paintTally(); }
+      }
+    });
+    // the charts both played (their best play on each), who did better
+    Promise.all([playsOf(a.id), playsOf(b.id)]).then(([pa, pb]) => {
+      if (!common.isConnected) return;
+      const mb = new Map(((pb && pb.top) || []).map((t) => [t.board, t]));
+      const both = ((pa && pa.top) || []).filter((t) => t.board && mb.has(t.board)).map((t) => [t, mb.get(t.board)]).sort((x, y) => (y[0].stars || 0) - (x[0].stars || 0));
+      const head2 = h("div.side-card-head", {}, h("h2", { text: "Charts they've both played" }));
+      if (!both.length) { common.replaceChildren(head2, h("p.empty", { text: "No charts in common yet." })); return; }
+      let wa = 0, wb = 0;
+      const rowsEl = both.map(([ta, tb]) => {
+        const win = (ta.pp || 0) === (tb.pp || 0) ? 0 : (ta.pp || 0) > (tb.pp || 0) ? -1 : 1;
+        if (win < 0) wa++; else if (win > 0) wb++;
+        const thumb = h("span.cm-pic");
+        if (ta.pic) thumb.append(waitPic(thumb, h("img", { src: ta.pic, alt: "", loading: "lazy" })));
+        const cell = (t, w) => h("span.cm-play" + (w ? ".win" : ""), {}, h("b", { text: fmt0.format(t.pp || 0) + " PR" }), h("small", { text: `${fmt2.format(t.acc || 0)}% · ${t.grade || "–"}${t.fc ? " · FC" : ""}` }));
+        return h("div.cm-row", {}, cell(ta, win < 0), h("span.cm-song", {}, thumb, h("span", {}, h("b", { text: ta.title, title: ta.title }),
+          h("small", { text: [ta.difficulty, ta.keys ? ta.keys + "K" : "", "★ " + (ta.stars || 0).toFixed(2)].filter(Boolean).join(" · ") }))), cell(tb, win > 0));
+      });
+      head2.append(h("span.cmp-key", {}, h("i.a"), `${a.name} ${wa}`, h("i.b"), `${b.name} ${wb}`));
+      common.replaceChildren(head2, h("div.cm-list", {}, ...rowsEl));
+    });
+  }
+  /** "Compare with…": type a name, pick from the list (or a player near them on the ranking). */
+  function comparePicker(a, b) {
+    const input = h("input", { type: "search", placeholder: b ? "Compare with someone else…" : "Type a player's name", autocomplete: "off", "aria-label": "Player to compare with" });
+    const list = h("div.cmp-sugg");
+    const near = () => { const l = (data ? data.players : []).filter((x) => !isOfficial(x)); const i = l.findIndex((x) => x.id === a.id); return l.slice(Math.max(0, i - 3), i + 4).filter((x) => x.id !== a.id && (!b || x.id !== b.id)); };
+    const paint = () => {
+      const q = input.value.trim();
+      const found = (q ? findByName(q) : near()).filter((x) => x.id !== a.id && !isOfficial(x)).slice(0, 6);
+      list.replaceChildren(...(found.length ? [h("span.cmp-sugg-cap", { text: q ? "Players" : "Near them on the ranking" })] : []), ...found.map((x) => h("a.cmp-pick", { href: profileHref(a.id) + "?vs=" + encodeURIComponent(x.id) }, smallAvatar(x.id, x.name, x.avatarHash), h("span", {}, h("b", { text: x.name }), h("small", { text: `#${fmt0.format(x.rank)} · ${fmt0.format(x.pp || 0)} PR` })))));
+    };
+    input.addEventListener("input", paint);
+    paint();
+    return h("section.cmp-picker", {}, h("label.search", {}, (() => { const s = document.createElement("span"); s.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>'; return s.firstChild; })(), input), list);
+  }
+  /** Two players' days in one graph: PR, rank or accuracy, on the same dates. */
+  function duoGraphs(da, db) {
+    const host = h("div.duo-graphs"), tabs = h("div.pf-gtabs");
+    const metrics = [["PR", 1], ["Rank", 3], ["Accuracy", 2]];
+    let cur = 1;
+    const paint = () => {
+      tabs.replaceChildren(...metrics.map(([label, k]) => h("button" + (k === cur ? ".on" : ""), { type: "button", onclick: () => { cur = k; paint(); } }, label)));
+      host.replaceChildren(tabs, duoGraph(da, db, cur));
+    };
+    paint();
+    return host;
+  }
+  function duoGraph(da, db, k) {
+    const NS = "http://www.w3.org/2000/svg", W = 600, H = 170, pad = 10;
+    const dates = [...new Set([...da, ...db].map((d) => d[0]))].sort();
+    const x = (date) => dates.length < 2 ? W / 2 : dates.indexOf(date) / (dates.length - 1) * W;
+    const vals = [...da, ...db].map((d) => Number(d[k]) || 0);
+    const lo = Math.min(...vals), hi = Math.max(...vals);
+    const up = k !== 3;
+    const y = (v) => hi === lo ? H / 2 : up ? H - pad - (v - lo) / (hi - lo) * (H - pad * 2) : pad + (v - lo) / (hi - lo) * (H - pad * 2);
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("preserveAspectRatio", "none"); svg.setAttribute("class", "duo-svg");
+    let inner = "";
+    for (let i = 1; i < 4; i++) inner += `<line class="duo-grid" x1="0" x2="${W}" y1="${(H / 4 * i).toFixed(1)}" y2="${(H / 4 * i).toFixed(1)}"/>`;
+    const line = (days, cls) => days.length ? `<polyline class="duo-line ${cls}" vector-effect="non-scaling-stroke" points="${days.map((d) => `${x(d[0]).toFixed(1)},${y(Number(d[k]) || 0).toFixed(1)}`).join(" ")}"/>` : "";
+    svg.innerHTML = inner + line(da, "a") + line(db, "b");
+    const fmtV = (v) => k === 3 ? "#" + fmt0.format(v) : k === 1 ? fmt0.format(v) + " PR" : (Number(v) || 0).toFixed(2) + "%";
+    const day = (s) => new Date(s + "T12:00:00Z").toLocaleDateString(undefined, { day: "numeric", month: "short" });
+    return h("div.duo-chart", {}, svg, h("div.duo-axis", {}, h("span", { text: dates.length ? day(dates[0]) : "" }), h("span", { text: `${fmtV(up ? hi : lo)} at best` }), h("span", { text: dates.length ? day(dates[dates.length - 1]) : "" })));
+  }
+  /** Two skill radars laid over each other (the first player's axes; the second's matched by name). */
+  function duoRadar(ka, kb) {
+    const axes = ka.axes || [];
+    const lb = new Map((kb.axes || []).map((x) => [x.key, Number(x.level) || 0]));
+    const la = axes.map((x) => Number(x.level) || 0), lbv = axes.map((x) => lb.get(x.key) || 0);
+    const S = 260, C = S / 2, R = 92, max = Math.max(2, Math.ceil(Math.max(0, ...la, ...lbv) + 0.4));
+    const ang = (i) => -Math.PI / 2 + i * 2 * Math.PI / axes.length;
+    const pt = (i, r) => [C + Math.cos(ang(i)) * r, C + Math.sin(ang(i)) * r];
+    const poly = (vals) => vals.map((v, i) => pt(i, R * Math.min(1, v / max)).map((n) => n.toFixed(1)).join(",")).join(" ");
+    let inner = "";
+    for (let st = 1; st <= max; st += max > 6 ? 2 : 1) inner += `<polygon class="sk-ring" points="${axes.map((_, i) => pt(i, R * st / max).map((n) => n.toFixed(1)).join(",")).join(" ")}"/>`;
+    axes.forEach((_, i) => { const [x2, y2] = pt(i, R); inner += `<line class="sk-spoke" x1="${C}" y1="${C}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}"/>`; });
+    inner += `<polygon class="duo-shape a" points="${poly(la)}"/><polygon class="duo-shape b" points="${poly(lbv)}"/>`;
+    axes.forEach((a, i) => {
+      const [lx, ly] = pt(i, R + 20);
+      const anchor = Math.abs(lx - C) < 8 ? "middle" : lx < C ? "end" : "start";
+      inner += `<text class="sk-label" x="${lx.toFixed(1)}" y="${(ly + 4).toFixed(1)}" text-anchor="${anchor}">${String(a.name).replace(/[<&]/g, "")}</text>`;
+    });
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", `-62 -10 ${S + 124} ${S + 20}`); svg.setAttribute("class", "sk-radar duo-radar"); svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "Skills of both players");
+    svg.innerHTML = inner;
+    return svg;
+  }
+
 
   // ---------------------------------------------------------------- top plays and recent plays (2.1.4)
   const GRADE_COL = { SS: "#ffd23f", S: "#ffb13b", A: "#5ee08a", B: "#5ab8ff", C: "#b69bff", D: "#ff6b8b", F: "#8a8aa0" };
@@ -928,13 +1456,15 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
    * A profile's Top plays (the PR the global ranking counts per chart, best first, with what each counts for in their total)
    * and Recent plays (the plays the server checked, newest first), from /play/plays. Hidden when they have none.
    */
-  function playsSection(p) {
+  /** A player's plays. opts.limit: how many show at first; opts.more: what "see all" does (else "Show more" adds 20). */
+  function playsSection(p, opts = {}) {
+    const limit = opts.limit || 10;
     const list = h("div.pl-list");
     const tabBtns = {};
     const tabs = h("div.pl-tabs", {}, ...[["top", "Top plays"], ["recent", "Recent plays"]].map(([k, label]) =>
-      (tabBtns[k] = h("button.pl-tab", { type: "button", onclick: () => { mode = k; shown = 10; paint(); } }, label))));
-    const box = h("section.pl-section", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: "Plays" }), tabs), list);
-    let data = null, mode = "top", shown = 10;
+      (tabBtns[k] = h("button.pl-tab", { type: "button", onclick: () => { mode = k; shown = limit; paint(); } }, label))));
+    const box = h("section.pl-section", { hidden: true }, h("div.section-head", {}, h("h2.section-title", { text: opts.more ? "Best plays" : "Plays" }), tabs), list);
+    let data = null, mode = "top", shown = limit;
     // (2.2.1) a play's details, in the showcase's popup. A play without its score and judgements (kept before 2.2.1 and
     // not filled in yet) gets them from the player's board score when that's the same play (same accuracy and mods).
     // (2.2.2) the popup opens at once and fills in when the board answers (it waited for the board before); the board is
@@ -965,6 +1495,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       // (2.2.1) the song's picture; the row opens the play's details (like a showcase play), with a link to its Workshop page
       const thumb = h("span.pl-thumb", { "aria-hidden": "true" });
       if (t.pic) { const img = h("img", { src: t.pic, alt: "", loading: "lazy" }); img.onerror = () => img.remove(); thumb.append(img); }
+      if (t.item) thumb.append(playBtn({ id: t.item, title: t.title, preview: t.pic, type: "charts" }, "small"));
       return h("div.pl-row.linked", { "data-place": top ? i + 1 : null, role: "button", tabindex: "0", title: "Details",
         onclick: () => openPlay(t), onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openPlay(t); } },
         onpointerenter: () => { if (missing(t)) boardOf(t); }, onfocus: () => { if (missing(t)) boardOf(t); } },
@@ -987,9 +1518,11 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const rows = (data && data[mode]) || [];
       list.replaceChildren(
         ...(rows.length ? rows.slice(0, shown).map(row) : [h("p.empty", { text: mode === "top" ? "No plays on the ranking yet." : "No recent plays yet." })]),
-        rows.length > shown ? h("button.btn.small.pl-more", { type: "button", onclick: () => { shown += 20; paint(); } }, `Show more (${fmt0.format(rows.length - shown)})`) : null);
+        rows.length > shown ? (opts.more
+          ? h("button.btn.small.pl-more", { type: "button", onclick: opts.more }, `See all ${fmt0.format(rows.length)} ${mode === "top" ? "top" : "recent"} plays`)
+          : h("button.btn.small.pl-more", { type: "button", onclick: () => { shown += 20; paint(); } }, `Show more (${fmt0.format(rows.length - shown)})`)) : null);
     };
-    if (worker) fetch(`${worker}/play/plays?player=${encodeURIComponent(p.id)}`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+    playsOf(p.id).then((d) => {
       if (!d || !box.isConnected && !box.parentNode) return;
       if (!((d.top || []).length || (d.recent || []).length)) return;
       data = d;
@@ -1088,87 +1621,176 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     return (s || x.notes || "").replace(/\*\*/g, "").replace(/<@\d+>/g, "").trim();
   }
 
+  // (3.0) what's in the game, each with its own icon
+  const ABOUT_ICONS = [
+    '<path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>',
+    '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+    '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0zM17 6h3v2a3 3 0 0 1-3 3M7 6H4v2a3 3 0 0 0 3 3"/>',
+    '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
+    '<circle cx="9" cy="8" r="3.5"/><path d="M2 20v-1a5 5 0 0 1 5-5h4a5 5 0 0 1 5 5v1"/><path d="M16 4.2a3.5 3.5 0 0 1 0 6.6M22 20v-1a5 5 0 0 0-3-4.6"/>',
+    '<path d="M4 12a8 8 0 1 0 2.3-5.7"/><path d="M4 4v4h4"/><path d="M12 8v4l3 2"/>',
+    '<path d="M3 17h18M6 13l3-6 3 4 3-7 3 9"/>',
+    '<path d="M12 3a9 9 0 1 0 9 9"/><path d="M12 7v5h5"/><circle cx="18.5" cy="5.5" r="2.5"/>',
+  ];
+
+  // ---------------------------------------------------------------- the front page: a title screen and a song wheel (3.0 arcade)
   function home() {
     const players = data ? data.players : [];
     const online = players.filter((p) => p.online).length;
-    const stat = (label, value, cls) => h("div.hm-stat" + (cls ? "." + cls : ""), {}, h("b", { text: value }), h("span", { text: label }));
-    const ver = stat("Latest version", "…");
-    // (2.2.2) the Workshop's verified charts (checked by OCTIVE: global leaderboards and full PR), where Top performance used to be
-    const verified = h("a.hm-stat", { href: "workshop?verified=1", title: "Charts checked by OCTIVE: global leaderboards and full PR" },
-      h("b", { text: "…" }), h("span", { text: "Verified charts" }));
-    const strip = h("section.hm-stats", {},
-      stat("Online now", data ? fmt0.format(online) : "…", "on"),
-      stat("On the global ranking", data ? fmt0.format(players.length) : "…"),
-      verified,
-      ver);
-    const update = h("aside.hm-update", {}, h("p.empty", { text: "Loading the latest update…" }));
-    const hero = h("section.hm-hero", {},
-      h("div.hm-intro", {},
-        h("h1.hm-name", {}, h("img", { src: "logo.svg", alt: "", width: 52, height: 52 }), h("span.hm-word", { text: "OCTIVE" })),
-        h("p.hm-lead", { text: "A free vertical scrolling rhythm game for 1 to 20 keys, on Windows, Android and in your browser. Bring your osu!mania maps, grab charts other players made from the Workshop, or make your own." }),
-        h("div.cta", {},
-          h("a.btn.primary.big", { href: "downloads" }, "Download"),
-          h("a.btn.big", { href: "play/" }, "Play in the browser"))),
-      update);
+    // the counters, like a game's HUD
+    const hud = (tag, attrs, label, value, col) => h(tag + ".ar-hud-cell", { ...attrs, style: `--s:${col}` }, h("small", { text: label }), h("b", { text: value }), h("i.ar-hud-bar"));
+    const onCell = hud("div", {}, "Online now", data ? fmt0.format(online) : "…", "var(--green)");
+    onCell.querySelector("small").prepend(h("i.hm3-live"));
+    const verCell = hud("a", { href: "updates" }, "Version", "…", "var(--pink)");
+    const verified = hud("a", { href: "workshop?verified=1", title: "Charts checked by OCTIVE: global leaderboards and full PR" }, "Verified charts", "…", "var(--orange)");
+    const hudRow = h("section.ar-hud", {}, onCell, hud("a", { href: "rankings" }, "Ranked players", data ? fmt0.format(players.length) : "…", "var(--cyan)"), verified, verCell);
 
-    const shelf = h("div.hm-shelf", {}, h("p.empty", { text: "Loading the Workshop…" }));
-    const workshop = h("section.hm-sec", {},
-      h("div.section-head", {}, h("h2.section-title", { text: "New in the Workshop" }), h("a.more", { href: "workshop" }, "See all")),
-      shelf);
+    // the title screen
+    const title = h("div.ar-title", {},
+      h("p.ar-kicker", {}, h("span", { text: "Free rhythm game" }), h("span", { text: "1 to 20 keys" }), h("span", { text: "Windows · Android · Browser" })),
+      h("h1.ar-logo", {}, h("img", { src: "logo.svg", alt: "", width: 84, height: 84 }), h("span.ar-word", { text: "OCTIVE", "data-text": "OCTIVE" })),
+      h("p.ar-lead", { text: "A vertical scrolling rhythm game. Bring your osu!mania maps, grab charts other players made in the Workshop, or make your own." }),
+      h("div.ar-start", {},
+        h("a.btn.primary.big.ar-go", { href: "downloads" }, h("span.ar-tri"), "Download free"),
+        h("a.btn.big", { href: "play/" }, "Play in browser")),
+      h("p.ar-press", { text: "Press start" }));
 
-    // (2.1.2) the charts players like most (the same likes as the game's Workshop), where Top players used to be
+    // the song wheel: the Workshop's newest charts; pointing at one shows it big (and it moves on by itself until you do)
+    const jacketImg = h("img", { alt: "" });
+    const jacket = h("a.ar-jacket", { href: "workshop" },
+      h("span.ar-jacket-pic", {}, jacketImg),
+      h("span.ar-jacket-tags"),
+      h("span.ar-jacket-plate", {}, h("b"), h("small")));
+    const bars = h("ol.ar-bars", {}, h("li.ar-bar-wait", { text: "Loading the Workshop…" }));
+    const jacketPlay = h("span.ar-jacket-play");
+    const wheel = h("div.ar-wheel", {}, h("div.ar-wheel-head", {}, h("span", { text: "Song select" }), h("a", { href: "workshop" }, "All charts")), h("div.ar-jacket-wrap", {}, jacket, jacketPlay), bars);
+    const hero = h("section.ar-hero", {}, title, wheel);
+    let wheelItems = [], at = 0, cycle = null, touched = false;
+    function pick(i) {
+      if (!wheelItems.length) return;
+      at = (i + wheelItems.length) % wheelItems.length;
+      const it = wheelItems[at];
+      [...bars.children].forEach((li, k) => li.classList.toggle("on", k === at));
+      jacket.href = "workshop/" + it.id;
+      jacket.classList.remove("in"); void jacket.offsetWidth; jacket.classList.add("in");
+      const holder = jacket.querySelector(".ar-jacket-pic");
+      if (it.preview) { jacketImg.hidden = false; waitPic(holder, jacketImg); jacketImg.src = it.preview; } else jacketImg.hidden = true;
+      jacket.querySelector(".ar-jacket-tags").replaceChildren(
+        it.topStars > 0 ? h("span.ar-star", { text: "★ " + it.topStars.toFixed(2), style: `--s:${starColor(it.topStars)}` }) : null,
+        it.verified ? h("span.ar-ver", { text: "Verified" }) : null,
+        (it.keys || []).length ? h("span.ar-keys", { text: it.keys.map((k) => k + "K").join(" ") }) : null);
+      jacket.querySelector(".ar-jacket-plate b").textContent = it.title;
+      jacketPlay.replaceChildren(playBtn(it, "big") || "");
+      jacket.querySelector(".ar-jacket-plate small").textContent = ["by " + (it.creator || "someone"), it.topPR > 0 ? fmt0.format(Math.round(it.topPR)) + " PR" : ""].filter(Boolean).join(" · ");
+    }
+    const stopCycle = () => { touched = true; clearInterval(cycle); };
+    wheel.addEventListener("pointerenter", stopCycle);
+    wheel.addEventListener("focusin", stopCycle);
+
+    // the news ticker: the latest update, rolling along
+    const ticker = h("a.ar-ticker", { href: "updates" }, h("span.ar-ticker-tag", { text: "News" }), h("span.ar-ticker-run", {}, h("span", { text: "Loading the latest update…" })));
+
+    // (2.1.2) the charts players like most, and (3.0) who's climbing
     const liked = h("ol.hm-top.hm-liked", {}, h("p.empty", { text: "Loading…" }));
-    const board = h("div.hm-col", {},
-      h("div.section-head", {}, h("h2.section-title", { text: "Most liked charts" }), h("a.more", { href: "workshop?sort=liked" }, "Workshop")),
+    const board = h("div.hm-col.hm3-col", {},
+      h("div.section-head", {}, h("h2.section-title", { text: "Most liked" }), h("a.more", { href: "workshop?sort=liked" }, "Workshop")),
       liked);
     fetch(worker + "/api/items?type=charts&sort=liked", { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
-      // the same answer has the number of verified charts (for the stat above)
       verified.querySelector("b").textContent = d && Number.isFinite(d.verifiedCharts) ? fmt0.format(d.verifiedCharts) : "—";
       if (!liked.isConnected) return;
-      const items = ((d && d.items) || []).filter((x) => (x.likes || 0) > 0).slice(0, 8);
+      const items = ((d && d.items) || []).filter((x) => (x.likes || 0) > 0).slice(0, 6);
       if (!items.length) { liked.replaceChildren(h("p.empty", { text: "No likes yet: like a chart in the Workshop, here or in the game." })); return; }
       liked.replaceChildren(...items.map((x, i) => {
         const pic = h("span.hm-cover");
-        if (x.preview) { const img = h("img", { src: x.preview, alt: "", loading: "lazy" }); img.onerror = () => img.remove(); pic.append(img); }
+        if (x.preview) pic.append(waitPic(pic, h("img", { src: x.preview, alt: "", loading: "lazy" })));
         return h("li", {}, h("a", { href: "workshop/" + x.id, "data-place": i + 1 },
-          h("span.hm-rank", { text: "#" + (i + 1) }),
-          pic,
+          h("span.hm-rank", { text: String(i + 1) }), pic,
           h("span.hm-who", {}, h("span.name", { text: x.title, title: x.title }),
-            h("span.hm-by", { text: [x.creator ? "by " + x.creator : "", x.topStars > 0 ? "★ " + x.topStars.toFixed(2) : "", x.verified ? "✓ verified" : ""].filter(Boolean).join(" · ") })),
+            h("span.hm-by", { text: [x.creator ? "by " + x.creator : "", x.topStars > 0 ? "★ " + x.topStars.toFixed(2) : "", x.verified ? "verified" : ""].filter(Boolean).join(" · ") })),
           h("span.hm-pr.hm-likes", { title: `${fmt0.format(x.likes)} like${x.likes === 1 ? "" : "s"}` }, "♥ " + fmt0.format(x.likes))));
       }));
     });
-    const about = h("div.hm-col", {},
-      h("div.section-head", {}, h("h2.section-title", { text: "What's in the game" })),
-      h("dl.hm-list", {}, ABOUT.map(([t, d]) => h("div", {}, h("dt", { text: t }), h("dd", { text: d })))));
+    const climb = h("ol.hm-top.hm3-climb", {}, h("p.empty", { text: "Loading…" }));
+    const climbCol = h("div.hm-col.hm3-col.hm3-climbcol", {},
+      h("div.section-head", {}, h("h2.section-title", { text: "Climbing this week" }), h("a.more", { href: "rankings" }, "Rankings")),
+      climb);
+    if (worker) fetch(worker + "/play/gainers?limit=6", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)).catch(() => null).then((g) => {
+      if (!climb.isConnected) return;
+      const list = ((g && g.players) || []).slice(0, 6);
+      if (!list.length) { climb.replaceChildren(h("p.empty", { text: "Nobody has gained PR this week yet." })); return; }
+      climb.replaceChildren(...list.map((x, i) => h("li", {}, h("a", { href: profileHref(x.playerId), "data-place": i + 1 },
+        h("span.hm-rank", { text: String(i + 1) }), smallAvatar(x.playerId, x.name),
+        h("span.hm-who", {}, h("span.name", { text: x.name || "Player" }), h("span.hm-by", { text: `#${fmt0.format(x.rank || 0)} · ${fmt0.format(x.pp || 0)} PR` })),
+        h("span.hm-pr.hm3-gain", { text: "+" + fmt0.format(x.gain || 0) })))));
+    });
+
+    // mode select: what's in the game
+    const modes = h("section.hm-sec.ar-modes", {},
+      h("div.section-head", {}, h("h2.section-title", { text: "Mode select" }), h("a.more", { href: "about.html" }, "About OCTIVE")),
+      h("div.hm3-feat-grid", {}, ...ABOUT.map(([t, d], i) => {
+        const ic = h("span.hm3-ic"); ic.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${ABOUT_ICONS[i] || ABOUT_ICONS[0]}</svg>`;
+        return h("article.hm3-f", { style: `--c:var(--${["pink", "cyan", "yellow", "orange", "green", "blue", "purple", "teal"][i % 8]})` },
+          h("span.ar-mode-n", { text: String(i + 1).padStart(2, "0") }), ic, h("h3", { text: t }), h("p", { text: d }));
+      })));
 
     const liveStrip = h("section.hm-sec.hm-live", { hidden: true });
     const dailyRow = h("section.hm-sec.hm-daily", {},
-      h("div.section-head", {}, h("h2.section-title", { text: "Today's daily charts" }), h("a.more", { href: "daily" }, "Scores and more")),
+      h("div.section-head", {}, h("h2.section-title", { text: "Daily challenge" }), h("a.more", { href: "daily" }, "Scores")),
       h("div.hm-daily-row", {}, h("p.empty", { text: "Loading today's charts…" })));
-    app.replaceChildren(hero, liveStrip, strip, workshop, dailyRow, h("section.hm-sec.hm-two", {}, board, about));
+    const owner = findPlayer(ROLE_OWNER);
+    const discord = owner && owner.socials ? socialUrl(null, owner.socials.discord) : null;
+    const cta = h("section.ar-cta", {},
+      h("div", {}, h("p.ar-press.on", { text: "Press start" }), h("h2", { text: "Ready?" }),
+        h("p", { text: "Free on Windows, Android and in your browser. Your scores, friends and Workshop follow you everywhere." })),
+      h("div.ar-start", {}, h("a.btn.primary.big", { href: "downloads" }, h("span.ar-tri"), "Get OCTIVE"),
+        discord ? h("a.btn.big", { href: discord, target: "_blank", rel: "noopener" }, "Join the Discord") : h("a.btn.big", { href: "play/" }, "Play in browser")));
+    app.replaceChildren(hero, ticker, hudRow, liveStrip, dailyRow, h("section.hm-sec.hm-two.hm3-two", {}, board, climbCol), modes, cta);
     paintLiveStrip();
     loadDailyRow(dailyRow);
     document.title = "OCTIVE";
 
-    loadRelease().then((m) => { if (m && hero.isConnected) ver.querySelector("b").textContent = "v" + m.version; });
+    loadRelease().then((m) => { if (m && hero.isConnected) verCell.querySelector("b").textContent = "v" + m.version; });
     fetch(worker + "/releases/history.json", { cache: "no-cache" }).then((r) => r.ok ? r.json() : []).catch(() => []).then((hist) => {
-      if (!update.isConnected) return;
+      if (!ticker.isConnected) return;
       const x = (Array.isArray(hist) ? hist : []).find((y) => y && y.version && !/test/i.test(y.version));
-      if (!x) { update.replaceChildren(h("p.empty", { text: "No updates yet." })); return; }
+      if (!x) { ticker.hidden = true; return; }
       const when = x.published ? new Date(x.published).toLocaleDateString(undefined, { day: "numeric", month: "long" }) : "";
-      update.replaceChildren(
-        h("p.hm-kicker", { text: "Latest update" + (when ? ", " + when : "") }),
-        h("h2", { text: "OCTIVE " + x.version }),
-        h("p", { text: releaseSummary(x) }),
-        h("a", { href: "updates/" + x.version }, "Read the patch notes"));
+      ticker.href = "updates/" + x.version;
+      const msg = `OCTIVE ${x.version}${when ? " · " + when : ""} — ${releaseSummary(x)} — Read the patch notes`;
+      // the text twice, so it rolls on without a gap
+      ticker.querySelector(".ar-ticker-run").replaceChildren(h("span", { text: msg }), h("span", { text: msg, "aria-hidden": "true" }));
     });
-    fetch(worker + "/api/items?sort=new", { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
-      if (!shelf.isConnected) return;
-      const items = (d && d.items) || [];
-      if (!items.length) { shelf.replaceChildren(h("p.empty", { text: "Nothing shared yet. Share yours from the game: Play → Workshop." })); return; }
-      shelf.replaceChildren(...items.slice(0, 6).map(workshopCard));
+    fetch(worker + "/api/items?type=charts&sort=new", { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
+      if (!bars.isConnected) return;
+      wheelItems = ((d && d.items) || []).slice(0, 8);
+      if (!wheelItems.length) { bars.replaceChildren(h("li.ar-bar-wait", { text: "Nothing shared yet. Share yours from the game: Play → Workshop." })); return; }
+      bars.replaceChildren(...wheelItems.map((it, i) => {
+        const pic = h("span.ar-bar-pic");
+        if (it.preview) pic.append(waitPic(pic, h("img", { src: it.preview, alt: "", loading: "lazy" })));
+        const a = h("a.ar-bar", { href: "workshop/" + it.id, onpointerenter: () => pick(i), onfocus: () => pick(i) },
+          pic, h("span.ar-bar-text", {}, h("b", { text: it.title }), h("small", { text: "by " + (it.creator || "someone") })),
+          it.topStars > 0 ? h("span.ar-bar-star", { text: "★" + it.topStars.toFixed(1), style: `--s:${starColor(it.topStars)}` }) : null);
+        return h("li", { style: `--i:${i}` }, a, playBtn(it, "small"));
+      }));
+      pick(0);
+      if (!matchMedia("(prefers-reduced-motion: reduce)").matches) cycle = setInterval(() => { if (!bars.isConnected) { clearInterval(cycle); return; } if (!touched && !document.hidden) pick(at + 1); }, 4200);
     });
+  }
+
+  /** (3.0) A Workshop item on the front page's shelf: its picture, big, with the title over it. */
+  function shelfCard(it) {
+    const pic = h("span.sh-pic");
+    if (it.preview) pic.append(waitPic(pic, h("img", { src: it.preview, alt: "", loading: "lazy" })));
+    else pic.append(h("span.sh-type", { text: WS_LABEL[it.type] || "" }));
+    return h("a.sh-card", { href: "workshop/" + it.id, title: it.title },
+      pic,
+      h("span.sh-chips", {},
+        it.type === "charts" && it.topStars > 0 ? h("span.sh-star", { text: "★ " + it.topStars.toFixed(2), style: `background:${starColor(it.topStars)}` }) : null,
+        it.verified && it.type === "charts" ? h("span.sh-ver", { text: "✓ Verified" }) : null,
+        it.type !== "charts" ? h("span.sh-kind", { text: WS_LABEL[it.type] || it.type }) : null),
+      h("span.sh-body", {},
+        h("b", { text: it.title }),
+        h("small", { text: ["by " + (it.creator || "someone"), it.type === "charts" && it.topPR > 0 ? fmt0.format(Math.round(it.topPR)) + " PR" : "", (it.keys || []).length ? it.keys.map((k) => k + "K").join(" ") : ""].filter(Boolean).join(" · ") })));
   }
 
   // ---------------------------------------------------------------- #/workshop: charts, skins, themes and styles players shared
@@ -1210,33 +1832,260 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   const wsActive = () => (wsVerified && wsType === "charts" ? 1 : 0) + (wsCustom && (wsType === "skins" || wsType === "styles") ? 1 : 0) + (wsF.builtin ? 1 : 0) + (wsF.by ? 1 : 0)
     + (wsType === "charts" ? (wsF.charter ? 1 : 0) + (wsF.keys.size ? 1 : 0) + (Number(wsF.minStars) > 0 || Number(wsF.maxStars) > 0 ? 1 : 0) + (wsF.tags.size ? 1 : 0) : 0);
 
-  function workshopCard(it) {
-    const pic = h("div.ws-pic" + (it.type === "skins" || it.type === "styles" ? ".contain" : ""));
-    if (it.preview) { const img = h("img", { src: it.preview, alt: "", loading: "lazy" }); img.onerror = () => img.remove(); pic.append(img); }
-    else pic.append(h("span.ws-type", { text: WS_LABEL[it.type] || "" }));
-    const kb = it.size / 1048576;
-    if (it.verified && it.type === "charts") pic.append(h("span.ws-verified", { text: "✓ VERIFIED", title: "Verified by OCTIVE: global leaderboards and full PR" }));
-    if (it.type === "charts" && it.topStars > 0) pic.append(h("span.ws-stars", { text: "★ " + it.topStars.toFixed(2), style: `background:${starColor(it.topStars)}` }));
-    if (it.customizable && (it.type === "skins" || it.type === "styles")) pic.append(h("span.ws-custom", { text: "CUSTOMIZABLE", title: "Its maker allows changes" }));
-    pic.addEventListener("click", () => go("workshop/" + it.id));
-    pic.title = "Details";
-    return h("article.ws-card", {},
+  // ---------------------------------------------------------------- 3.0: listen to a chart's song first (the little player)
+  // The ▶ on a chart's picture plays its song (the server pulls it out of the package: /api/audio/<id>). A little player
+  // shows at the bottom right: the picture (it opens the chart's page), the title, pause, a bar to scrub, the volume and
+  // close. One song at a time; it keeps playing while you move around the site.
+  const MP = { el: null, audio: null, it: null, loading: false, failed: false, dragAt: null };
+  const PLAY_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path class="pv-i-play" d="M8 5.2v13.6L19 12z"/><path class="pv-i-pause" d="M6.5 5h4v14h-4zM13.5 5h4v14h-4z"/></svg>';
+  const mmss = (s) => { s = Math.max(0, Math.floor(Number(s) || 0)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+  /** The ▶ on a chart's picture. it: { id, title, creator, preview, version } (charts only). */
+  function playBtn(it, size) {
+    if (!it || !it.id || (it.type && it.type !== "charts")) return null;
+    const b = h("button.pv-play" + (size ? "." + size : ""), { type: "button", "data-play-id": it.id, "aria-label": `Listen to ${it.title || "the song"}`, title: "Listen to the song" });
+    b.innerHTML = PLAY_SVG;
+    b.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); playSong(it); });
+    b.addEventListener("pointerdown", (e) => e.stopPropagation());
+    if (MP.it && MP.it.id === it.id) { b.classList.toggle("on", !!(MP.audio && !MP.audio.paused)); b.classList.toggle("loading", MP.loading); }
+    return b;
+  }
+  /** Every ▶ of the song that's on shows whether it plays. */
+  function paintPlayButtons() {
+    const id = MP.it && MP.it.id, on = !!(MP.audio && !MP.audio.paused && !MP.failed);
+    document.querySelectorAll(".pv-play").forEach((b) => { const mine = b.dataset.playId === id; b.classList.toggle("on", mine && on); b.classList.toggle("loading", mine && MP.loading); });
+    if (MP.el) {
+      MP.el.classList.toggle("playing", on);
+      MP.el.classList.toggle("loading", MP.loading);
+      MP.el.classList.toggle("failed", MP.failed);
+      const t = MP.el.querySelector(".mp-toggle");
+      if (t) t.setAttribute("aria-label", on ? "Pause" : "Play");
+    }
+  }
+  function stopSong() {
+    if (MP.audio) { MP.audio.pause(); MP.audio.removeAttribute("src"); MP.audio.load(); }
+    MP.audio = null; MP.it = null; MP.loading = false; MP.failed = false;
+    if (MP.el) { const el = MP.el; MP.el = null; el.classList.add("out"); setTimeout(() => el.remove(), 260); }
+    document.body.classList.remove("mp-on");
+    if ("mediaSession" in navigator) { try { navigator.mediaSession.metadata = null; } catch { /* old browser */ } }
+    paintPlayButtons();
+  }
+  function playSong(it) {
+    // the same song: pause or go on
+    if (MP.it && MP.it.id === it.id && MP.audio && !MP.failed) { MP.audio.paused ? MP.audio.play().catch(() => {}) : MP.audio.pause(); paintPlayButtons(); return; }
+    if (MP.audio) { MP.audio.pause(); MP.audio.removeAttribute("src"); MP.audio.load(); }
+    const audio = new Audio();
+    audio.preload = "auto";
+    audio.volume = Math.max(0, Math.min(1, Number(store.get("octive.previewVolume") ?? 0.7)));
+    MP.audio = audio; MP.it = it; MP.loading = true; MP.failed = false;
+    buildPlayer(it);
+    const paintTime = () => { if (MP.audio === audio) paintPosition(); };
+    audio.addEventListener("loadedmetadata", paintTime);
+    audio.addEventListener("timeupdate", paintTime);
+    audio.addEventListener("durationchange", paintTime);
+    audio.addEventListener("waiting", () => { if (MP.audio === audio) { MP.loading = true; paintPlayButtons(); } });
+    audio.addEventListener("playing", () => { if (MP.audio === audio) { MP.loading = false; paintPlayButtons(); } });
+    audio.addEventListener("pause", () => { if (MP.audio === audio) paintPlayButtons(); });
+    audio.addEventListener("ended", () => { if (MP.audio === audio) { audio.currentTime = 0; paintPlayButtons(); paintPosition(); } });
+    audio.addEventListener("error", () => {
+      if (MP.audio !== audio) return;
+      MP.loading = false; MP.failed = true; paintPlayButtons();
+      const sub = MP.el && MP.el.querySelector(".mp-sub");
+      if (sub) sub.textContent = "This song can't be played here right now.";
+    });
+    audio.src = it.src || `${worker}/api/audio/${encodeURIComponent(it.id)}?v=${encodeURIComponent(it.version || 1)}`;
+    audio.play().catch(() => { /* waits for the file; the ▶ in the player starts it */ });
+    // the computer's own media keys and lock screen show it too
+    if ("mediaSession" in navigator) {
+      try {
+        navigator.mediaSession.metadata = new MediaMetadata({ title: it.title || "Song", artist: it.creator ? "by " + it.creator : "OCTIVE Workshop", album: "OCTIVE Workshop", artwork: it.preview ? [{ src: it.preview }] : [] });
+        navigator.mediaSession.setActionHandler("play", () => MP.audio && MP.audio.play());
+        navigator.mediaSession.setActionHandler("pause", () => MP.audio && MP.audio.pause());
+        navigator.mediaSession.setActionHandler("stop", stopSong);
+      } catch { /* not supported */ }
+    }
+    paintPlayButtons();
+  }
+  function paintPosition() {
+    if (!MP.el || !MP.audio || MP.dragAt != null) return;
+    const a = MP.audio, d = Number.isFinite(a.duration) ? a.duration : 0, t = a.currentTime || 0;
+    const f = d ? Math.min(1, t / d) : 0;
+    MP.el.style.setProperty("--mp", f.toFixed(4));
+    MP.el.querySelector(".mp-time").textContent = `${mmss(t)} / ${d ? mmss(d) : "–:––"}`;
+    const bar = MP.el.querySelector(".mp-bar");
+    bar.setAttribute("aria-valuemax", String(Math.round(d)));
+    bar.setAttribute("aria-valuenow", String(Math.round(t)));
+    bar.setAttribute("aria-valuetext", `${mmss(t)} of ${mmss(d)}`);
+  }
+  function buildPlayer(it) {
+    const open = "workshop/" + it.id;
+    MP.dragAt = null;
+    const pic = h("a.mp-pic", { href: open, title: "Open the chart's page" });
+    if (it.preview) pic.append(waitPic(pic, h("img", { src: it.preview, alt: "" })));
+    const toggle = h("button.mp-toggle", { type: "button", "aria-label": "Pause", onclick: () => playSong(it) });
+    toggle.innerHTML = PLAY_SVG;
+    const bar = h("div.mp-bar", { role: "slider", tabindex: "0", "aria-label": "Where in the song", "aria-valuemin": "0" }, h("i.mp-fill"), h("i.mp-knob"));
+    // while you drag, the bar and the time follow you; the song jumps there when you let go (no stutter from many jumps)
+    const fracAt = (clientX) => { const r = bar.getBoundingClientRect(); return r.width ? Math.max(0, Math.min(1, (clientX - r.left) / r.width)) : 0; };
+    const showAt = (f) => {
+      const a = MP.audio, d = a && Number.isFinite(a.duration) ? a.duration : 0;
+      if (!MP.el) return;
+      MP.el.style.setProperty("--mp", f.toFixed(4));
+      MP.el.querySelector(".mp-time").textContent = `${mmss(f * d)} / ${d ? mmss(d) : "–:––"}`;
+    };
+    bar.addEventListener("pointerdown", (e) => {
+      if (e.button > 0) return;
+      e.preventDefault(); bar.focus({ preventScroll: true }); bar.classList.add("drag");
+      MP.dragAt = fracAt(e.clientX); showAt(MP.dragAt);
+      try { bar.setPointerCapture(e.pointerId); } catch { /* no capture: the drag still follows moves over the bar */ }
+    });
+    bar.addEventListener("pointermove", (e) => { if (bar.classList.contains("drag")) { MP.dragAt = fracAt(e.clientX); showAt(MP.dragAt); } });
+    const end = (e) => {
+      if (!bar.classList.contains("drag")) return;
+      bar.classList.remove("drag");
+      const f = MP.dragAt; MP.dragAt = null;
+      const a = MP.audio;
+      if (e.type === "pointerup" && f != null && a && Number.isFinite(a.duration)) a.currentTime = f * a.duration;
+      paintPosition();
+    };
+    bar.addEventListener("pointerup", end);
+    bar.addEventListener("pointercancel", end);
+    bar.addEventListener("lostpointercapture", end);
+    bar.addEventListener("keydown", (e) => {
+      const a = MP.audio; if (!a) return;
+      if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); a.currentTime = Math.max(0, Math.min(a.duration || 0, a.currentTime + (e.key === "ArrowLeft" ? -5 : 5))); paintPosition(); }
+      else if (e.key === " " || e.key === "Enter") { e.preventDefault(); playSong(it); }
+    });
+    const vol = h("input.mp-vol", { type: "range", min: "0", max: "1", step: "0.05", value: String(MP.audio ? MP.audio.volume : 0.7), "aria-label": "Volume" });
+    vol.addEventListener("input", () => { if (MP.audio) MP.audio.volume = Number(vol.value); store.set("octive.previewVolume", vol.value); });
+    const el = h("div.mp", { role: "region", "aria-label": "Song preview" },
+      h("span.mp-eq", { "aria-hidden": "true" }, h("i"), h("i"), h("i"), h("i")),
       pic,
-      h("div.ws-body", {},
-        h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
-        h("h3", {}, h("a", { href: "workshop/" + it.id, text: it.title, title: it.title })),
-        h("a.ws-by", { href: profileHref(it.creatorId || "") }, "by " + (it.creator || "someone")),
-        it.type === "charts" ? h("p.ws-facts", {},
-          it.topPR > 0 ? h("b", { text: `${fmt0.format(Math.round(it.topPR))} PR`, title: it.verified ? "The most PR its hardest difficulty gives" : "The most PR its hardest difficulty gives. Not verified yet, so a third of it counts toward totals and the global ranking." }) : null,
-          (it.keys || []).length ? h("span", { text: (it.topPR > 0 ? " · " : "") + it.keys.map((k) => k + "K").join(" ") }) : null) : null,
-        wsTagChips(it),
-        h("p.ws-desc", { text: it.description || "", title: it.description || undefined }),
-        h("span.ws-meta", { text: [`${kb.toFixed(kb < 1 ? 2 : 1)} MB`, `${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"}`,
-          it.likes ? `♥ ${fmt0.format(it.likes)}` : "", it.reviews ? `${fmt0.format(it.reviews)} review${it.reviews === 1 ? "" : "s"}` : "",
-          new Date(it.at).toLocaleDateString(undefined, { dateStyle: "medium" })].filter(Boolean).join(" · ") }),
-        h("div.ws-actions", {},
-          h("a.btn.primary.small", { href: `${worker}/api/download/${it.id}?redirect=1` }, "Download"),
-          h("a.btn.small.ws-open", { href: `octive://workshop/${it.id}`, title: "Opens OCTIVE (starting it if it's closed), goes to the Workshop and gets this", onclick: () => openHint() }, "Open in OCTIVE"))));
+      h("div.mp-main", {},
+        h("div.mp-top", {},
+          h("div.mp-text", {}, h("a.mp-title", { href: open, text: it.title || "Song", title: it.title || "" }), h("small.mp-sub", { text: it.creator ? "by " + it.creator : "Workshop chart" })),
+          toggle,
+          h("button.mp-close", { type: "button", "aria-label": "Close the player", title: "Close", onclick: stopSong }, "✕")),
+        h("div.mp-row", {}, bar, h("span.mp-time", { text: "0:00 / –:––" })),
+        h("label.mp-volrow", {}, h("span", { text: "Volume" }), vol)));
+    if (MP.el) MP.el.replaceWith(el); else document.body.append(el);
+    MP.el = el;
+    document.body.classList.add("mp-on");
+  }
+
+  // ---------------------------------------------------------------- 3.0: chart lists (kept in this browser, shared as one link)
+  const LIST_KEY = "octive.chartList", LIST_MAX = 50;
+  /** Your list: [{ id, t: title }] in the order you added them. */
+  function chartList() {
+    try { return (JSON.parse(store.get(LIST_KEY) || "[]") || []).filter((x) => x && /^[a-z0-9]{16,40}$/.test(x.id)); } catch { return []; }
+  }
+  function saveChartList(list) {
+    store.set(LIST_KEY, list.length ? JSON.stringify(list.slice(0, LIST_MAX)) : null);
+    paintListPill();
+    // every + / ✓ and "My list" on the page repaints itself (each keeps its own painter)
+    document.querySelectorAll(".wl-btn, .ws-mylist").forEach((el) => el._paint && el._paint());
+  }
+  const inChartList = (id) => chartList().some((x) => x.id === id);
+  function toggleChartList(it) {
+    const list = chartList(), i = list.findIndex((x) => x.id === it.id);
+    if (i >= 0) list.splice(i, 1);
+    else if (list.length >= LIST_MAX) { toast(`A list holds up to ${LIST_MAX} charts.`); return; }
+    else list.push({ id: it.id, t: String(it.title || "").slice(0, 120) });
+    saveChartList(list);
+    toast(i >= 0 ? "Taken off your chart list" : "Added to your chart list");
+  }
+  const listLink = (ids) => SITE_URL + "workshop/?list=" + ids.join(",");
+  /** The + / ✓ button on a Workshop card or item page. */
+  function listBtn(it, big) {
+    const b = h("button.wl-btn" + (big ? ".btn" : ""), { type: "button" });
+    const paint = () => {
+      const on = inChartList(it.id);
+      b.classList.toggle("on", on);
+      b.title = on ? "On your chart list: click to take it off" : "Add to your chart list (share the list as one link)";
+      b.setAttribute("aria-pressed", String(on));
+      b.replaceChildren(h("span.wl-ic", { text: on ? "✓" : "+" }), big ? (on ? "On your list" : "Add to list") : null);
+    };
+    b.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); toggleChartList(it); });
+    b._paint = paint;
+    paint();
+    return b;
+  }
+  /** The floating "Chart list · 3" on the Workshop's pages, and the drawer it opens. */
+  function paintListPill() {
+    const list = chartList();
+    let pill = document.querySelector(".wl-pill");
+    const want = document.body.dataset.page === "workshop" && list.length > 0;
+    if (!want) { pill?.remove(); document.querySelector(".wl-drawer")?.remove(); return; }
+    if (!pill) {
+      pill = h("button.wl-pill", { type: "button", onclick: () => (document.querySelector(".wl-drawer") ? document.querySelector(".wl-drawer").remove() : openListDrawer()) });
+      document.body.append(pill);
+    }
+    pill.replaceChildren(h("span.wl-note", { text: "♪" }), "Chart list", h("b", { text: String(list.length) }));
+    const dr = document.querySelector(".wl-drawer");
+    if (dr) openListDrawer(true);
+  }
+  function openListDrawer(repaint) {
+    const list = chartList();
+    let dr = document.querySelector(".wl-drawer");
+    if (!dr) { dr = h("div.wl-drawer", { role: "dialog", "aria-label": "Your chart list" }); document.body.append(dr); }
+    else if (!repaint) return;
+    const copy = h("button.btn.small.primary", { type: "button" }, "Copy link");
+    copy.addEventListener("click", async () => {
+      const url = listLink(chartList().map((x) => x.id));
+      try { await navigator.clipboard.writeText(url); copy.textContent = "Copied"; } catch { prompt("Copy this link:", url); }
+      setTimeout(() => { copy.textContent = "Copy link"; }, 1600);
+    });
+    dr.replaceChildren(
+      h("div.wl-head", {}, h("div", {}, h("b", { text: "Your chart list" }), h("small", { text: `${list.length} chart${list.length === 1 ? "" : "s"} · kept in this browser` })),
+        h("button.wl-close", { type: "button", "aria-label": "Close", onclick: () => dr.remove() }, "✕")),
+      h("ol.wl-items", {}, ...list.map((x, i) => h("li", {},
+        h("span.wl-n", { text: String(i + 1) }), h("a", { href: "workshop/" + x.id, text: x.t || "Chart", title: x.t || "" }),
+        h("button.wl-x", { type: "button", title: "Take it off", "aria-label": "Take it off", onclick: () => { saveChartList(chartList().filter((y) => y.id !== x.id)); } }, "✕")))),
+      h("div.wl-acts", {}, copy, h("a.btn.small", { href: "workshop/?list=" + list.map((x) => x.id).join(","), onclick: () => dr.remove() }, "Open the list"),
+        h("button.btn.small.ghost", { type: "button", onclick: () => { if (confirm("Empty your chart list?")) saveChartList([]); } }, "Empty it")));
+  }
+  /** workshop/?list=a,b,c: a list someone shared (or yours), with a download for each. */
+  function chartListPage(ids) {
+    ids = [...new Set(ids)].filter((x) => /^[a-z0-9]{16,40}$/.test(x)).slice(0, LIST_MAX);
+    const mine = chartList().map((x) => x.id);
+    const same = ids.length === mine.length && ids.every((x, i) => x === mine[i]);
+    document.title = "Chart list · Workshop · OCTIVE";
+    setCrumb("Chart list");
+    const grid = h("div.wk-grid.wl-grid", {}, h("p.empty", { text: "Loading the charts…" }));
+    const items = [];
+    const copy = h("button.btn.primary", { type: "button" }, "Copy link");
+    copy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(listLink(ids)); copy.textContent = "Link copied"; } catch { prompt("Copy this link:", listLink(ids)); }
+      setTimeout(() => { copy.textContent = "Copy link"; }, 1600);
+    });
+    const save = same ? null : h("button.btn", { type: "button", onclick: () => {
+      const list = chartList();
+      for (const it of items.filter(Boolean)) if (!list.some((x) => x.id === it.id)) list.push({ id: it.id, t: it.title });
+      saveChartList(list); toast("Added to your chart list");
+    } }, "Add them to my list");
+    const all = h("button.btn", { type: "button", title: "Downloads every chart, one after another (your browser may ask to allow several downloads)", onclick: () => {
+      items.filter(Boolean).forEach((it, i) => setTimeout(() => { const a = h("a", { href: `${worker}/api/download/${it.id}?redirect=1` }); document.body.append(a); a.click(); a.remove(); }, i * 900));
+    } }, "Download all");
+    app.replaceChildren(h("div.ws-page.wl-page", {},
+      h("a.back", { href: "workshop" }, "← Workshop"),
+      h("section.page-head", {}, h("p.eyebrow", { text: same ? "Your chart list" : "A shared chart list" }), h("h1", { text: `${ids.length} chart${ids.length === 1 ? "" : "s"}` }),
+        h("p.sub", { text: same ? "The charts you added. Copy the link to share the whole list: it opens right here for anyone." : "Someone shared these Workshop charts with you. Download them, open them in OCTIVE, or add them to your own list." }),
+        h("div.wl-page-acts", {}, copy, save, all)),
+      grid));
+    if (!ids.length) { grid.replaceChildren(h("p.empty", { text: "This list is empty." })); return; }
+    let next = 0, done = 0;
+    const slots = ids.map(() => wkGhosts(1)[0]);
+    grid.replaceChildren(...slots);
+    const pump = () => {
+      if (next >= ids.length) return;
+      const i = next++;
+      cachedJson(`${worker}/api/items/${ids[i]}`, 600_000).then((d) => {
+        const it = d && d.item;
+        if (it) { items[i] = it; slots[i].replaceWith(wkCard(it)); } else slots[i].replaceWith(h("article.wk-card.wk-gone", {}, h("p", { text: "This chart isn't in the Workshop any more." })));
+        if (++done === ids.length) { const keep = items.filter(Boolean); items.length = 0; items.push(...keep); }
+        pump();
+      });
+    };
+    for (let k = 0; k < 4; k++) pump();
   }
 
   /** After "Open in OCTIVE": if the game didn't take the link (not installed), say where to get it. */
@@ -1272,105 +2121,341 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     setTimeout(() => { location.href = link; openHint(); }, 400);
   }
 
+  // ---------------------------------------------------------------- 3.2: the Workshop, rebuilt (2026-11-27)
+  // The user didn't like the song-select Workshop ("change the workshop, full change") and left the pick to me. Now: a
+  // spotlight of the newest verified charts on top, the filters always open on the left (a panel on phones), and every
+  // item as a wide card with its art behind it, its stars, a coloured dot per difficulty, its numbers and buttons.
+  const WK_BANDS = [[0, 2.5], [2.5, 4], [4, 6], [6, 8], [8, 0]];
+  const WK_SORTS = [["new", "Newest"], ["popular", "Most downloaded"], ["liked", "Most liked"], ["hardest", "Stars: highest"], ["easiest", "Stars: lowest"],
+    ["pr", "Most PR"], ["title", "Title (A–Z)"], ["oldest", "Oldest"]];
+  const wkWhen = (t) => (t ? ago(new Date(t).toISOString()) : "");
+  /** Every difficulty of a Workshop item, easiest first: [{ name, stars, keys, song }]. */
+  function wkDiffs(it) {
+    return (it.songs || []).flatMap((sg) => (sg.charts || []).map((c) => ({ name: c.difficulty || "Chart", stars: Number(c.stars) || 0, keys: c.keys, song: sg.title || "" })))
+      .sort((a, b) => a.stars - b.stars);
+  }
+  /** A dot per difficulty in its star colour (up to max, then +N). Pointing at them (or tapping them) lists every
+   *  difficulty under the card, like osu!'s beatmap listing. */
+  function wkDots(it, max = 12) {
+    const d = wkDiffs(it);
+    if (!d.length) return null;
+    return h("button.wk-dots", { type: "button", "aria-expanded": "false", "aria-label": `${d.length} difficult${d.length === 1 ? "y" : "ies"}: show them` },
+      ...d.slice(0, max).map((x) => h("i", { style: `--s:${starColor(x.stars)}` })),
+      d.length > max ? h("small", { text: "+" + (d.length - max) }) : null);
+  }
+  /** The list that opens under a card: every difficulty, easiest first, with its stars, name and keys (and song, in a pack). */
+  function wkDiffList(it) {
+    // the song's title only helps when a pack's songs have different titles
+    const d = wkDiffs(it), pack = new Set(d.map((x) => x.song)).size > 1;
+    return h("div.wk-pop", { role: "list", "aria-label": "Difficulties" },
+      ...d.map((x) => h("div.wk-pop-row", { role: "listitem" },
+        h("span.wk-pop-star", { style: `--s:${starColor(x.stars)}`, text: "★ " + x.stars.toFixed(2) }),
+        h("span.wk-pop-name", { text: x.name, title: x.name }),
+        h("small", { text: [pack ? x.song : "", x.keys ? x.keys + "K" : ""].filter(Boolean).join(" · ") }))));
+  }
+  let wkOpenCell = null;
+  /** What an item is in a few words: a chart's keys and its BPM and length (one song) or how many songs (a pack). */
+  function wkFacts(it) {
+    if (it.type !== "charts") return [WS_LABEL[it.type] || it.type];
+    const songs = it.songs || [], out = [];
+    if ((it.keys || []).length) out.push(it.keys.map((k) => k + "K").join(" "));
+    if (songs.length > 1) out.push(`${songs.length} songs`);
+    else if (songs[0]) {
+      if (songs[0].bpm > 0) out.push(`${Math.round(songs[0].bpm)} BPM`);
+      if (songs[0].durationUs > 0) out.push(mmss(songs[0].durationUs / 1e6));
+    }
+    return out;
+  }
+  /** A Workshop item as a wide card: its picture (▶ to listen, + for your list), its art faintly behind, its stars,
+   *  title, maker, numbers and difficulties. The whole card opens its page. */
+  function wkCard(it) {
+    // one item on its own (a chart list) comes without its summary: work out its stars and keys from its difficulties
+    if (it.type === "charts" && !(it.topStars > 0 && (it.keys || []).length)) {
+      const d = wkDiffs(it);
+      it = { ...it, topStars: it.topStars > 0 ? it.topStars : (d.length ? d[d.length - 1].stars : 0),
+        keys: (it.keys || []).length ? it.keys : [...new Set(d.map((x) => x.keys).filter(Boolean))].sort((a, b) => a - b) };
+    }
+    const isChart = it.type === "charts";
+    const top = Number(it.topStars) || 0;
+    const href = "workshop/" + it.id;
+    const pic = h("div.wk-pic" + (it.type === "skins" || it.type === "styles" ? ".contain" : ""));
+    if (it.preview) pic.append(waitPic(pic, h("img", { src: it.preview, alt: "", loading: "lazy" })));
+    else pic.append(h("span.wk-noart", { text: isChart ? "♪" : (WS_LABEL[it.type] || "?").charAt(0) }));
+    if (isChart) pic.append(playBtn(it), listBtn(it));
+    const facts = wkFacts(it);
+    const when = wkWhen(it.at);
+    const tint = isChart && top > 0 ? `--c:${starColor(top)}` : null;
+    // (3.2) in the spotlight (bought in the game's points shop): gold, like in the game
+    const lit = !!(it.spotlight && Date.parse(it.spotlight) > Date.now());
+    const card = h("article.wk-card" + (isChart ? "" : ".wk-thing") + (lit ? ".wk-lit" : ""), { style: tint },
+      it.preview ? h("img.wk-bg", { src: it.preview, alt: "", loading: "lazy", "aria-hidden": "true" }) : null,
+      pic,
+      h("div.wk-body", {},
+        h("div.wk-top", {},
+          lit ? h("span.wk-spotchip", { text: "★ Spotlight", title: "Its maker put it on top of the Workshop for a day" }) : null,
+          isChart && top > 0 ? h("span.wk-star", { text: "★ " + top.toFixed(2), title: "Its hardest difficulty" }) : h("span.wk-kind", { text: WS_LABEL[it.type] || it.type }),
+          it.verified && isChart ? h("span.wk-ver", { text: "Verified", title: "Verified by OCTIVE: global leaderboards and full PR" }) : null,
+          it.customizable && !isChart ? h("span.wk-ver", { text: "Customizable", title: "Its maker allows changes" }) : null,
+          it.builtin ? h("span.wk-own", { text: "OCTIVE", title: "One of OCTIVE's own" }) : null,
+          h("span.wk-stats", {},
+            h("span", { title: `${fmt0.format(it.likes || 0)} like${it.likes === 1 ? "" : "s"}` }, h("i", { text: "♥" }), fmt0.format(it.likes || 0)),
+            h("span", { title: `${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"}` }, h("i", { text: "↓" }), fmt0.format(it.downloads || 0)))),
+        h("h3.wk-title", {}, h("a", { href, text: it.title, title: it.title })),
+        h("p.wk-by", {}, "by ", h("a", { href: profileHref(it.creatorId || ""), text: it.creator || "someone" }), facts.length ? h("span", { text: " · " + facts.join(" · ") }) : null),
+        h("div.wk-foot", {},
+          isChart ? wkDots(it) : h("span.wk-when", { text: when }),
+          isChart && it.topPR > 0 ? h("b.wk-pr", { text: fmt0.format(Math.round(it.topPR)) + " PR",
+            title: it.verified ? "The most PR its hardest difficulty gives" : "The most PR its hardest difficulty gives. Not verified yet, so a third of it counts toward totals and the global ranking." })
+            : isChart ? h("span.wk-when", { text: when }) : null)));
+    // (3.2) the card sits in a cell, so the list of difficulties can open under it, over the cards below
+    const cell = h("div.wk-cell", { style: tint }, card);
+    const dots = card.querySelector(".wk-dots");
+    if (!dots) return cell;
+    const pop = wkDiffList(it);
+    cell.append(pop);
+    const open = (on) => {
+      if (on && wkOpenCell && wkOpenCell !== cell) wkOpenCell._open(false);
+      cell.classList.toggle("pop", on);
+      dots.setAttribute("aria-expanded", String(on));
+      wkOpenCell = on ? cell : wkOpenCell === cell ? null : wkOpenCell;
+    };
+    cell._open = open;
+    dots.addEventListener("pointerenter", (e) => { if (e.pointerType === "mouse") open(true); });
+    cell.addEventListener("pointerleave", (e) => { if (e.pointerType === "mouse") open(false); });
+    // a mouse already opened it by pointing; a tap or Enter opens and closes it
+    dots.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); open(e.pointerType === "mouse" ? true : !cell.classList.contains("pop")); });
+    cell.addEventListener("keydown", (e) => { if (e.key === "Escape" && cell.classList.contains("pop")) { open(false); dots.focus(); } });
+    cell.addEventListener("focusout", (e) => { if (!cell.contains(e.relatedTarget)) open(false); });
+    return cell;
+  }
+  /** Loading: grey cards in the shape of the real ones. */
+  const wkGhosts = (n) => Array.from({ length: n }, () => h("div.wk-card.wk-ghost", { "aria-hidden": "true" }, h("div.wk-pic.pic-wait"), h("div.wk-body", {}, h("i"), h("i"), h("i"))));
+
+  /** The Workshop's spotlight, one at a time, big (it moves on by itself until you pick one): first the uploads their makers
+   *  put in the spotlight (bought in the game's points shop: on top of the Workshop for a day, gold), then the newest
+   *  verified charts. */
+  function wkSpotlight() {
+    const box = h("section.wk-spot.wk-spot-wait", { "aria-label": "Spotlight" });
+    // everything, newest first (the server puts uploads in the spotlight first)
+    cachedJson(`${worker}/api/items?sort=new`, 120_000).then((d) => {
+      const all = (d && d.items) || [];
+      const lit = all.filter((x) => x.spotlight && Date.parse(x.spotlight) > Date.now()).slice(0, 10);
+      const fresh = all.filter((x) => x.type === "charts" && x.verified && x.preview && !lit.includes(x));
+      const picks = [...lit, ...fresh].slice(0, Math.max(6, lit.length));
+      if (!box.isConnected) return;
+      if (!picks.length) { box.remove(); return; }
+      box.classList.remove("wk-spot-wait");
+      let at = 0, timer = null, held = false;
+      const bg = h("img.wk-spot-bg", { alt: "", "aria-hidden": "true" });
+      const artImg = h("img", { alt: "" });
+      const art = h("a.wk-spot-art", { "aria-label": "Open the chart" }, artImg);
+      const play = h("span.wk-spot-play");
+      const text = h("div.wk-spot-text");
+      const pager = h("div.wk-spot-pager", { role: "group", "aria-label": "Spotlight charts" });
+      const stop = () => { held = true; clearInterval(timer); };
+      function show(i) {
+        at = (i + picks.length) % picks.length;
+        const it = picks[at], top = Number(it.topStars) || 0, diffs = wkDiffs(it), isLit = !!it.spotlight, isChart = it.type === "charts";
+        box.style.setProperty("--c", isLit ? "#ffd23f" : top > 0 ? starColor(top) : "#ff4d9d");
+        box.classList.toggle("lit", isLit);
+        // (an upload without a picture can be in the spotlight too)
+        for (const img of [bg, artImg]) { img.hidden = !it.preview; if (it.preview) img.src = it.preview; else img.removeAttribute("src"); }
+        art.classList.toggle("noart", !it.preview);
+        art.classList.toggle("contain", it.type === "skins" || it.type === "styles");
+        art.href = "workshop/" + it.id;
+        play.replaceChildren(playBtn(it, "big") || "");
+        const left = isLit ? Math.max(0, Date.parse(it.spotlight) - Date.now()) : 0;
+        text.replaceChildren(
+          isLit ? h("p.wk-spot-tag.lit", {}, h("b", { text: "★ Spotlight" }), h("span", { text: `${left >= 3600e3 ? Math.floor(left / 3600e3) + "h" : Math.max(1, Math.ceil(left / 60e3)) + " min"} left in the spotlight` }))
+            : h("p.wk-spot-tag", {}, h("b", { text: "New" }), h("span", { text: "Verified chart" })),
+          h("h2.wk-spot-title", {}, h("a", { href: "workshop/" + it.id, text: it.title, title: it.title })),
+          h("p.wk-spot-by", {}, "by ", h("a", { href: profileHref(it.creatorId || ""), text: it.creator || "someone" }),
+            h("span", { text: " · " + [...wkFacts(it), isChart ? `${diffs.length} difficult${diffs.length === 1 ? "y" : "ies"}` : ""].filter(Boolean).join(" · ") })),
+          diffs.length ? h("div.wk-spot-diffs", {}, ...diffs.slice(-6).map((x) => h("span", { style: `--s:${starColor(x.stars)}`, title: x.name, text: "★ " + x.stars.toFixed(2) })),
+            diffs.length > 6 ? h("small", { text: `+${diffs.length - 6} more` }) : null) : null,
+          h("div.wk-spot-acts", {},
+            h("a.btn.primary", { href: `${worker}/api/download/${it.id}?redirect=1` }, "Download"),
+            h("a.btn", { href: `octive://workshop/${it.id}`, title: "Opens OCTIVE (starting it if it's closed), goes to the Workshop and gets this", onclick: () => openHint() }, "Open in OCTIVE"),
+            isChart ? listBtn(it, true) : null));
+        [...pager.children].forEach((b, k) => { b.classList.toggle("on", k === at); b.setAttribute("aria-pressed", String(k === at)); });
+        box.classList.remove("in"); void box.offsetWidth; box.classList.add("in");
+      }
+      picks.forEach((it, k) => pager.append(h("button", { type: "button", "aria-label": it.title, title: it.title, onclick: () => { stop(); show(k); } })));
+      box.replaceChildren(bg,
+        h("div.wk-spot-in", {}, text,
+          h("div.wk-spot-side", {}, h("div.wk-spot-artwrap", {}, art, play),
+            h("div.wk-spot-nav", {},
+              h("button.wk-spot-arrow", { type: "button", "aria-label": "Previous chart", onclick: () => { stop(); show(at - 1); } }, "‹"),
+              pager,
+              h("button.wk-spot-arrow", { type: "button", "aria-label": "Next chart", onclick: () => { stop(); show(at + 1); } }, "›")))));
+      show(0);
+      timer = setInterval(() => {
+        if (!box.isConnected) { clearInterval(timer); return; }
+        if (!held && !document.hidden && !box.matches(":hover, :focus-within")) show(at + 1);
+      }, 7000);
+    });
+    return box;
+  }
+
   function workshopPage() {
     const one = (routeHash().match(/^#\/workshop\/([a-z0-9]{16,40})/) || [])[1];
-    if (one) { workshopItemPage(one); return; }
-    // #/workshop?sort=liked (the home page's Most liked charts link)
-    const wantSort = new URLSearchParams((routeHash().split("?")[1] || "")).get("sort");
-    if (wantSort && /^(new|popular|liked|hardest|easiest|pr|title|oldest)$/.test(wantSort)) { wsSort = wantSort; wsType = "charts"; }
-    // #/workshop?verified=1 (the home page's Verified charts)
-    const wantVer = new URLSearchParams((routeHash().split("?")[1] || "")).get("verified");
+    if (one) { workshopItemPage(one); paintListPill(); return; }
+    const wq = new URLSearchParams((routeHash().split("?")[1] || ""));
+    // (3.0) workshop/?list=a,b,c: a shared chart list
+    if (wq.get("list") != null) { chartListPage(String(wq.get("list") || "").split(",").map((x) => x.trim()).filter(Boolean)); paintListPill(); return; }
+    // (3.0) star range and tags from the address (a profile's "Charts for them" → More)
+    if (wq.get("minStars") || wq.get("maxStars") || wq.get("tags")) {
+      wsType = "charts"; wsF.minStars = wq.get("minStars") || ""; wsF.maxStars = wq.get("maxStars") || "";
+      wsF.tags = new Set(String(wq.get("tags") || "").split(",").filter((t) => WS_TAGS.some(([id]) => id === t)));
+    }
+    // workshop?sort=liked (the home page's Most liked charts link), workshop?verified=1
+    const wantSort = wq.get("sort");
+    if (wantSort && WK_SORTS.some(([k]) => k === wantSort)) { wsSort = wantSort; wsType = "charts"; }
+    const wantVer = wq.get("verified");
     if (wantVer === "1" || wantVer === "0") { wsVerified = wantVer; wsType = "charts"; }
     document.title = "Workshop · OCTIVE";
-    const tabs = h("div.ws-tabs");
-    const grid = h("div.ws-grid", {}, h("p.empty", { text: "Loading…" }));
-    const status = h("p.ws-status");
-    // (2.1.2) the search also finds players (from the ranking)
+
+    // the head: what it is, and how much there is
+    const stat = (label) => h("div.stat", {}, h("span.stat-label", { text: label }), h("span.stat-value", { text: "–" }));
+    const stats = { charts: stat("Charts"), verified: stat("Verified"), other: stat("Skins and themes") };
+    const head = h("section.hero.wk-hero", {},
+      h("div", {}, h("p.eyebrow", { text: "Made by players" }), h("h1", { text: "Workshop" }),
+        h("p.sub", { text: "Charts, skins, themes and styles players made. Listen first, then download them or open them straight in OCTIVE. Share yours from the game: Play → Workshop → Share." })),
+      h("div.hero-side", {}, stats.charts, stats.verified, stats.other));
+
+    // the bar: what to show, the search and the order
+    const types = h("div.wk-types", { role: "tablist", "aria-label": "What to show" });
+    const search = h("input.wk-q", { type: "search", placeholder: "Search charts, creators and players…", value: wsQuery, "aria-label": "Search the Workshop" });
+    const sIc = h("span.wk-sic", { "aria-hidden": "true" });
+    sIc.innerHTML = '<svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.6-3.6"/></svg>';
+    const sort = h("select.wk-sort", { "aria-label": "Order" }, ...WK_SORTS.map(([v, t]) => h("option", { value: v, text: t })));
+    sort.value = wsSort;
+    const side = h("aside.wk-side", { "aria-label": "Filters" });
+    const filterBtn = h("button.btn.small.wk-filter-btn", { type: "button", "aria-expanded": "false" }, "Filters");
+    filterBtn.addEventListener("click", () => { const open = !side.classList.contains("open"); side.classList.toggle("open", open); filterBtn.setAttribute("aria-expanded", String(open)); });
+
+    // the results: how many, Surprise me, your list, players the search found, the cards
+    const status = h("p.wk-status", { text: "Loading…" });
+    const grid = h("div.wk-grid", {}, ...wkGhosts(6));
     const people = h("div.ws-people", { hidden: true });
     function paintPeople() {
-      if (!people.isConnected && grid.parentNode) grid.parentNode.insertBefore(people, grid);
       const q = (wsQuery || "").toLowerCase();
       const found = q.length >= 2 && data ? data.players.filter((p) => (p.name || "").toLowerCase().includes(q)).slice(0, 8) : [];
       people.hidden = !found.length;
       people.replaceChildren(...(found.length ? [h("span.ws-people-cap", { text: `Players · ${found.length}` }), h("div.ws-people-row", {}, ...found.map(playerChip))] : []));
     }
-    const search = h("input.help-search.ws-search", { type: "search", placeholder: "Search charts, creators and players…", value: wsQuery });
-    const sort = h("select.ws-sort", {}, h("option", { value: "new", text: "Newest" }), h("option", { value: "popular", text: "Most downloaded" }), h("option", { value: "liked", text: "Most liked" }),
-      h("option", { value: "hardest", text: "Stars: highest" }), h("option", { value: "easiest", text: "Stars: lowest" }), h("option", { value: "pr", text: "Most PR" }),
-      h("option", { value: "title", text: "Title (A–Z)" }), h("option", { value: "oldest", text: "Oldest" }));
-    sort.value = wsSort;
-    const filterBtn = h("button.btn.small.ws-filter-btn", { type: "button" }, "Filters");
-    const panel = h("div.ws-filters");
-    panel.hidden = wsActive() === 0;
-    filterBtn.addEventListener("click", () => { panel.hidden = !panel.hidden; paintFilters(); });
+    let shown = [];
+    const surprise = h("button.btn.small.wk-surprise", { type: "button", title: "Open a random one of the items showing", onclick: () => {
+      if (!shown.length) { toast("Nothing to pick from: change the filters."); return; }
+      go("workshop/" + shown[Math.floor(Math.random() * shown.length)].id);
+    } }, h("span.ws-dice", { text: "⚄" }), "Surprise me");
+    const myList = h("button.btn.small.ws-mylist", { type: "button", onclick: () => openListDrawer() });
+    const paintMyList = () => { const n = chartList().length; myList.replaceChildren(h("span.wl-note", { text: "♪" }), n ? `My list · ${n}` : "My list"); myList.disabled = !n; myList.title = n ? "Your chart list" : "Add charts with the + on their pictures"; };
+    paintMyList();
+    myList._paint = paintMyList;
+
+    // the filters (the same as the game's Filters panel)
     let typed = null;
     const later = () => { clearTimeout(typed); typed = setTimeout(load, 350); };
-    function chip(text, on, click, title) { const b = h("button.ws-chip" + (on ? ".on" : ""), { type: "button", title }, text); b.addEventListener("click", click); return b; }
-    function line(caption, ...kids) { return h("div.ws-fline", {}, h("span.ws-fcap", { text: caption }), h("div.ws-fkids", {}, ...kids)); }
-    function paintFilters() {
+    const clearAll = () => { wsVerified = ""; wsCustom = false; wsF.builtin = false; wsF.by = ""; wsF.charter = ""; wsF.keys.clear(); wsF.minStars = ""; wsF.maxStars = ""; wsF.tags.clear(); paintSide(); load(); };
+    const clearBtn = h("button.wk-clear", { type: "button", onclick: clearAll });
+    const paintCount = () => {
       const n = wsActive();
-      filterBtn.textContent = n ? `Filters (${n})` : "Filters";
-      if (panel.hidden) return;
-      const changed = () => { paintFilters(); load(); };
-      const rows = [];
-      const show = [];
-      if (wsType === "charts") show.push(chip("Everything", !wsVerified, () => { wsVerified = ""; changed(); }), chip("✓ Verified", wsVerified === "1", () => { wsVerified = "1"; changed(); }, "Checked by OCTIVE: global leaderboards and full PR"), chip("Not verified", wsVerified === "0", () => { wsVerified = "0"; changed(); }));
-      show.push(chip("OCTIVE's own", wsF.builtin, () => { wsF.builtin = !wsF.builtin; changed(); }, "OCTIVE's official songs, skins and themes"));
-      if (wsType === "skins" || wsType === "styles") show.push(chip("Customizable", wsCustom, () => { wsCustom = !wsCustom; changed(); }, "Only ones their makers allow you to change"));
-      rows.push(line("show", ...show));
-      const by = h("input.ws-ftext", { type: "search", placeholder: "Type a player's name", value: wsF.by });
-      by.addEventListener("input", () => { wsF.by = by.value.trim(); filterBtn.textContent = wsActive() ? `Filters (${wsActive()})` : "Filters"; later(); });
-      rows.push(line("uploaded by", by));
+      filterBtn.textContent = n ? `Filters · ${n}` : "Filters";
+      clearBtn.hidden = !n;
+      clearBtn.textContent = `Clear ${n}`;
+    };
+    const chip = (text, on, click, title, style) => { const b = h("button.wk-chip" + (on ? ".on" : ""), { type: "button", title, style, "aria-pressed": String(!!on) }, text); b.addEventListener("click", click); return b; };
+    const group = (title, ...kids) => h("section.wk-fgroup", {}, h("h3", { text: title }), ...kids);
+    function paintSide() {
+      const changed = () => { paintSide(); load(); };
+      const groups = [];
+      if (wsType === "charts") groups.push(group("Show", h("div.wk-seg", {},
+        chip("All", !wsVerified, () => { wsVerified = ""; changed(); }),
+        chip("Verified", wsVerified === "1", () => { wsVerified = "1"; changed(); }, "Checked by OCTIVE: global leaderboards and full PR"),
+        chip("Not yet", wsVerified === "0", () => { wsVerified = "0"; changed(); }, "Not verified yet"))));
+      const only = [chip("OCTIVE's own", wsF.builtin, () => { wsF.builtin = !wsF.builtin; changed(); }, "OCTIVE's official songs, skins and themes")];
+      if (wsType === "skins" || wsType === "styles") only.push(chip("Customizable", wsCustom, () => { wsCustom = !wsCustom; changed(); }, "Only ones their makers allow you to change"));
+      groups.push(group("Only", h("div.wk-chips", {}, ...only)));
       if (wsType === "charts") {
-        const ch = h("input.ws-ftext", { type: "search", placeholder: "Type a charter's name", value: wsF.charter });
-        ch.addEventListener("input", () => { wsF.charter = ch.value.trim(); filterBtn.textContent = wsActive() ? `Filters (${wsActive()})` : "Filters"; later(); });
-        rows.push(line("charter", ch));
-        rows.push(line("keys", ...[4, 5, 6, 7, 8, 9, 10].map((k) => chip(k + "K", wsF.keys.has(k), () => { wsF.keys.has(k) ? wsF.keys.delete(k) : wsF.keys.add(k); changed(); }))));
-        const mn = h("input.ws-ftext.short", { type: "number", min: 0, max: 99, step: 0.1, placeholder: "from ★", value: wsF.minStars });
-        const mx = h("input.ws-ftext.short", { type: "number", min: 0, max: 99, step: 0.1, placeholder: "up to ★", value: wsF.maxStars });
-        mn.addEventListener("input", () => { wsF.minStars = mn.value; later(); });
-        mx.addEventListener("input", () => { wsF.maxStars = mx.value; later(); });
-        rows.push(line("stars", mn, h("span.ws-to", { text: "to" }), mx));
-        rows.push(line("tags", ...WS_TAGS.map(([id, name]) => chip(name, wsF.tags.has(id), () => { wsF.tags.has(id) ? wsF.tags.delete(id) : wsF.tags.add(id); changed(); }))));
+        groups.push(group("Keys", h("div.wk-chips.wk-keys", {}, ...[4, 5, 6, 7, 8, 9, 10].map((k) => chip(k + "K", wsF.keys.has(k), () => { wsF.keys.has(k) ? wsF.keys.delete(k) : wsF.keys.add(k); changed(); })))));
+        const lo = Number(wsF.minStars) || 0, hi = Number(wsF.maxStars) || 0;
+        const bands = WK_BANDS.map(([a, b]) => {
+          const on = (a || b) && lo === a && hi === b;
+          return chip(b ? `${a}–${b}` : `${a}+`, on, () => { if (on) { wsF.minStars = ""; wsF.maxStars = ""; } else { wsF.minStars = a ? String(a) : ""; wsF.maxStars = b ? String(b) : ""; } changed(); },
+            b ? `Hardest difficulty from ★ ${a} to ★ ${b}` : `Hardest difficulty ★ ${a} or more`, `--s:${starColor(a + 0.01)}`);
+        });
+        const mn = h("input.wk-num", { type: "number", min: 0, max: 99, step: 0.1, placeholder: "from", value: wsF.minStars, "aria-label": "Stars from" });
+        const mx = h("input.wk-num", { type: "number", min: 0, max: 99, step: 0.1, placeholder: "to", value: wsF.maxStars, "aria-label": "Stars up to" });
+        mn.addEventListener("input", () => { wsF.minStars = mn.value; paintCount(); later(); });
+        mx.addEventListener("input", () => { wsF.maxStars = mx.value; paintCount(); later(); });
+        groups.push(group("Stars", h("div.wk-chips.wk-bands", {}, ...bands), h("div.wk-range", {}, h("span", { text: "★" }), mn, h("span", { text: "to" }), mx)));
+        const all = side.dataset.tags === "all";
+        const tags = WS_TAGS.filter(([id], i) => all || i < 10 || wsF.tags.has(id));
+        groups.push(group("Tags", h("div.wk-chips", {},
+          ...tags.map(([id, name]) => chip(name, wsF.tags.has(id), () => { wsF.tags.has(id) ? wsF.tags.delete(id) : wsF.tags.add(id); changed(); })),
+          all ? null : h("button.wk-more", { type: "button", onclick: () => { side.dataset.tags = "all"; paintSide(); } }, `+ ${WS_TAGS.length - tags.length} more`))));
+        const ch = h("input.wk-text", { type: "search", placeholder: "A charter's name", value: wsF.charter, "aria-label": "Charter" });
+        ch.addEventListener("input", () => { wsF.charter = ch.value.trim(); paintCount(); later(); });
+        groups.push(group("Charter", ch));
       }
-      const clear = h("button.btn.ghost.small", { type: "button" }, "Clear filters");
-      clear.addEventListener("click", () => { wsVerified = ""; wsCustom = false; wsF.builtin = false; wsF.by = ""; wsF.charter = ""; wsF.keys.clear(); wsF.minStars = ""; wsF.maxStars = ""; wsF.tags.clear(); changed(); });
-      panel.replaceChildren(...rows, h("div.ws-fend", {}, clear));
+      const by = h("input.wk-text", { type: "search", placeholder: "A player's name", value: wsF.by, "aria-label": "Uploaded by" });
+      by.addEventListener("input", () => { wsF.by = by.value.trim(); paintCount(); later(); });
+      groups.push(group("Uploaded by", by));
+      side.replaceChildren(h("div.wk-side-head", {}, h("b", { text: "Filters" }), clearBtn), ...groups);
+      paintCount();
     }
+
     let counts = {};
-    const paintTabs = () => tabs.replaceChildren(...WS_TYPES.map(([id, name]) => {
-      const b = h("button.ws-tab" + (id === wsType ? ".on" : ""), { type: "button" }, name, counts[id] ? h("span.ws-count", { text: String(counts[id]) }) : null);
-      b.addEventListener("click", () => { wsType = id; paintTabs(); paintFilters(); load(); });
+    const paintTypes = () => types.replaceChildren(...WS_TYPES.map(([id, name]) => {
+      const b = h("button.wk-type" + (id === wsType ? ".on" : ""), { type: "button", role: "tab", "aria-selected": String(id === wsType) },
+        h("span", { text: name }), counts[id] != null ? h("small", { text: fmt0.format(counts[id]) }) : null);
+      b.addEventListener("click", () => { if (wsType === id) return; wsType = id; paintTypes(); paintSide(); load(); });
       return b;
     }));
     let gen = 0;
     function load() {
       const g = ++gen;
       status.textContent = "Loading…";
+      grid.classList.add("wk-loading");
       paintPeople();
       fetch(`${worker}/api/items?${wsQueryString()}`, { cache: "no-cache" })
         .then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
           if (g !== gen || !grid.isConnected) return;
-          if (!d) { status.textContent = "The Workshop can't be reached right now."; grid.replaceChildren(); return; }
-          counts = d.counts || {}; paintTabs();
+          grid.classList.remove("wk-loading");
+          if (!d) { status.textContent = "The Workshop can't be reached right now."; grid.replaceChildren(); shown = []; return; }
+          counts = d.counts || {}; paintTypes();
+          stats.charts.lastChild.textContent = fmt0.format(counts.charts || 0);
+          if (Number.isFinite(d.verifiedCharts)) stats.verified.lastChild.textContent = fmt0.format(d.verifiedCharts);
+          stats.other.lastChild.textContent = fmt0.format((counts.skins || 0) + (counts.themes || 0) + (counts.styles || 0));
           const what = (WS_TYPES.find((t) => t[0] === wsType) || [, "items"])[1].toLowerCase();
           const n = wsActive();
-          status.textContent = d.items.length ? `${d.items.length} ${what}${n ? ` · ${n} filter${n === 1 ? "" : "s"} on` : ""}${d.pending ? ` · ${d.pending} older upload${d.pending === 1 ? " is" : "s are"} still being read for these filters` : ""}`
-            : (wsQuery ? `No ${what} match "${wsQuery}".` : n ? `No ${what} match these filters.` : `No ${what} shared yet.`);
-          grid.replaceChildren(...d.items.map(workshopCard));
+          const order = (WK_SORTS.find(([k]) => k === wsSort) || [, ""])[1];
+          const one = (WS_LABEL[wsType] || "item").toLowerCase();
+          status.replaceChildren(...(d.items.length
+            ? [h("b", { text: `${fmt0.format(d.items.length)} ${d.items.length === 1 ? one : what}` }), h("span", { text: [order && " · " + order.toLowerCase(), n ? ` · ${n} filter${n === 1 ? "" : "s"} on` : "",
+              d.pending ? ` · ${d.pending} older upload${d.pending === 1 ? " is" : "s are"} still being read for these filters` : ""].join("") })]
+            : [h("span", { text: wsQuery ? `No ${what} match "${wsQuery}".` : n ? `No ${what} match these filters.` : `No ${what} shared yet.` })]));
+          grid.replaceChildren(...(d.items.length ? d.items.map(wkCard)
+            : [h("div.wk-empty", {}, h("b", { text: "Nothing here" }), h("p", { text: n ? "Try fewer filters." : wsQuery ? "Try other words, or a creator's name." : "Share yours from the game: Play → Workshop → Share." }),
+              n ? h("button.btn.small", { type: "button", onclick: clearAll }, "Clear the filters") : null)]));
+          shown = d.items;
         });
     }
     let t = null;
     search.addEventListener("input", () => { wsQuery = search.value.trim(); clearTimeout(t); t = setTimeout(load, 250); });
     sort.addEventListener("change", () => { wsSort = sort.value; load(); });
 
-    app.replaceChildren(h("div.ws-page", {},
-      h("section.page-head", {}, h("h1", { text: "Workshop" }),
-        h("p.sub", { text: "Charts, skins, themes and styles made by players. Download them here and open them with OCTIVE, or get them in the game (Play → Workshop). To share yours, use Share in the game: it's posted in the OCTIVE Discord too." })),
-      h("div.ws-bar", {}, tabs, h("div.ws-tools", {}, search, sort, filterBtn)),
-      panel, status, grid));
-    paintTabs();
-    paintFilters();
+    app.replaceChildren(h("div.wk-page", {},
+      head,
+      wkSpotlight(),
+      h("div.wk-bar", {}, types, h("label.wk-search", {}, sIc, search), sort, filterBtn),
+      h("div.wk-main", {}, side,
+        h("div.wk-results", {},
+          h("div.wk-results-head", {}, status, h("div.wk-head-acts", {}, surprise, myList)),
+          people, grid))));
+    paintTypes();
+    paintSide();
     load();
   }
 
@@ -1399,7 +2484,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
 
       // the banner: the picture sharp on the left and blurred behind everything
       const pic = h("div.wsi-pic" + (it.type === "skins" || it.type === "styles" ? ".contain" : ""));
-      if (it.preview) pic.append(h("img", { src: it.preview, alt: "" }));
+      if (it.preview) pic.append(waitPic(pic, h("img", { src: it.preview, alt: "" })));
+      if (isSong) pic.append(playBtn(it, "big"));
       if (it.verified && isSong) pic.append(h("span.ws-verified", { text: "✓ VERIFIED", title: "Verified by OCTIVE: global leaderboards and full PR" }));
       if (isSong && top > 0) pic.append(h("span.ws-stars", { text: "★ " + top.toFixed(2), style: `background:${starColor(top)}` }));
       const chip = (text, title, cls, style) => h("span.wsi-chip" + (cls ? "." + cls : ""), { title, style }, text);
@@ -1410,13 +2496,13 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         songs.length === 1 && sg0.bpm ? chip(`${Math.round(sg0.bpm * 10) / 10} BPM`, "Tempo", "bpm") : null,
         songs.length === 1 && sg0.durationUs ? chip(fmtLength(sg0.durationUs), "Length", "len") : null,
         songs.length > 1 ? chip(`${songs.length} songs`, "A pack", "len") : null,
-        chip(`${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"}`, "Downloads", "dl"),
+        chip(`${fmt0.format(it.downloads || 0)} download${it.downloads === 1 ? "" : "s"}`, "Downloads", "dls"),
         likeChip, revChip,
         chip(`${kb.toFixed(kb < 1 ? 2 : 1)} MB`, "Size", "size"));
       const tagList = [...new Set([...(it.tags || []), ...charts.flatMap((c) => c.autoTags || [])])];
       const own = new Set(it.tags || []);
       const tags = tagList.length ? h("div.ws-tags.wsi-tags", {}, tagList.map((t) => h("span.ws-tag" + (own.has(t) ? "" : ".auto"), { text: wsTagName(t), title: own.has(t) ? "Tagged by the uploader" : "Auto-tag: worked out from the charts' notes" }))) : null;
-      const hero = h("section.wsi-hero", { style: it.preview ? `--pic:url("${it.preview}")` : null },
+      const hero = h("section.wsi-hero", { style: (it.preview ? `--pic:url("${it.preview}");` : "") + (isSong && top > 0 ? `--c:${starColor(top)}` : "") || null },
         pic,
         h("div.wsi-head", {},
           h("span.ws-kind", { text: WS_LABEL[it.type] || it.type }),
@@ -1427,7 +2513,8 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
             h("a.btn.primary", { href: `octive://workshop/${it.id}`, onclick: () => openHint() }, "Open in OCTIVE"),
             likeBtn,
             h("a.btn", { href: `${worker}/api/download/${it.id}?redirect=1` }, (it.fileNames || []).length > 1 ? "Download (first song)" : "Download"),
-            it.discord ? h("a.btn.discord", { href: it.discord, target: "_blank", rel: "noopener" }, h("img", { src: "discord.png", alt: "" }), "On Discord") : null)));
+            it.discord ? h("a.btn.discord", { href: it.discord, target: "_blank", rel: "noopener" }, h("img", { src: "discord.png", alt: "" }), "On Discord") : null,
+            listBtn(it, true))));
 
       // every difficulty: a coloured star tile, its name and charter, its numbers and a bar for how hard it is
       const diffs = h("section.panel.wsi-diffs", {}, h("h2", { text: charts.length ? `Difficulties · ${charts.length}` : "Difficulties" }),
@@ -1597,12 +2684,12 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const p = findPlayer(id);
     if (p) { setAvatar(box, p); return box; }
     box.querySelector(".dot").remove();
+    box.style.setProperty("--av", avatarTint(id || name));
     // not in the loaded ranking (yet): their picture straight from the server, the first letter if there's none
     if (worker && id) {
       const img = box.querySelector("img"), initial = box.querySelector(".initial");
-      img.onload = () => { img.hidden = false; initial.hidden = true; };
-      img.onerror = () => img.remove();
-      img.src = `${worker}/avatar/${encodeURIComponent(id)}` + (avatarHash ? `?v=${encodeURIComponent(avatarHash)}` : "");
+      waitForPicture(box, img, initial, `${worker}/avatar/${encodeURIComponent(id)}` + (avatarHash ? `?v=${encodeURIComponent(avatarHash)}` : ""));
+      img.onerror = () => { box.classList.remove("av-wait"); img.remove(); initial.hidden = false; };
     }
     return box;
   }
@@ -1774,51 +2861,75 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       }));
     });
   }
-  /** #/daily: today's charts, the scoring and every tier's board. */
+  /** #/daily: today's charts, the scoring and every tier's board.
+   *  (3.2) Redone: a countdown to the next charts (with how far the day has gone), the rules in three lines, and each tier
+   *  as a wide card: its chart's picture (▶ to listen), the tier and what it multiplies by, the chart, and the day's best. */
+  const TIER_MULT = { easy: "×½", normal: "×1", hard: "×2", extreme: "×3" };
   function dailyPage() {
     document.title = "Daily charts · OCTIVE";
-    const clock = h("span.dp-clock", { text: "…" });
-    const grid = h("div.dp-grid", {}, h("p.empty", { text: "Loading today's charts…" }));
-    app.replaceChildren(h("div.daily-page", {},
-      h("section.page-head", {}, h("h1", { text: "Daily charts" }),
-        h("p.sub", { text: "The same charts for everyone, new every day at midnight UTC. One attempt each and no mods: your accuracy, rounded down, is your points (halved on Easy, doubled on Hard, tripled on Extreme). Play them in the game: Play → Daily & Shop." }),
-        h("div.ph-chips", {}, h("span.ph-chip", {}, "New charts in ", clock))),
-      grid));
+    const clock = h("b.dp-clock", { text: "--:--:--" });
+    const dayFill = h("i");
+    const dateEl = h("small.dp-date");
+    const tiersBox = h("div.dp-tiers", {}, ...Array.from({ length: 4 }, () => h("div.dp-tcard.dp-ghost", { "aria-hidden": "true" }, h("div.dp-tart.pic-wait"), h("div.dp-tinfo", {}, h("i"), h("i"), h("i")))));
+    const rule = (b, t) => h("li", {}, h("b", { text: b }), h("span", { text: t }));
+    app.replaceChildren(h("div.daily-page.dp-page", {},
+      h("section.hero.dp-hero", {},
+        h("div", {}, h("p.eyebrow", { text: "Every day" }), h("h1", { text: "Daily charts" }),
+          h("p.sub", { text: "Four charts for everyone, new every day at midnight UTC. Play them in the game: Play → Daily & Shop." })),
+        h("div.dp-timer", { role: "timer", "aria-label": "Time until the next charts" },
+          h("small", { text: "New charts in" }), clock, h("span.dp-daybar", { title: "How much of today has gone" }, dayFill), dateEl)),
+      h("ul.dp-rules", {},
+        rule("One try", "at each chart, once a day"),
+        rule("No mods", "every chart as it is"),
+        rule("Accuracy is points", "rounded down, times the tier: ×½ ×1 ×2 ×3")),
+      tiersBox));
     loadDaily().then((d) => {
-      if (!grid.isConnected) return;
-      if (!d || !(d.tiers || []).length) { grid.replaceChildren(h("p.empty", { text: "Today's charts can't be loaded right now." })); return; }
-      const tick = () => { if (!clock.isConnected) { clearInterval(iv); return; } clock.textContent = untilText(d.nextAt); };
+      if (!tiersBox.isConnected) return;
+      if (!d || !(d.tiers || []).length) { tiersBox.replaceChildren(h("p.empty", { text: "Today's charts can't be loaded right now." })); return; }
+      const next = Date.parse(d.nextAt);
+      if (d.date) dateEl.textContent = new Date(d.date + "T12:00:00Z").toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long", timeZone: "UTC" });
+      const tick = () => {
+        if (!clock.isConnected) { clearInterval(iv); return; }
+        const left = Math.max(0, next - Date.now());
+        const hh = Math.floor(left / 3_600_000), mm = Math.floor(left / 60_000) % 60, ss = Math.floor(left / 1000) % 60;
+        clock.textContent = [hh, mm, ss].map((n) => String(n).padStart(2, "0")).join(":");
+        dayFill.style.width = `${Math.min(100, Math.max(0, (1 - left / 86_400_000) * 100)).toFixed(2)}%`;
+      };
       const iv = setInterval(tick, 1000); tick();
-      grid.replaceChildren(...d.tiers.map((t) => {
+      tiersBox.replaceChildren(...d.tiers.map((t) => {
         const col = TIER_COLOR[t.tier] || "#b69bff";
-        const list = h("div.dp-board");
-        let shown = 10;
-        const paint = () => {
-          const top = t.top || [];
-          list.replaceChildren(
-            ...(top.length ? top.slice(0, shown).map((s, i) => h("a.dp-row", { href: profileHref(s.id), "data-place": i + 1 },
-              h("span.wb-rank", { text: "#" + (i + 1) }), smallAvatar(s.id, s.name), h("b", { text: s.name || "Player" }),
-              h("span.dp-acc", { text: (Number(s.acc) || 0).toFixed(2) + "%" }), h("span.dp-pts", { text: fmt0.format(s.points || 0) + " pts" })))
-              : [h("p.empty", { text: "Nobody has played it yet today." })]),
-            top.length > shown ? h("button.btn.small", { type: "button", onclick: () => { shown = top.length; paint(); } }, `Show all ${top.length}`) : null);
-        };
-        paint();
-        return h("article.dp-card", { style: `--c:${col}` },
-          h("div.dp-pic", {}, t.preview ? h("img", { src: t.preview, alt: "", loading: "lazy", onerror: (e) => e.currentTarget.remove() }) : null,
-            h("span.dp-tier", { text: t.name }), h("span.dp-max", { text: `up to ${fmt0.format(t.maxPoints || 0)} pts` })),
-          h("div.dp-info", {},
-            h("h2", { text: t.title, title: t.title }),
-            h("p.dp-artist", { text: t.artist || "" }),
+        const top = t.top || [];
+        const board = h("ol.dp-top");
+        let shown = 5;
+        const paintBoard = () => board.replaceChildren(
+          ...(top.length ? top.slice(0, shown).map((sc, i) => h("li", {}, h("a.dp-row", { href: profileHref(sc.id), "data-place": i + 1 },
+              h("span.dp-rank", { text: String(i + 1) }), smallAvatar(sc.id, sc.name), h("b.dp-who", { text: sc.name || "Player" }),
+              h("span.dp-acc", { text: (Number(sc.acc) || 0).toFixed(2) + "%" }), h("span.dp-pts", { text: fmt0.format(sc.points || 0) }))))
+            : [h("li.dp-none", {}, h("b", { text: "Nobody yet" }), h("span", { text: "Be the first to set a score today." }))]),
+          top.length > shown ? h("li.dp-more", {}, h("button.btn.small.ghost", { type: "button", onclick: () => { shown = top.length; paintBoard(); } }, `Show all ${fmt0.format(top.length)}`)) : null);
+        paintBoard();
+        const art = h("div.dp-tart");
+        if (t.preview) art.append(waitPic(art, h("img", { src: t.preview, alt: "", loading: "lazy", onerror: (e) => e.currentTarget.remove() })));
+        else art.append(h("span.dp-noart", { text: "♪" }));
+        if (t.itemId) art.append(playBtn({ id: t.itemId, title: t.title, creator: t.artist, preview: t.preview, type: "charts" }, "big"));
+        return h("article.dp-tcard", { style: `--c:${col}` },
+          art,
+          h("div.dp-tinfo", {},
+            h("div.dp-ttop", {}, h("span.dp-tname", { text: t.name }), h("span.dp-mult", { text: TIER_MULT[t.tier] || "", title: "Your accuracy is multiplied by this" }),
+              h("span.dp-tmax", { text: `up to ${fmt0.format(t.maxPoints || 0)} pts` })),
+            h("h2.dp-ttitle", { text: t.title || "Chart", title: t.title || "" }),
+            h("p.dp-tartist", { text: [t.artist, t.creator ? "charted by " + t.creator : ""].filter(Boolean).join(" · ") }),
             h("div.dp-facts", {},
               h("span.dp-star", { text: "★ " + (t.stars || 0).toFixed(2), style: `--s:${starColor(t.stars || 0)}` }),
-              h("span", { text: t.difficulty || "" }), h("span", { text: `${t.keys || 4}K` }),
+              t.difficulty ? h("span", { text: t.difficulty }) : null, h("span", { text: `${t.keys || 4}K` }),
               t.notes ? h("span", { text: `${fmt0.format(t.notes)} notes` }) : null,
               t.durationUs ? h("span", { text: fmtLength(t.durationUs) }) : null),
             h("div.dp-actions", {},
-              t.itemId ? h("a.btn.small", { href: "workshop/" + t.itemId }, "View chart") : null,
-              t.itemId ? h("a.btn.small.primary", { href: `octive://workshop/${t.itemId}`, onclick: () => openHint() }, "Open in OCTIVE") : null),
-            h("h3.dp-board-head", { text: `Today's scores · ${fmt0.format(t.players || 0)}` }),
-            list));
+              t.itemId ? h("a.btn.small.primary", { href: `octive://workshop/${t.itemId}`, onclick: () => openHint() }, "Open in OCTIVE") : null,
+              t.itemId ? h("a.btn.small", { href: "workshop/" + t.itemId }, "View chart") : null)),
+          h("div.dp-tboard", {},
+            h("div.dp-tboard-head", {}, h("b", { text: "Today's best" }), h("small", { text: `${fmt0.format(t.players || 0)} played` })),
+            board));
       }));
     });
   }
@@ -1969,11 +3080,14 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const testerBox = h("section.tester-dl", { hidden: true });
     const verChip = h("span.ph-chip.ver", { text: "Latest version" });
     loadRelease().then((m) => { if (m && m.version) verChip.textContent = "v" + m.version; });
+    // (3.0) the one for your device first and big, then the rest
+    const first = isAndroid ? android : win, second = isAndroid ? win : android;
+    first.classList.add("featured");
     const page = h("div.download-page", {},
-      h("section.page-head", {}, h("h1", { text: "Download OCTIVE" }), h("p.sub", { text: "Free on Windows and Android. Your account, scores and friends work on both." }),
+      h("section.page-head", {}, h("p.eyebrow", { text: "Free on every device" }), h("h1", { text: "Download OCTIVE" }), h("p.sub", { text: "Free on Windows and Android, or play in your browser. Your account, scores and friends work on all of them." }),
         h("div.ph-chips", {}, h("span.ph-chip.free", { text: "Free" }), verChip, h("span.ph-chip", { text: "Windows · Android · Browser" }))),
       testerBox,
-      h("div.dl-grid", {}, win, android, web, linux, mac),
+      h("div.dl-grid", {}, first, web, second, linux, mac),
       notes);
     app.replaceChildren(page);
     // testers (signed in here): the newest test build; the server only answers testers
@@ -2073,6 +3187,19 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           const src = `${worker}/avatar/${encodeURIComponent(me.playerId)}?v=${encodeURIComponent(me.avatarHash)}`;
           if (img) img.src = src; else av.replaceChildren(h("img", { src, alt: "" }));
         } else if (img) av.replaceChildren(...new DOMParser().parseFromString('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>', "image/svg+xml").childNodes);
+      }
+    }
+    // (3.0) the same in the top bar
+    const top = document.querySelector(".top-me");
+    if (top) {
+      const signedIn = !!me;
+      top.href = me && me.hasCard && !me.banned ? profileHref(me.playerId) : "account";
+      top.title = signedIn ? "Your profile" : "Sign in";
+      top.querySelector(".top-me-name")?.replaceChildren(signedIn ? me.name : "Sign in");
+      const tav = top.querySelector(".top-av");
+      if (tav) {
+        if (me && me.avatarHash) tav.replaceChildren(h("img", { src: `${worker}/avatar/${encodeURIComponent(me.playerId)}?v=${encodeURIComponent(me.avatarHash)}`, alt: "" }));
+        else if (tav.querySelector("img")) tav.replaceChildren(...new DOMParser().parseFromString('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>', "image/svg+xml").childNodes);
       }
     }
     const gear = document.querySelector(".nav-settings");
@@ -3041,7 +4168,15 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (from !== "custom") custom.value = months;
       upd();
     };
-    const quick = h("div.quick-months", {}, [1, 3, 6, 12, 24, 36].map((m) => h("button.chip", { type: "button", "data-m": m, onclick: () => setMonths(m) }, m === 1 ? "1 month" : m === 36 ? "36 months · 50% off" : `${m} months`)));
+    // (3.2) the usual lengths as tiles: how many months, what a month costs, and the discount
+    const quick = h("div.su-tiles", {}, [1, 3, 6, 12, 24, 36].map((m) => {
+      const pct = Math.round(discountFor(m) * 100);
+      return h("button.su-tile" + (m === 36 ? ".best" : ""), { type: "button", "data-m": m, onclick: () => setMonths(m), "aria-label": `${m} month${m === 1 ? "" : "s"}` },
+        pct ? h("span.su-off", { text: `−${pct}%` }) : null,
+        h("b", { text: String(m) }), h("small", { text: m === 1 ? "month" : "months" }),
+        h("span.su-per", { text: `${usd(priceFor(m) / m)} a month` }),
+        m === 36 ? h("span.su-best", { text: "Best value" }) : null);
+    }));
     const upd = () => {
       monthsLabel.textContent = months === 1 ? "1 month" : `${months} months`;
       const cents = priceFor(months), pct = Math.round(discountFor(months) * 100);
@@ -3121,13 +4256,12 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
         location.href = r.url;
       } catch (e) { setMsg(lifeOut, e.message); }
     }));
-    const lifetimePanel = h("section.panel.life-panel", {},
-      h("img.life-badge", { src: "badges/supporter-3y.png", alt: "" }),
-      h("div.life-text", {},
-        h("span.life-tag", { text: "Lifetime" }),
-        h("h2", { text: "Supporter forever, for $35" }),
-        h("p.panel-sub", { text: "Pay once and every perk is yours for good: it never runs out. That's the price of 14 months at $2.50, and your total time as a supporter keeps growing every day. For your own account." })),
-      h("div.life-cta", {}, h("b.life-price", { text: "$35" }), h("span.life-once", { text: "one time" }), lifeBuy, lifeOut));
+    const lifetimePanel = h("section.su-life", { id: "su-life" },
+      h("div.su-life-top", {}, h("img.su-life-badge", { src: "badges/supporter-3y.png", alt: "" }),
+        h("div", {}, h("span.su-life-tag", { text: "Lifetime" }), h("h2", { text: "Supporter forever" }))),
+      h("div.su-life-price", {}, h("b.life-price", { text: "$35" }), h("span.life-once", { text: "one time" })),
+      h("ul.su-life-list", {}, ...["Every perk, for good: it never runs out", "The price of 14 months at $2.50", "Your time as a supporter keeps growing every day", "For your own account"].map((t) => h("li", { text: t }))),
+      lifeBuy, lifeOut);
     const signHint = h("p.panel-sub.center");
     // the developer can gift supporter time for free
     const freeBtn = h("button.btn.wide.free-gift", { type: "button", hidden: true }, "♥ Gift for free (developer)");
@@ -3140,39 +4274,82 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     }));
 
     const status = h("div.sup-status");
-    const page = h("div.supporter-page", {},
+    // (3.2) the page, redone: a hero with a look at a supporter's profile, the plans (months or lifetime), the perks as
+    // cards with icons, the badges as two tracks, and the supporters
+    const pvName = h("b.su-pv-name.rainbow-text", { text: "Your name" });
+    const art = (m) => `badges/supporter-${milestoneArt(m)[1]}.png`;
+    const preview = h("div.su-preview", { "aria-hidden": "true" },
+      h("img.su-float.f1", { src: art(36), alt: "" }), h("img.su-float.f2", { src: art(12), alt: "" }), h("img.su-float.f3", { src: art(3), alt: "" }),
+      h("div.su-pv-card", {},
+        h("div.su-pv-banner", {}, ...Array.from({ length: 14 }, (_, i) => h("i", { style: `--x:${(i * 37) % 100}%;--y:${(i * 53) % 100}%;--d:${(i % 5) * 0.6}s` }))),
+        h("div.su-pv-body", {},
+          h("span.su-pv-av", {}, h("img", { src: "logo.svg", alt: "" })),
+          h("div.su-pv-who", {}, pvName, h("span.sup-pill", {}, h("img", { src: art(12), alt: "" }), h("span", { text: "Supporter" })))),
+        h("div.su-pv-perks", {}, ...["3× daily points", "Coloured name", "Banner", "Profile effects"].map((t) => h("span", { text: t })))));
+    const plans = h("section.su-plans", { id: "su-plans" },
+      h("div.su-buy", {},
+        h("div.su-buy-head", {}, h("h2", { text: "Choose your time" }), h("div.seg-row", {}, forMe, forGift)),
+        h("p.panel-sub", { text: "$2.50 a month. The longer the block, the less each month costs, down to half price at 36 months. One payment, nothing renews." }),
+        giftBox,
+        quick,
+        h("div.su-custom", {}, h("span", { text: "Or any number of months" }), slider, h("label.months-custom-wrap", {}, custom)),
+        h("div.su-total", {}, h("div.su-total-main", {}, h("small", {}, monthsLabel), total, h("div.su-total-sub", {}, each, save)), buy),
+        lifeNote, freeBtn, out, signHint,
+        h("p.fine", { text: "Payments are handled by Stripe; OCTIVE never sees your card. Time adds onto any time you already have. See the Terms for refunds." })),
+      lifetimePanel);
+    const PERK_ICONS = [
+      '<rect x="3.5" y="5" width="17" height="15" rx="2"/><path d="M8 3v4M16 3v4M3.5 10h17"/><path d="m12 12.4.9 1.8 2 .3-1.45 1.4.35 2-1.8-.95-1.8.95.35-2-1.45-1.4 2-.3z"/>',
+      '<path d="M3 12V4h8l9.3 9.3a1.5 1.5 0 0 1 0 2.1l-5.9 5.9a1.5 1.5 0 0 1-2.1 0z"/><circle cx="7.5" cy="8.5" r="1.5"/>',
+      '<path d="M8.5 3h7L20 7.5v7L15.5 19h-7L4 14.5v-7z"/><path d="m12 7.6 1.2 2.4 2.6.4-1.9 1.8.5 2.6-2.4-1.3-2.4 1.3.5-2.6-1.9-1.8 2.6-.4z"/>',
+      '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.6"/><path d="m21 16-5-5-8 8"/>',
+      '<path d="M4 19 9 5h2l5 14M6.2 14h7.6"/><path d="M19 9s2 2.3 2 3.6a2 2 0 0 1-4 0C17 11.3 19 9 19 9z"/>',
+      '<path d="M12 4c.6 3.6 1.9 5 5.5 5.5C13.9 10 12.6 11.4 12 15c-.6-3.6-1.9-5-5.5-5.5C10.1 9 11.4 7.6 12 4z"/><path d="M18.5 14c.3 1.7.9 2.3 2.5 2.5-1.6.3-2.2.9-2.5 2.5-.3-1.6-.9-2.2-2.5-2.5 1.6-.2 2.2-.8 2.5-2.5z"/>',
+      '<rect x="3" y="4" width="18" height="16" rx="3"/><path d="m10 9 5 3-5 3z"/>',
+      '<path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17z"/><path d="m14.5 7.5 3 3"/>',
+      '<path d="M12 15V4M7.5 8.5 12 4l4.5 4.5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>',
+      '<rect x="3" y="4" width="18" height="5" rx="1.5"/><rect x="3" y="11" width="18" height="4" rx="1.2"/><rect x="3" y="17" width="18" height="3" rx="1"/>',
+      '<path d="M3 20h18"/><path d="M6 16v-4M11 16V8M16 16v-6M20 16V5"/>',
+    ];
+    const PERK_COLS = ["#ff4d9d", "#ff9a3d", "#ffd23f", "#3ee089", "#36d6ff", "#5b7cff", "#a764ff"];
+    const perkGrid = h("section.su-perks", {},
+      h("div.section-head", {}, h("h2.section-title", { text: "What you get" })),
+      h("div.su-perk-grid", {}, perks.map(([t, d], i) => {
+        const ic = h("span.su-perk-ic");
+        ic.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${PERK_ICONS[i] || PERK_ICONS[2]}</svg>`;
+        return h("div.su-perk", { style: `--c:${PERK_COLS[i % PERK_COLS.length]}` }, ic, h("b", { text: t }), h("p", { text: d }));
+      })));
+    const track = (title, sub, items) => h("section.su-badges", {},
+      h("div.section-head", {}, h("h2.section-title", { text: title })), h("p.panel-sub", { text: sub }),
+      h("ol.su-track", {}, ...items.map(([img, label, note]) => h("li", {}, h("img", { src: img, alt: "" }), h("b", { text: label }), note ? h("small", { text: note }) : null))));
+    const wallN = h("span.su-wall-n");
+    const page = h("div.supporter-page.su-page", {},
       thanks ? h("div.thanks", {}, h("b", { text: "Thank you! ♥" }), h("span", { text: " Your support is being added now and shows in the game within a few minutes. Gifts wait for the player to claim them on their profile." })) : null,
-      h("section.sup-hero", {},
-        h("img.sup-hero-badge", { src: "badges/supporter-1y.png", alt: "" }),
-        h("div", {}, h("h1", { text: "Support OCTIVE" }),
+      h("section.su-hero", {},
+        h("div.su-hero-text", {},
+          h("p.eyebrow", { text: "Support OCTIVE" }),
+          h("h1", { text: "Become a supporter" }),
           h("p.sub", { text: "OCTIVE is free and made by one developer. Supporting keeps the servers running and gets you a few nice extras." }),
-          status)),
-      lifetimePanel,
-      h("div.sup-grid", {},
-        h("section.panel.buy-panel", {},
-          h("h2", { text: "Choose your time" }),
-          h("p.panel-sub", { text: "$2.50 a month, any number of months (type your own). Longer blocks cost less: 3+ months 10% off, 6+ 20%, 12+ 30%, 24+ 40%, and 36+ 50% (the most). One-time payment, nothing renews." }),
-          h("div.seg-row", {}, forMe, forGift), giftBox,
-          h("div.months-row", {}, monthsLabel, slider, h("label.months-custom-wrap", {}, h("span", { text: "Custom" }), custom)), quick,
-          h("div.price-box", {}, total, h("div", {}, each, save)),
-          buy, lifeNote, freeBtn, out, signHint,
-          h("p.fine", { text: "Payments are handled by Stripe; OCTIVE never sees your card. Time adds onto any time you already have. See the Terms for refunds." })),
-        h("section.panel.perk-panel", {},
-          h("h2", { text: "What you get" }),
-          h("ul.perks", {}, perks.map(([t, d]) => h("li", {}, h("b", { text: t }), h("span", { text: d })))))),
-      h("section.panel.milestones", {},
-        h("h2", { text: "Anniversary badges" }),
-        h("p.panel-sub", { text: "Earned from your total time as a supporter. Gaps never reset it." }),
-        h("div.sup-earned.big", {}, MILESTONE_ART.slice().reverse().map(([, key, label]) => h("figure", {}, h("img", { src: `badges/supporter-${key}.png`, alt: "" }), h("figcaption", { text: label }))))),
-      h("section.panel.milestones", {},
-        h("h2", { text: "Gifter badges" }),
-        h("p.panel-sub", { text: "Earned by gifting supporter to other players: every month you gift counts. Everyone who buys supporter also gets a Supporter number (#0001, #0002…) in the order they first supported OCTIVE." }),
-        h("div.sup-earned.big", {}, GIFTER_ART.slice().reverse().map(([, key, label, range]) => h("figure", {}, h("img", { src: `badges/gifter-${key}.png`, alt: "" }), h("figcaption", { text: `${label} · ${range} months` }))))),
-      h("section.panel.wall", {}, h("h2", { text: "Supporters" }), h("div.wall-list", {}, h("p.panel-sub", { text: "Loading…" }))));
+          status,
+          h("div.su-hero-acts", {},
+            h("button.btn.primary.big", { type: "button", onclick: () => plans.scrollIntoView({ behavior: "smooth", block: "start" }) }, "♥ Choose your time"),
+            h("button.btn.big", { type: "button", onclick: () => lifetimePanel.scrollIntoView({ behavior: "smooth", block: "center" }) }, "Lifetime · $35")),
+          h("ul.su-facts", {}, h("li", { text: `From ${usd(priceFor(36) / 36)} a month` }), h("li", { text: "Nothing renews" }), h("li", { text: "Paid safely with Stripe" }))),
+        preview),
+      plans,
+      perkGrid,
+      h("div.su-badge-row", {},
+        track("Anniversary badges", "Earned from your total time as a supporter. Gaps never reset it.",
+          MILESTONE_ART.slice().reverse().map(([, key, label]) => [`badges/supporter-${key}.png`, label])),
+        track("Gifter badges", "Earned by gifting supporter to other players: every month you gift counts.",
+          GIFTER_ART.slice().reverse().map(([, key, label, range]) => [`badges/gifter-${key}.png`, label, `${range} months`]))),
+      h("section.panel.wall.su-wall", {}, h("div.su-wall-head", {}, h("h2", { text: "Thank you, supporters" }), wallN),
+        h("p.panel-sub", { text: "Everyone who buys supporter gets a Supporter number (#0001, #0002…) in the order they first supported OCTIVE." }),
+        h("div.wall-list", {}, h("p.panel-sub", { text: "Loading…" }))));
     app.replaceChildren(page);
     upd(); paintGift();
 
     const paintMe = () => {
+      pvName.textContent = me ? me.name : "Your name";
       signHint.textContent = me ? `Signed in as ${me.name}.` : "";
       if (!me) signHint.append(h("a", { href: "account" }, "Sign in"), " with your game account to buy.");
       status.textContent = "";
@@ -3208,6 +4385,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           wall.append(a);
         }
         if (!list.length) wall.append(h("p.panel-sub", { text: "Be the first." }));
+        else wallN.textContent = `${fmt0.format(list.length)} supporting now`;
       } catch { wall.textContent = "The list couldn't be loaded."; }
     })();
   }
@@ -3524,9 +4702,11 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (!list.children.length) list.append(h("p.empty", { text: "No questions match. Try other words, or ask in the Discord." }));
     };
     q.addEventListener("input", paint);
+    // (3.0) help?q=… (from the quick search) opens with that question found
+    q.value = hashQuery().get("q") || "";
     paint();
     app.replaceChildren(h("div.help-page", {},
-      h("section.page-head", {}, h("h1", { text: "Help" }), h("p.sub", { text: "Common questions about OCTIVE." })),
+      h("section.page-head", {}, h("p.eyebrow", { text: "Questions and answers" }), h("h1", { text: "Help" }), h("p.sub", { text: "Common questions about OCTIVE. Can't find yours? Press Ctrl K to search everything, or ask in the Discord." })),
       q, list));
   }
 
@@ -3613,7 +4793,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   }
 
   const dmAvatar = (id, name, cls = "dm-av") => {
-    const el = h("span." + cls, { text: (name || "?").slice(0, 1).toUpperCase() });
+    const el = h("span." + cls, { text: (name || "?").slice(0, 1).toUpperCase(), style: `--av:${avatarTint(id)}` });
     const img = h("img", { src: `${worker}/avatar/${encodeURIComponent(id)}`, alt: "", loading: "lazy" });
     img.addEventListener("load", () => { el.textContent = ""; el.append(img); });
     return el;
@@ -3636,18 +4816,21 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (page() !== "messages") return;
     }
     if (!me) {
-      app.replaceChildren(h("div.dm-signin", {},
+      const ic = h("span.dm-signin-ic", { "aria-hidden": "true" });
+      ic.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8a2.5 2.5 0 0 1-2.5 2.5H10l-4.5 4v-4h0A2.5 2.5 0 0 1 4 13.5z"/><path d="M8.5 8.5h7M8.5 11.5h4.5"/></svg>';
+      app.replaceChildren(h("section.dm-signin", {}, ic,
         h("h1", { text: "Messages" }),
-        h("p.sub", { text: "Sign in with your OCTIVE account to read and send messages to your friends." }),
-        h("a.btn.primary", { href: "account" }, "Sign in")));
+        h("p.sub", { text: "Sign in with your OCTIVE account to read and send messages to your friends. They get them in the game too, even when they're offline." }),
+        h("a.btn.primary.big", { href: "account" }, "Sign in")));
       return;
     }
     const openId = (routeHash().match(/^#\/messages\/([A-Za-z0-9_-]{8,64})/) || [])[1] || null;
     const list = h("div.dm-list");
     const pane = h("section.dm-pane");
-    const root = h("div.dm-page" + (openId ? ".dm-open" : ""), {}, h("aside.dm-side", {}, h("h1", { text: "Messages" }), list), pane);
+    const unreadChip = h("span.dm-unread-chip", { hidden: true });
+    const root = h("div.dm-page" + (openId ? ".dm-open" : ""), {}, h("aside.dm-side", {}, h("div.dm-side-head", {}, h("h1", { text: "Messages" }), unreadChip), list), pane);
     app.replaceChildren(root);
-    let box = null, thread = [], since = 0;
+    let box = null, thread = [], since = 0, paintHead = () => {};
 
     const nameOf = (id) => (box?.threads || []).find((t) => t.with === id)?.name || (box?.friends || []).find((f) => f.id === id)?.name || dmNames[id] || findPlayer(id)?.name || (id === OFFICIAL_ID ? "Octive" : "Player");
 
@@ -3656,7 +4839,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       const rows = [];
       for (const t of box?.threads || []) {
         seen.add(t.with);
-        rows.push(h("a.dm-row" + (t.with === openId ? ".active" : "") + (t.unread ? ".unread" : ""), { href: "messages/" + encodeURIComponent(t.with) },
+        rows.push(h("a.dm-row" + (t.with === openId ? ".active" : "") + (t.unread ? ".unread" : "") + (findPlayer(t.with)?.online ? ".online" : ""), { href: "messages/" + encodeURIComponent(t.with) },
           dmAvatar(t.with, t.name),
           h("span.dm-row-main", {}, h("span.dm-row-name", { text: t.name || "Player" }), h("span.dm-row-last", { text: (t.fromMe ? "You: " : "") + (t.preview || "") })),
           h("span.dm-row-side", {}, h("span.dm-when", { text: t.last ? dmWhen(t.last) : "" }), t.unread ? h("span.dm-count", { text: String(t.unread) }) : null)));
@@ -3665,7 +4848,7 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (others.length) {
         rows.push(h("p.dm-cap", { text: "Friends" }));
         for (const f of others)
-          rows.push(h("a.dm-row" + (f.id === openId ? ".active" : ""), { href: "messages/" + encodeURIComponent(f.id) },
+          rows.push(h("a.dm-row" + (f.id === openId ? ".active" : "") + (findPlayer(f.id)?.online ? ".online" : ""), { href: "messages/" + encodeURIComponent(f.id) },
             dmAvatar(f.id, f.name), h("span.dm-row-main", {}, h("span.dm-row-name", { text: f.name || "Player" }), h("span.dm-row-last", { text: "Start a conversation" }))));
       }
       if (!rows.length)
@@ -3673,23 +4856,31 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
           ? "Open OCTIVE and sign in once: the game shares your friend list with the website so you can message them here."
           : "No friends yet. Add friends in the game (Friends, F8), then message them here." }));
       list.replaceChildren(...rows);
+      const n = box?.unread || 0;
+      unreadChip.hidden = !n;
+      unreadChip.textContent = `${n} unread`;
     }
 
     const feed = h("div.dm-feed");
     const input = h("textarea.dm-input", { rows: 1, maxlength: 500, placeholder: "Write a message…", "aria-label": "Message" });
-    const sendBtn = h("button.btn.primary", { type: "submit" }, "Send");
+    const sendBtn = h("button.dm-sendbtn", { type: "submit", "aria-label": "Send", title: "Send (Enter)" });
+    sendBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12 20 4l-4 16-4.5-6.5z"/><path d="M20 4 11.5 13.5"/></svg>';
     const note = h("p.form-msg", { role: "status" });
 
     function paintThread() {
       const kids = [];
-      let day = "";
+      let day = "", prev = null;
       for (const m of thread) {
         const d = new Date(m.at).toDateString();
-        if (d !== day) { day = d; kids.push(h("p.dm-day", { text: d === new Date().toDateString() ? "Today" : new Date(m.at).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) })); }
+        if (d !== day) { day = d; prev = null; kids.push(h("p.dm-day", {}, h("span", { text: d === new Date().toDateString() ? "Today" : new Date(m.at).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) }))); }
         const mine = m.from === me.playerId;
-        kids.push(h("div.dm-msg" + (mine ? ".mine" : "") + (m.pending ? ".pending" : "") + (m.failed ? ".failed" : ""), {},
-          h("p", { text: m.text }),
-          h("span.dm-time", { text: m.failed ? "Not sent: " + m.failed : m.pending ? "Sending…" : new Date(m.at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) })));
+        const first = !prev || prev.from !== m.from || m.at - prev.at > 5 * 60e3;
+        kids.push(h("div.dm-msg" + (mine ? ".mine" : "") + (first ? ".first" : "") + (m.pending ? ".pending" : "") + (m.failed ? ".failed" : ""), {},
+          !mine && first ? dmAvatar(m.from, nameOf(m.from), "dm-msg-av") : null,
+          h("div.dm-bubble", {},
+            h("p", { text: m.text }),
+            h("span.dm-time", { text: m.failed ? "Not sent: " + m.failed : m.pending ? "Sending…" : new Date(m.at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) }))));
+        prev = m;
       }
       if (!kids.length) kids.push(h("p.dm-none", { text: `Say hi to ${nameOf(openId)}! They'll see it in the game, even if they're offline right now.` }));
       const atBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
@@ -3735,17 +4926,31 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     if (openId) {
       input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
       input.addEventListener("input", () => { input.style.height = ""; input.style.height = Math.min(input.scrollHeight, 160) + "px"; });
+      const headAv = h("span.dm-head-av"), headName = h("a.dm-head-name", { href: profileHref(openId) }), headSub = h("small.dm-head-sub");
+      paintHead = () => {
+        headAv.replaceChildren(dmAvatar(openId, nameOf(openId)));
+        headName.textContent = nameOf(openId);
+        const p = findPlayer(openId);
+        headSub.textContent = p ? (p.online ? "● " : "") + statusText(p) : "";
+        headSub.classList.toggle("on", !!(p && p.online));
+      };
+      paintHead();
       const head = h("div.dm-head", {},
         h("a.dm-back", { href: "messages", "aria-label": "All messages" }, "←"),
-        dmAvatar(openId, nameOf(openId)),
-        h("a.dm-head-name", { href: profileHref(openId) }, nameOf(openId)));
+        headAv, h("div.dm-head-text", {}, headName, headSub),
+        h("a.btn.small.dm-head-prof", { href: profileHref(openId) }, "Profile"));
       pane.replaceChildren(head, feed,
         h("form.dm-send", { onsubmit: (e) => { e.preventDefault(); send(); } }, input, sendBtn), note);
-    } else pane.replaceChildren(h("div.dm-empty", {}, h("p", { text: "Pick a conversation or a friend." })));
+    } else {
+      const ic = h("span.dm-empty-ic", { "aria-hidden": "true" });
+      ic.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8a2.5 2.5 0 0 1-2.5 2.5H10l-4.5 4v-4h0A2.5 2.5 0 0 1 4 13.5z"/><path d="M8.5 8.5h7M8.5 11.5h4.5"/></svg>';
+      pane.replaceChildren(h("div.dm-empty", {}, ic, h("b", { text: "Your messages" }),
+        h("p", { text: "Pick a conversation or a friend. Messages reach them in the game too, even when they're offline." })));
+    }
 
     await loadInbox();
     if (openId) {
-      const nm = pane.querySelector(".dm-head-name"); if (nm) nm.textContent = nameOf(openId);
+      paintHead();
       await loadThread();
       paintThread();
       input.focus();
@@ -3767,11 +4972,11 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     const one = (routeHash().match(/^#\/crew\/([a-z0-9]{10,24})/) || [])[1];
     if (one) return crewPage(one);
     document.title = "Crews · OCTIVE";
-    const podium = h("div.cw-podium");
+    const podium = h("div.t3-wrap");
     const list = h("div.crew-list", {}, h("p.empty", { text: "Loading the crew board…" }));
     app.replaceChildren(h("section.cw-board", {},
-      h("div.section-head", {}, h("h1.section-title", { text: "Crew board" }), h("a.more", { href: "rankings" }, "Players →")),
-      h("p.panel-sub.crew-intro", { text: "Crews are teams of up to 12 players. A crew's score is its five best members' PR added up. Make or join one in the game: Profile → Crew." }),
+      h("section.page-head", {}, h("p.eyebrow", { text: "Teams" }), h("h1", { text: "Crews" }),
+        h("p.sub", { text: "Crews are teams of up to 12 players. A crew's score is its five best members' PR added up. Make or join one in the game: Profile → Crew." })),
       podium, list));
     fetch(`${worker}/play/crews`, { cache: "no-cache" }).then((r) => r.ok ? r.json() : null).catch(() => null).then((d) => {
       if (!list.isConnected) return;
@@ -3779,14 +4984,11 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
       if (!crews.length) { list.replaceChildren(h("p.empty", { text: "No crews yet." })); return; }
       const best = Math.max(1, ...crews.map((c) => c.score || 0));
       const members = (c) => `${c.members} member${c.members === 1 ? "" : "s"}`;
-      // the top three on a podium (2nd, 1st, 3rd), like the game's crew board
-      podium.replaceChildren(...[1, 0, 2].map((i) => crews[i]).filter(Boolean).map((c) =>
-        h("a.cw-pod", { href: "crew/" + encodeURIComponent(c.id), "data-place": c.rank, style: `--crew:${crewCol(c.color)}` },
-          h("span.cw-place", { text: ["", "1st", "2nd", "3rd"][c.rank] || "#" + c.rank }),
-          crewTag(c, true),
-          h("b.cw-pod-name", { text: c.name }),
-          h("span.cw-pod-score", { text: fmt0.format(Math.round(c.score || 0)) + " PR" }),
-          h("span.cw-pod-members", { text: members(c) }))));
+      // (3.2) the top three on cards, in their crew's colour
+      const t3 = topThree(crews.slice(0, 3).map((c) => ({ place: c.rank, href: "crew/" + encodeURIComponent(c.id), color: crewCol(c.color),
+        art: h("span.t3-crew", {}, crewTag(c, true)), name: h("span", { text: c.name }), sub: members(c),
+        value: fmt0.format(Math.round(c.score || 0)) + " PR", stats: [["Members", `${fmt0.format(c.members || 0)} / 12`]] })));
+      podium.replaceChildren(...(t3 ? [t3] : []));
       // everyone else, with a bar for their score next to the best crew's
       list.replaceChildren(...crews.slice(3).map((c) => h("a.crew-row", { href: "crew/" + encodeURIComponent(c.id), style: `--crew:${crewCol(c.color)}` },
         h("span.crew-rank", { text: "#" + c.rank }),
@@ -3869,12 +5071,29 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     return m ? m[1] : "home";
   }
 
+  // (3.0) the page's name beside OCTIVE in the top bar
+  const PAGE_NAMES = { rankings: "Rankings", countries: "Countries", ranked: "Ranked", crews: "Crews", workshop: "Workshop", daily: "Daily charts",
+    download: "Download", tools: "Rhythm tools", updates: "Updates", supporter: "Supporter", help: "Help", live: "Live on Twitch", messages: "Messages",
+    account: "Account", reset: "Password reset", open: "Workshop", compare: "Compare players", player: "Player" };
+  function setCrumb(text) {
+    const c = document.getElementById("crumb");
+    if (c) c.replaceChildren(...(text ? [h("i"), h("b", { text })] : []));
+  }
+
   function route(fromHashChange) {
+    if (!app) return;
     tidyAddress();
     const pg = page();
     const mine = pg === "player" && me && (profileKey() === me.playerId || (!!me.link && String(profileKey()).toLowerCase() === me.link.toLowerCase()));
     const navKey = pg === "player" ? (mine ? "me" : "rankings") : pg === "account" ? "settings" : pg === "crew" ? "crews" : pg;
     for (const a of document.querySelectorAll("[data-nav]")) a.classList.toggle("active", a.dataset.nav === navKey || (navKey === "settings" && a.dataset.nav === "account"));
+    // (3.0) every page has its own colour (the background's glow, titles, tabs…)
+    const q = hashQuery();
+    const pageKey = pg === "player" ? (q.get("vs") ? "compare" : "player") : pg === "rankings" && q.get("view") === "countries" ? "countries" : pg === "crew" ? "crews" : pg;
+    // leaving the tools: a test that's still going stops (its clicks and timers)
+    if (pageKey !== "tools" && toolKeys) { toolKeys.stop?.(); toolKeys = null; }
+    document.body.dataset.page = pageKey;
+    setCrumb(pageKey === "home" ? "" : PAGE_NAMES[pageKey] || "");
     if ((pg === "rankings" || pg === "player" || pg === "ranked") && !data) { app.replaceChildren(h("p.empty", { text: "Loading the ranking…" })); return; }
     if (pg === "player") player(profileKey());
     else if (pg === "rankings") rankings();
@@ -3891,17 +5110,26 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     else if (pg === "messages") messagesPage();
     else if (pg === "open") openPage();
     else if (pg === "crews" || pg === "crew") crewsPage();
+    else if (pg === "tools") toolsPage();
     else home();
+    paintListPill();
     if (fromHashChange) window.scrollTo(0, 0);
   }
 
-  window.addEventListener("hashchange", () => { route(true); document.body.classList.remove("menu-open"); document.querySelector(".nav-more")?.classList.remove("open"); });
+  window.addEventListener("hashchange", () => { route(true); closeSide(); });
   // (2.2.2) moving between the site's pages without loading the site again (links to its own files, like about.html
   // or play/, load as usual)
-  const SITE_ROUTES = new Set(["", "u", "rankings", "ranked", "crews", "crew", "workshop", "daily", "downloads", "updates", "supporter", "help", "account", "reset", "messages", "live", "open"]);
+  const SITE_ROUTES = new Set(["", "u", "rankings", "ranked", "crews", "crew", "workshop", "daily", "downloads", "updates", "supporter", "help", "account", "reset", "messages", "live", "open", "tools"]);
   window.addEventListener("popstate", () => route(true));
   document.addEventListener("click", (e) => {
-    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    // a link to a spot on this page (#app, the skip link): go there, don't load another page
+    const jump = e.target.closest && e.target.closest('a[href^="#"]:not([href^="#/"])');
+    if (jump && e.button === 0) {
+      const id = jump.getAttribute("href").slice(1), to = (id && document.getElementById(id)) || document.querySelector("main");
+      if (to) { e.preventDefault(); to.setAttribute("tabindex", "-1"); to.focus({ preventScroll: true }); to.scrollIntoView({ block: "start" }); }
+      return;
+    }
+    if (!app || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return; // (pages of their own load the site as usual)
     const a = e.target.closest && e.target.closest("a[href]");
     if (!a || (a.target && a.target !== "_self") || a.hasAttribute("download")) return;
     const u = new URL(a.href, document.baseURI);
@@ -3914,21 +5142,68 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
     e.preventDefault();
     if (to === location.pathname + location.search) history.replaceState(history.state, "", to); else history.pushState(null, "", to);
     route(true);
-    document.body.classList.remove("menu-open");
-    document.querySelector(".nav-more")?.classList.remove("open");
+    closeSide();
   });
-  // the More menu opens on click too (touch screens), and closes when you click elsewhere
-  const more = document.querySelector(".nav-more");
-  if (more) {
-    more.querySelector(".nav-more-btn").addEventListener("click", (e) => { e.stopPropagation(); more.classList.toggle("open"); });
-    document.addEventListener("click", (e) => { if (!more.contains(e.target)) more.classList.remove("open"); });
-  }
-  // phones: the sidebar slides in from the menu button; a tap outside closes it
+
+  // ---------------------------------------------------------------- 3.0: the menu, a sidebar that slides in
+  // Pointing at the window's left edge opens it and moving away closes it again; the menu button (or the M key) opens
+  // it until you click elsewhere. Pinned, it stays open beside the page (wide screens only). On phones it's a drawer.
+  const side = document.querySelector(".side");
   const menuBtn = document.querySelector(".menu-btn");
-  if (menuBtn) menuBtn.addEventListener("click", () => document.body.classList.toggle("menu-open"));
-  document.querySelector(".side-scrim")?.addEventListener("click", () => document.body.classList.remove("menu-open"));
-  route();
-  load();
+  const pinBtn = document.querySelector(".side-pin");
+  const hoverable = matchMedia("(hover: hover) and (pointer: fine)");
+  const wideEnough = matchMedia("(min-width: 1180px)");
+  let sideBy = null, sideShut = null;
+  function openSide(by) {
+    clearTimeout(sideShut);
+    if (!side || document.body.classList.contains("side-pinned")) return;
+    sideBy = by;
+    document.body.classList.add("side-open");
+    menuBtn?.setAttribute("aria-expanded", "true");
+  }
+  function closeSide() {
+    clearTimeout(sideShut);
+    sideBy = null;
+    document.body.classList.remove("side-open", "menu-open");
+    menuBtn?.setAttribute("aria-expanded", "false");
+  }
+  const toggleSide = (by) => (document.body.classList.contains("side-open") ? closeSide() : openSide(by));
+  function applyPin(on) {
+    const pinned = !!on && wideEnough.matches;
+    document.body.classList.toggle("side-pinned", pinned);
+    pinBtn?.setAttribute("aria-pressed", String(!!on));
+    if (pinBtn) pinBtn.title = on ? "Let the menu hide again" : "Keep the menu open";
+    if (pinned) closeSide();
+  }
+  if (side) {
+    applyPin(store.get("octive.sidePinned") === "1");
+    wideEnough.addEventListener?.("change", () => applyPin(store.get("octive.sidePinned") === "1"));
+    pinBtn?.addEventListener("click", () => {
+      const on = store.get("octive.sidePinned") !== "1";
+      store.set("octive.sidePinned", on ? "1" : null);
+      applyPin(on);
+      if (!on) openSide("click");
+    });
+    document.querySelector(".side-edge")?.addEventListener("pointerenter", () => { if (hoverable.matches) openSide("hover"); });
+    side.addEventListener("pointerenter", () => clearTimeout(sideShut));
+    side.addEventListener("pointerleave", (e) => { if (sideBy === "hover" && e.pointerType === "mouse") sideShut = setTimeout(closeSide, 280); });
+    side.addEventListener("focusout", (e) => { if (sideBy && sideBy !== "hover" && e.relatedTarget && !side.contains(e.relatedTarget) && !e.relatedTarget.closest(".menu-btn")) closeSide(); });
+    menuBtn?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleSide("click");
+      // from the keyboard: straight to the first link
+      if (e.detail === 0 && document.body.classList.contains("side-open")) setTimeout(() => side.querySelector(".side-nav a:not([hidden])")?.focus(), 60);
+    });
+    document.querySelector(".side-scrim")?.addEventListener("click", closeSide);
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && document.body.classList.contains("side-open")) { closeSide(); menuBtn?.focus(); } });
+  }
+  document.querySelector(".qs-btn")?.addEventListener("click", () => openSearch());
+  // the menu's live line: players online now and the latest version
+  function paintSideStatus() {
+    const on = document.getElementById("side-online");
+    if (on && data) on.textContent = fmt0.format(data.players.filter((p) => p.online).length);
+  }
+  loadRelease().then((m) => { const v = document.getElementById("side-ver"); if (v && m && m.version) v.textContent = "v" + m.version; });
   // stay signed in: show the name in the menu
   if (worker && (store.get("octive.token", true) || store.get("octive.session")) && page() !== "account")
     callApi("me", undefined, true).then((m) => { me = m; updateAccountNav(); giftPopup(); refreshDmBadge(); }).catch(() => {});
@@ -3939,7 +5214,502 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   setInterval(pingSeen, 120_000);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) pingSeen(); });
   // keep online status fresh while the page is open
-  setInterval(() => { const q = document.querySelector("[data-search]"); if (!document.hidden && !(q && q.value) && window.scrollY < 200 && ["home", "rankings", "player", "ranked"].includes(page())) load(); }, 90_000);
+  setInterval(() => {
+    const q = document.querySelector("[data-search]"), typing = document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName);
+    if (!document.hidden && !(q && q.value) && !typing && !qsLayer && !hashQuery().has("vs") && window.scrollY < 200 && ["home", "rankings", "player", "ranked"].includes(page())) load();
+  }, 90_000);
+  // ---------------------------------------------------------------- 3.0: rhythm tools (key test, tapping test, offset finder)
+  // Everything runs in the page; nothing is sent anywhere. While a tool is open it listens to the keyboard, so the site's
+  // own shortcuts (G…, M, the arrow-key secret) stay quiet on this page.
+  const TOOL_TABS = [["keys", "Key test"], ["tap", "Tapping test"], ["offset", "Offset finder"]];
+  let toolKeys = null; // the open tool's key handlers: { down(e), up(e), blur() }
+  const toolTyping = (e) => /^(INPUT|TEXTAREA|SELECT)$/.test((e.target && e.target.tagName) || "");
+  document.addEventListener("keydown", (e) => {
+    if (!toolKeys || document.body.dataset.page !== "tools" || e.ctrlKey || e.metaKey || e.altKey || toolTyping(e)) return;
+    // Enter and Space on a link or a button do what they normally do (follow it, press it)
+    if ((e.key === "Enter" || e.key === " ") && e.target && e.target.closest && e.target.closest("a[href], button, select, [role=button], .side, .qs-layer, .modal-layer") && !e.target.closest(".of-pad, .tp-pad")) return;
+    toolKeys.down(e);
+  });
+  document.addEventListener("keyup", (e) => { if (toolKeys && document.body.dataset.page === "tools") toolKeys.up?.(e); });
+  window.addEventListener("blur", () => toolKeys?.blur?.());
+  const KEY_NAMES = { Space: "Space", Semicolon: ";", Quote: "'", Comma: ",", Period: ".", Slash: "/", BracketLeft: "[", BracketRight: "]", Backslash: "\\", Minus: "-", Equal: "=",
+    Backquote: "`", ArrowUp: "↑", ArrowDown: "↓", ArrowLeft: "←", ArrowRight: "→", ShiftLeft: "L Shift", ShiftRight: "R Shift", CapsLock: "Caps", Tab: "Tab", Enter: "Enter", Backspace: "Back" };
+  const keyName = (code) => KEY_NAMES[code] || String(code || "").replace(/^Key|^Digit|^Numpad/, "");
+
+  function toolsPage() {
+    document.title = "Rhythm tools · OCTIVE";
+    const want = hashQuery().get("t");
+    const t = TOOL_TABS.some(([k]) => k === want) ? want : "keys";
+    const body = h("div.tl-body.tl-live");
+    toolKeys?.stop?.();
+    toolKeys = null;
+    app.replaceChildren(h("div.tools-page", {},
+      h("section.page-head", {}, h("p.eyebrow", { text: "For your setup" }), h("h1", { text: "Rhythm tools" }),
+        h("p.sub", { text: "Check that your keyboard can hold every key at once, see how fast and steady you tap, and find your audio offset. It all runs in this page: nothing is sent anywhere." })),
+      h("nav.tl-tabs.rk-tabs", { "aria-label": "Tools" }, ...TOOL_TABS.map(([k, label]) => h("a.ws-tab" + (k === t ? ".on" : ""), { href: "tools?t=" + k }, label))),
+      body));
+    if (t === "keys") keyTest(body); else if (t === "tap") tapTest(body); else offsetTest(body);
+  }
+
+  // ---- the key test: hold your keys down together; every lane that lights up is a key your keyboard registered
+  const KEY_LAYOUTS = { "4K": ["KeyD", "KeyF", "KeyJ", "KeyK"], "5K": ["KeyD", "KeyF", "Space", "KeyJ", "KeyK"], "6K": ["KeyS", "KeyD", "KeyF", "KeyJ", "KeyK", "KeyL"],
+    "7K": ["KeyS", "KeyD", "KeyF", "Space", "KeyJ", "KeyK", "KeyL"], "10K": ["KeyA", "KeyS", "KeyD", "KeyF", "KeyV", "KeyN", "KeyJ", "KeyK", "KeyL", "Semicolon"] };
+  const LANE_COLS = ["#ff4d9d", "#36d6ff", "#ffd23f", "#a764ff", "#3ee089", "#ff9a3d", "#5b7cff", "#2fe0c0", "#ff5a6e", "#b9a6ff"];
+  function keyTest(body) {
+    let mine = null;
+    try { mine = JSON.parse(store.get("octive.toolKeys") || "null"); } catch { /* none */ }
+    let pick = store.get("octive.toolLayout") || "4K";
+    let codes = pick === "mine" && Array.isArray(mine) && mine.length ? mine : KEY_LAYOUTS[pick] || KEY_LAYOUTS["4K"];
+    if (pick === "mine" && codes === KEY_LAYOUTS["4K"]) pick = "4K";
+    let held = new Set(), most = 0, counts = {}, setting = null;
+    const field = h("div.kt-field");
+    const nowEl = h("b", { text: "0" }), mostEl = h("b", { text: "0" }), msgEl = h("p.kt-msg");
+    const chips = h("div.kt-layouts");
+    const lanes = new Map();
+    function build() {
+      held = new Set(); most = 0; counts = {};
+      lanes.clear();
+      field.style.setProperty("--n", codes.length);
+      field.replaceChildren(...codes.map((code, i) => {
+        const lane = h("div.kt-lane", { style: `--c:${LANE_COLS[i % LANE_COLS.length]}` }, h("span.kt-beam"), h("span.kt-cap", { text: keyName(code) }), h("small.kt-count", { text: "0" }));
+        lanes.set(code, lane);
+        return lane;
+      }));
+      chips.replaceChildren(h("span.kt-cap-label", { text: "Layout" }),
+        ...Object.keys(KEY_LAYOUTS).map((k) => h("button.chip" + (pick === k ? ".on" : ""), { type: "button", onclick: () => { pick = k; codes = KEY_LAYOUTS[k]; store.set("octive.toolLayout", k); build(); } }, k)),
+        Array.isArray(mine) && mine.length ? h("button.chip" + (pick === "mine" ? ".on" : ""), { type: "button", onclick: () => { pick = "mine"; codes = mine; store.set("octive.toolLayout", "mine"); build(); } }, `My keys (${mine.length}K)`) : null,
+        h("button.chip.kt-set", { type: "button", onclick: startSetting }, "Set my keys…"));
+      paint();
+    }
+    function paint() {
+      nowEl.textContent = String(held.size);
+      mostEl.textContent = `${most} / ${codes.length}`;
+      if (setting) { msgEl.className = "kt-msg setting"; msgEl.textContent = setting.length ? `Keys so far: ${setting.map(keyName).join(" ")} · press Enter when you're done (Esc to stop)` : "Press your keys from left to right, then Enter."; return; }
+      const all = most >= codes.length;
+      msgEl.className = "kt-msg" + (all ? " ok" : "");
+      msgEl.textContent = all ? `All ${codes.length} keys register together: no ghosting on this layout.`
+        : most > 1 ? `The most keys held together so far: ${most}. Hold all ${codes.length} down at once: if a lane stays dark, your keyboard can't register that combination (ghosting).`
+          : matchMedia("(pointer: coarse)").matches && !matchMedia("(pointer: fine)").matches ? "This test needs a keyboard: open this page on a computer, or connect a keyboard."
+          : `Hold all ${codes.length} keys down at once. Every lane that lights up is a key your keyboard registered.`;
+    }
+    function startSetting() { setting = []; field.classList.add("setting"); paint(); }
+    function burst(lane) {
+      const n = h("i.kt-note");
+      lane.append(n);
+      setTimeout(() => n.remove(), 600);
+    }
+    toolKeys = {
+      down(e) {
+        if (setting) {
+          e.preventDefault();
+          if (e.code === "Escape") { setting = null; field.classList.remove("setting"); paint(); return; }
+          if (e.code === "Enter") {
+            if (setting.length) { mine = setting.slice(0, 10); store.set("octive.toolKeys", JSON.stringify(mine)); store.set("octive.toolLayout", "mine"); pick = "mine"; codes = mine; }
+            setting = null; field.classList.remove("setting"); build(); return;
+          }
+          if (!e.repeat && !setting.includes(e.code) && setting.length < 10) setting.push(e.code);
+          paint(); return;
+        }
+        const lane = lanes.get(e.code);
+        if (!lane) return;
+        e.preventDefault();
+        if (e.repeat) return;
+        held.add(e.code);
+        counts[e.code] = (counts[e.code] || 0) + 1;
+        lane.classList.add("on");
+        lane.querySelector(".kt-count").textContent = String(counts[e.code]);
+        burst(lane);
+        most = Math.max(most, held.size);
+        paint();
+      },
+      up(e) { const lane = lanes.get(e.code); if (!lane) return; held.delete(e.code); lane.classList.remove("on"); paint(); },
+      blur() { held.clear(); lanes.forEach((l) => l.classList.remove("on")); paint(); },
+    };
+    body.replaceChildren(h("section.tl-card.feature-card", {},
+      h("div.tl-top", {}, h("div", {}, h("h2", { text: "Key test" }), h("p.tl-sub", { text: "Some keyboards can't register certain keys held together (ghosting), which drops notes in chords and jumps. Hold your keys down and see." })),
+        h("div.tl-nums", {}, h("div.num-tile", { style: "--s:var(--cyan)" }, h("small", { text: "Held now" }), nowEl), h("div.num-tile", { style: "--s:var(--green)" }, h("small", { text: "Most at once" }), mostEl))),
+      chips, field, msgEl,
+      h("button.btn.small.ghost.kt-reset", { type: "button", onclick: build }, "Start over")));
+    build();
+  }
+
+  // ---- the tapping test: tap two keys as fast and as evenly as you can
+  const TAP_KEYS = [["Z X", ["KeyZ", "KeyX"]], ["D F", ["KeyD", "KeyF"]], ["J K", ["KeyJ", "KeyK"]], ["Any key", null]];
+  const TAP_MODES = [["10 s", { secs: 10 }], ["20 s", { secs: 20 }], ["30 s", { secs: 30 }], ["100 taps", { taps: 100 }]];
+  function tapTest(body) {
+    let keySet = Number(store.get("octive.tapKeys") || 0) || 0, mode = Number(store.get("octive.tapMode") || 0) || 0;
+    let taps = [], raf = 0, done = false;
+    const bpmEl = h("b", { text: "0" }), urEl = h("b", { text: "–" }), tapsEl = h("b", { text: "0" }), timeEl = h("b", { text: "–" });
+    const graph = h("div.tp-graph"), result = h("div.tp-result", { hidden: true });
+    const opts = h("div.tp-opts");
+    const pad = h("div.tp-pad", {}, h("span.tp-pad-big", { text: "Tap to start" }), h("small"));
+    const stats = () => {
+      const iv = [];
+      for (let i = 1; i < taps.length; i++) iv.push(taps[i] - taps[i - 1]);
+      if (!iv.length) return { bpm: 0, ur: 0, iv };
+      const mean = iv.reduce((a, b) => a + b, 0) / iv.length;
+      const sd = Math.sqrt(iv.reduce((a, b) => a + (b - mean) * (b - mean), 0) / iv.length);
+      return { bpm: 15000 / mean, ur: sd * 10, iv };
+    };
+    function paintOpts() {
+      opts.replaceChildren(h("span.kt-cap-label", { text: "Keys" }), ...TAP_KEYS.map(([label], i) => h("button.chip" + (i === keySet ? ".on" : ""), { type: "button", onclick: () => { keySet = i; store.set("octive.tapKeys", String(i)); reset(); } }, label)),
+        h("span.kt-cap-label", { text: "Length" }), ...TAP_MODES.map(([label], i) => h("button.chip" + (i === mode ? ".on" : ""), { type: "button", onclick: () => { mode = i; store.set("octive.tapMode", String(i)); reset(); } }, label)));
+    }
+    function paintGraph() {
+      const { iv } = stats();
+      if (iv.length < 3) { graph.replaceChildren(); return; }
+      const pts = iv.map((_, i) => { const w = iv.slice(Math.max(0, i - 3), i + 1); return 15000 / (w.reduce((a, b) => a + b, 0) / w.length); });
+      const lo = Math.min(...pts) * 0.96, hi = Math.max(...pts) * 1.04, W = 600, H = 120;
+      const poly = pts.map((v, i) => `${(i / (pts.length - 1) * W).toFixed(1)},${(H - (v - lo) / Math.max(1, hi - lo) * H).toFixed(1)}`).join(" ");
+      graph.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><polyline points="${poly}" vector-effect="non-scaling-stroke"/></svg>`;
+    }
+    function tick() {
+      const m = TAP_MODES[mode][1];
+      const el = taps.length ? (performance.now() - taps[0]) / 1000 : 0;
+      timeEl.textContent = m.secs ? Math.max(0, m.secs - el).toFixed(1) + " s" : `${taps.length} / ${m.taps}`;
+      if (m.secs && el >= m.secs) { finish(); return; }
+      raf = requestAnimationFrame(tick);
+    }
+    function paintNums() {
+      const s = stats();
+      bpmEl.textContent = s.bpm ? fmt0.format(s.bpm) : "0";
+      urEl.textContent = s.iv.length >= 2 ? s.ur.toFixed(1) : "–";
+      tapsEl.textContent = String(taps.length);
+    }
+    function finish() {
+      cancelAnimationFrame(raf); done = true;
+      body.querySelector(".tl-card")?.classList.remove("running");
+      const s = stats();
+      const m = TAP_MODES[mode][1];
+      const text = `OCTIVE tapping test: ${fmt0.format(s.bpm)} BPM (1/4 notes), ${s.ur.toFixed(1)} UR, ${taps.length} taps in ${m.secs ? m.secs + " s" : (((taps[taps.length - 1] - taps[0]) / 1000).toFixed(1) + " s")}`;
+      const copy = h("button.btn.small", { type: "button" }, "Copy result");
+      copy.addEventListener("click", async () => { try { await navigator.clipboard.writeText(text); copy.textContent = "Copied"; } catch { prompt("Copy:", text); } });
+      result.replaceChildren(h("p", {}, h("b", { text: `${fmt0.format(s.bpm)} BPM` }), ` with an unstable rate of ${s.ur.toFixed(1)}. `,
+        s.ur < 80 ? "Very steady." : s.ur < 140 ? "Nice and even." : "Try fewer, more even taps: a lower UR counts more than speed."), h("div.tp-acts", {}, copy, h("button.btn.small.primary", { type: "button", onclick: reset }, "Again")));
+      result.hidden = false;
+      pad.querySelector(".tp-pad-big").textContent = "Done";
+      pad.querySelector("small").textContent = "Press Again (or Enter) to go again";
+    }
+    function reset() {
+      cancelAnimationFrame(raf); taps = []; done = false;
+      result.hidden = true; graph.replaceChildren();
+      body.querySelector(".tl-card")?.classList.remove("running");
+      paintOpts(); paintNums();
+      timeEl.textContent = TAP_MODES[mode][1].secs ? TAP_MODES[mode][1].secs + " s" : `0 / ${TAP_MODES[mode][1].taps}`;
+      pad.querySelector(".tp-pad-big").textContent = "Tap to start";
+      pad.querySelector("small").textContent = TAP_KEYS[keySet][1] ? `Tap ${TAP_KEYS[keySet][0].replace(" ", " and ")} one after the other` : "Tap any keys one after the other";
+    }
+    toolKeys = {
+      down(e) {
+        if (done) { if (e.code === "Enter") { e.preventDefault(); reset(); } return; }
+        const ok = TAP_KEYS[keySet][1] ? TAP_KEYS[keySet][1].includes(e.code) : !/^(Shift|Control|Alt|Meta|Tab|Escape|Enter|F\d+)/.test(e.code);
+        if (!ok) return;
+        e.preventDefault();
+        if (e.repeat) return;
+        hit();
+      },
+      blur() { /* keep going: the clock decides */ },
+      stop() { cancelAnimationFrame(raf); },
+    };
+    // a tap on the pad counts too (phones and tablets have no keys)
+    pad.addEventListener("pointerdown", (e) => { e.preventDefault(); if (!done) hit(); });
+    function hit() {
+        const now = performance.now();
+        if (!taps.length) { body.querySelector(".tl-card")?.classList.add("running"); raf = requestAnimationFrame(tick); }
+        taps.push(now);
+        pad.classList.remove("hit"); void pad.offsetWidth; pad.classList.add("hit");
+        pad.querySelector(".tp-pad-big").textContent = String(taps.length);
+        paintNums(); paintGraph();
+        const m = TAP_MODES[mode][1];
+        if (m.taps && taps.length >= m.taps) finish();
+    }
+    body.replaceChildren(h("section.tl-card.feature-card", {},
+      h("div.tl-top", {}, h("div", {}, h("h2", { text: "Tapping test" }), h("p.tl-sub", { text: "Alternate two keys as fast and as evenly as you can. BPM counts each tap as a 1/4 note; the unstable rate (UR, lower is better) is how even your taps are." })),
+        h("div.tl-nums", {},
+          h("div.num-tile", { style: "--s:var(--pink)" }, h("small", { text: "BPM" }), bpmEl),
+          h("div.num-tile", { style: "--s:var(--cyan)" }, h("small", { text: "UR" }), urEl),
+          h("div.num-tile", { style: "--s:var(--green)" }, h("small", { text: "Taps" }), tapsEl),
+          h("div.num-tile", { style: "--s:var(--orange)" }, h("small", { text: "Time" }), timeEl))),
+      opts, pad, graph, result));
+    reset();
+  }
+
+  // ---- the offset finder: OCTIVE's own hit sound on the beat; tap along and see how early or late you are
+  let offCtx = null;
+  /** OCTIVE's default sounds, made the same way as the game's SfxBank (hit: an 808-style click with a little noise). */
+  function octSound(ctx, kind) {
+    const rate = ctx.sampleRate, secs = kind === "tick" ? 0.05 : 0.09, n = Math.floor(secs * rate);
+    const buf = ctx.createBuffer(1, n, rate), d = buf.getChannelData(0);
+    const click808 = (t, f0, f1) => { const f = f1 + (f0 - f1) * Math.exp(-t * 60); return Math.sin(2 * Math.PI * f * t) * Math.exp(-t * 45); };
+    for (let i = 0; i < n; i++) {
+      const t = i / rate, fade = Math.min(1, i / 48);
+      const v = kind === "tick" ? Math.sin(2 * Math.PI * 2400 * t) * Math.exp(-t * 100) * 0.6
+        : click808(t, 2600, 900) * 0.55 + (Math.random() * 2 - 1) * Math.exp(-t / 0.012) * 0.35;
+      d[i] = Math.max(-1, Math.min(1, v * fade));
+    }
+    return buf;
+  }
+  function offsetTest(body) {
+    const BPM = 110, BEAT = 60 / BPM, COUNT_IN = 4, BEATS = 20;
+    let run = null;
+    const meanEl = h("b", { text: "–" }), spreadEl = h("b", { text: "–" }), beatEl = h("b", { text: "–" });
+    const line = h("div.of-line", {}, h("span.of-mid"), h("span.of-early", { text: "early" }), h("span.of-late", { text: "late" }));
+    const dots = h("div.of-beats");
+    const result = h("div.tp-result", { hidden: true });
+    const startBtn = h("button.btn.primary.big", { type: "button" }, "▶ Start");
+    const median = (a) => { const s = a.slice().sort((x, y) => x - y); return s.length ? (s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2) : 0; };
+    function paint() {
+      if (!run) return;
+      const errs = run.errs;
+      meanEl.textContent = errs.length ? `${median(errs) > 0 ? "+" : ""}${Math.round(median(errs))} ms` : "–";
+      const m = errs.length ? errs.reduce((a, b) => a + b, 0) / errs.length : 0;
+      spreadEl.textContent = errs.length > 1 ? `±${Math.round(Math.sqrt(errs.reduce((a, b) => a + (b - m) * (b - m), 0) / errs.length))} ms` : "–";
+    }
+    function stop(finished) {
+      if (!run) return;
+      clearInterval(run.timer);
+      for (const s of run.sources) { try { s.stop(); } catch { /* done */ } }
+      const errs = run.errs;
+      body.querySelector(".tl-card")?.classList.remove("running");
+      startBtn.textContent = "▶ Start again";
+      if (finished && errs.length >= 6) {
+        const med = Math.round(median(errs));
+        const late = med > 0;
+        result.replaceChildren(
+          h("p", {}, "You tap ", h("b", { text: `${Math.abs(med)} ms ${late ? "late" : "early"}` }), ` on average (the middle of ${errs.length} taps). `),
+          h("p", {}, Math.abs(med) <= 5 ? "That's right on the beat: you don't need an offset." : ["In OCTIVE, set the audio offset to ", h("b", { text: `${late ? "+" : "−"}${Math.abs(med)} ms` }),
+            " (Settings → Calibration), or turn on Adjust offset automatically (Settings → Audio) and the game keeps tuning it after each song."]),
+          h("p.of-note", { text: "Measured with this browser's sound. Wireless headphones add their own delay, and the game's audio can differ a little, so treat it as a starting point." }));
+        result.hidden = false;
+      } else if (finished) {
+        result.replaceChildren(h("p", { text: "Not enough taps landed near the beat to tell. Tap along with every click after the four count-in ticks, then try again." }));
+        result.hidden = false;
+      }
+      run = null;
+    }
+    function start() {
+      if (run) { stop(false); return; }
+      offCtx = offCtx || new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = offCtx;
+      ctx.resume();
+      const hit = octSound(ctx, "hit"), tick = octSound(ctx, "tick");
+      const lat = (ctx.outputLatency || 0) + (ctx.baseLatency || 0);
+      const t0 = ctx.currentTime + 0.6;
+      const sources = [];
+      const beats = [];
+      for (let i = 0; i < COUNT_IN + BEATS; i++) {
+        const src = ctx.createBufferSource(), g = ctx.createGain();
+        src.buffer = i < COUNT_IN ? tick : hit;
+        g.gain.value = i < COUNT_IN ? 0.55 : 0.9;
+        src.connect(g).connect(ctx.destination);
+        src.start(t0 + i * BEAT);
+        sources.push(src);
+        if (i >= COUNT_IN) beats.push(t0 + i * BEAT + lat);
+      }
+      result.hidden = true;
+      line.querySelectorAll(".of-dot").forEach((d) => d.remove());
+      dots.replaceChildren(...Array.from({ length: COUNT_IN + BEATS }, (_, i) => h("i" + (i < COUNT_IN ? ".in" : ""))));
+      run = { ctx, t0, lat, beats, errs: [], sources, timer: 0 };
+      body.querySelector(".tl-card")?.classList.add("running");
+      startBtn.textContent = "■ Stop";
+      run.timer = setInterval(() => {
+        if (!run) return;
+        const k = Math.floor((ctx.currentTime - lat - t0) / BEAT);
+        [...dots.children].forEach((d, i) => d.classList.toggle("past", i <= k));
+        beatEl.textContent = k < 0 ? "–" : k < COUNT_IN ? `Count-in ${k + 1}` : `${Math.min(BEATS, k - COUNT_IN + 1)} / ${BEATS}`;
+        if (ctx.currentTime > t0 + (COUNT_IN + BEATS) * BEAT + lat + 0.4) stop(true);
+      }, 40);
+      paint();
+    }
+    function tap() {
+      if (!run) return;
+      const now = run.ctx.currentTime;
+      if (now < run.beats[0] - BEAT / 2) return; // still counting in
+      let best = null;
+      for (const b of run.beats) if (best === null || Math.abs(now - b) < Math.abs(now - best)) best = b;
+      const err = (now - best) * 1000;
+      if (Math.abs(err) > 220) return; // not near a beat
+      run.errs.push(err);
+      const d = h("span.of-dot" + (err > 0 ? ".late" : ""), { style: `left:${50 + Math.max(-1, Math.min(1, err / 150)) * 50}%` });
+      line.append(d);
+      paint();
+    }
+    startBtn.addEventListener("click", start);
+    const padEl = h("button.of-pad", { type: "button", onpointerdown: (e) => { e.preventDefault(); tap(); } }, h("span", { text: "Tap here, or any key" }));
+    toolKeys = {
+      down(e) {
+        if (/^(Shift|Control|Alt|Meta|Tab|Escape|F\d+)/.test(e.code)) { if (e.code === "Escape") stop(false); return; }
+        if (e.code === "Enter" && !run) { e.preventDefault(); start(); return; }
+        e.preventDefault();
+        if (!e.repeat) tap();
+      },
+      blur() { /* keep listening */ },
+      stop() { stop(false); },
+    };
+    body.replaceChildren(h("section.tl-card.feature-card", {},
+      h("div.tl-top", {}, h("div", {}, h("h2", { text: "Offset finder" }), h("p.tl-sub", { text: `OCTIVE's own hit sound plays ${BEATS} times at ${BPM} BPM after four count-in ticks. Tap along to the clicks (any key, or the pad) and see whether you hit early or late.` })),
+        h("div.tl-nums", {},
+          h("div.num-tile", { style: "--s:var(--pink)" }, h("small", { text: "You're off by" }), meanEl),
+          h("div.num-tile", { style: "--s:var(--cyan)" }, h("small", { text: "Spread" }), spreadEl),
+          h("div.num-tile", { style: "--s:var(--green)" }, h("small", { text: "Beat" }), beatEl))),
+      h("div.of-row", {}, startBtn, padEl), dots, line, result));
+  }
+
+
+  // ---------------------------------------------------------------- 3.0: quick search (Ctrl+K) and keyboard shortcuts
+  // One box for everything: players (from the ranking), Workshop charts (asked from the server as you type), the site's
+  // pages, Help's answers, and "name vs name" to compare two players.
+  const QS_PAGES = [
+    ["Home", "./", "The front page"], ["Rankings", "rankings", "Every player by total PR"], ["Countries", "rankings?view=countries", "Countries ranked by their players' PR"],
+    ["Ranked", "ranked", "The 1v1 ladders"], ["Crews", "crews", "Teams of up to 12 players"], ["Workshop", "workshop", "Charts, skins, themes and styles"],
+    ["Daily charts", "daily", "Today's charts and scores"], ["Download", "downloads", "Windows, Android or the browser"], ["Play in browser", "play/", "No download needed"],
+    ["Rhythm tools", "tools", "Key test, tapping test and offset finder"], ["Key test", "tools?t=keys", "See which keys still register when held together"],
+    ["Tapping test", "tools?t=tap", "Your tapping speed (BPM) and unstable rate"], ["Offset finder", "tools?t=offset", "Tap along to the clicks to find your audio offset"],
+    ["Updates", "updates", "Every release and its patch notes"], ["Supporter", "supporter", "Support OCTIVE and get a few extras"], ["Help", "help", "Common questions"],
+    ["Live on Twitch", "live", "Players streaming right now"], ["Messages", "messages", "Your conversations"], ["Account settings", "account", "Sign in, your profile and preferences"],
+    ["About OCTIVE", "about.html", "What OCTIVE is"], ["osu!mania maps in OCTIVE", "osu-mania.html", "Bring your maps"], ["FNF charts", "fnf.html", "Friday Night Funkin' songs and modcharts"],
+    ["Privacy", "privacy.html", "What's collected and why"], ["Terms", "terms.html", "The rules"],
+  ];
+  const QS_ICON = {
+    page: '<path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5"/>', chart: '<path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>',
+    help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 0 1 4.9.7c0 1.7-2.4 2.1-2.4 3.8M12 17h.01"/>', vs: '<path d="M4 6l6 12M10 6L4 18"/><path d="M20 7.5c-.8-1-2-1.5-3.2-1.5-1.6 0-2.8.9-2.8 2.2 0 3 6 1.8 6 5.3 0 1.4-1.3 2.5-3.1 2.5-1.3 0-2.6-.6-3.4-1.6"/>',
+  };
+  const qsIcon = (k) => { const s = h("span.qs-ic"); s.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${QS_ICON[k]}</svg>`; return s; };
+  let qsLayer = null, qsWsCache = new Map();
+  /** The best player for a name typed in the search ("sent" finds Senterra). */
+  function findByName(q) {
+    q = String(q || "").trim().toLowerCase();
+    if (!q || !data) return [];
+    const ps = data.official ? [...data.players, data.official] : data.players;
+    return ps.filter((p) => (p.name || "").toLowerCase().includes(q))
+      .sort((a, b) => ((b.name || "").toLowerCase().startsWith(q) - (a.name || "").toLowerCase().startsWith(q)) || ((a.rank || 1e9) - (b.rank || 1e9)));
+  }
+  function closeSearch() { qsLayer?.remove(); qsLayer = null; document.documentElement.classList.remove("qs-on"); }
+  function openSearch(start) {
+    if (qsLayer) { qsLayer.querySelector("input").focus(); return; }
+    if (!data) load();
+    const input = h("input.qs-input", { type: "search", placeholder: "Search players, charts, pages and help…", autocomplete: "off", spellcheck: "false", "aria-label": "Search OCTIVE" });
+    const results = h("div.qs-results", { role: "listbox" });
+    const box = h("div.qs-box", { role: "dialog", "aria-modal": "true", "aria-label": "Search OCTIVE" },
+      h("div.qs-field", {}, (() => { const s = h("span.qs-glass"); s.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg>'; return s; })(),
+        input, h("button.qs-esc", { type: "button", onclick: closeSearch, "aria-label": "Close" }, h("kbd", { text: "Esc" }))),
+      results,
+      h("div.qs-foot", {},
+        h("span", {}, h("kbd", { text: "↑" }), h("kbd", { text: "↓" }), " move"),
+        h("span", {}, h("kbd", { text: "Enter" }), " open"),
+        h("span.qs-tip", {}, "Type ", h("b", { text: "name vs name" }), " to compare two players"),
+        h("button.qs-keys", { type: "button", onclick: () => { closeSearch(); shortcutsSheet(); } }, h("kbd", { text: "?" }), " shortcuts")));
+    qsLayer = h("div.qs-layer", { onmousedown: (e) => { if (e.target === qsLayer) closeSearch(); } }, box);
+    document.body.append(qsLayer);
+    document.documentElement.classList.add("qs-on");
+    let items = [], at = 0, gen = 0;
+    const mark = () => items.forEach((el, i) => { el.classList.toggle("on", i === at); el.setAttribute("aria-selected", String(i === at)); if (i === at) el.scrollIntoView({ block: "nearest" }); });
+    const item = (href, icon, title, sub, kind) => {
+      const a = h("a.qs-item", { href, role: "option", onclick: () => closeSearch() }, icon, h("span.qs-text", {}, h("b", {}, title), sub ? h("small", { text: sub }) : null), kind ? h("span.qs-kind", { text: kind }) : null);
+      a.addEventListener("pointermove", () => { const i = items.indexOf(a); if (i >= 0 && i !== at) { at = i; mark(); } });
+      return a;
+    };
+    const group = (name, els) => (els.length ? [h("div.qs-group", { text: name }), ...els] : []);
+    function paint(wsItems, wsBusy) {
+      const q = input.value.trim(), ql = q.toLowerCase();
+      const out = [];
+      // name vs name
+      const vs = q.match(/^(.+?)\s+(?:vs\.?|versus|v)\s+(.+)$/i);
+      if (vs) {
+        const a = findByName(vs[1])[0], b = findByName(vs[2]).find((x) => !a || x.id !== a.id);
+        if (a && b) out.push(...group("Compare", [item(profileHref(a.id) + "?vs=" + encodeURIComponent(b.id), qsIcon("vs"), `${a.name} vs ${b.name}`, "Stats, graphs, skills and the charts they've both played", "Compare")]));
+      }
+      const players = q ? findByName(vs ? vs[1] : q).slice(0, 6) : (data ? data.players.filter((p) => p.online).slice(0, 4) : []);
+      out.push(...group(q ? "Players" : "Online now", players.map((p) => item(profileHref(p.id), smallAvatar(p.id, p.name),
+        p.name || "Player", isOfficial(p) ? "Official OCTIVE account" : [`#${fmt0.format(p.rank)}`, `${fmt0.format(p.pp || 0)} PR`, p.country ? regionName(p.country) : ""].filter(Boolean).join(" · "), "Player"))));
+      if (q && !vs) {
+        const ws = (wsItems || []).slice(0, 6).map((x) => {
+          const pic = h("span.qs-pic");
+          if (x.preview) pic.append(waitPic(pic, h("img", { src: x.preview, alt: "", loading: "lazy" })));
+          return item("workshop/" + x.id, pic, x.title, [x.creator ? "by " + x.creator : "", x.topStars > 0 ? "★ " + x.topStars.toFixed(2) : "", x.verified ? "verified" : ""].filter(Boolean).join(" · "), "Chart");
+        });
+        if (wsBusy && !ws.length) out.push(h("div.qs-group", { text: "Charts" }), h("p.qs-busy", { text: "Searching the Workshop…" }));
+        else out.push(...group("Charts", ws));
+      }
+      const pages = q ? QS_PAGES.filter(([n, , d]) => (n + " " + d).toLowerCase().includes(ql)).slice(0, 5) : QS_PAGES.filter(([, href]) => ["rankings", "workshop", "downloads", "daily", "tools", "rankings?view=countries"].includes(href));
+      out.push(...group(q ? "Pages" : "Jump to", pages.map(([n, href, d]) => item(href, qsIcon("page"), n, d, "Page"))));
+      if (q.length >= 3) {
+        const help = HELP.flatMap(([g, list]) => list.map(([qq, a]) => [g, qq, a])).filter(([, qq, a]) => (qq + " " + a).toLowerCase().includes(ql)).slice(0, 4);
+        out.push(...group("Help", help.map(([g, qq, a]) => item("help?q=" + encodeURIComponent(qq), qsIcon("help"), qq, a.length > 90 ? a.slice(0, 88) + "…" : a, g))));
+      }
+      if (!out.length) out.push(h("p.qs-none", { text: q ? `Nothing found for "${q}".` : "Start typing…" }));
+      results.replaceChildren(...out);
+      items = [...results.querySelectorAll(".qs-item")];
+      at = Math.min(at, Math.max(0, items.length - 1));
+      mark();
+    }
+    let wsT = null;
+    function update() {
+      const q = input.value.trim();
+      at = 0;
+      const key = q.toLowerCase();
+      clearTimeout(wsT);
+      const g = ++gen; // an answer for an older query is dropped
+      if (!q || /\s(?:vs\.?|versus|v)\s/i.test(q)) { paint([], false); return; }
+      if (qsWsCache.has(key)) { paint(qsWsCache.get(key), false); return; }
+      paint([], true);
+      wsT = setTimeout(() => {
+        fetch(`${worker}/api/items?type=charts&sort=popular&q=${encodeURIComponent(q)}`, { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)).catch(() => null).then((d) => {
+          const list = (d && d.items) || [];
+          qsWsCache.set(key, list);
+          if (g === gen && qsLayer) paint(list, false);
+        });
+      }, 220);
+    }
+    input.addEventListener("input", update);
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") { e.preventDefault(); at = Math.min(items.length - 1, at + 1); mark(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); at = Math.max(0, at - 1); mark(); }
+      else if (e.key === "Enter") { e.preventDefault(); items[at]?.click(); }
+      else if (e.key === "Escape") { e.preventDefault(); closeSearch(); }
+    });
+    if (start) input.value = start;
+    update();
+    setTimeout(() => input.focus(), 0);
+    // the players arrive with the ranking: paint again once it's here
+    if (!data) { const wait = setInterval(() => { if (!qsLayer) { clearInterval(wait); return; } if (data) { clearInterval(wait); update(); } }, 250); }
+  }
+  /** "?" : every keyboard shortcut. */
+  const GO_KEYS = { h: ["./", "Home"], r: ["rankings", "Rankings"], n: ["rankings?view=countries", "Countries"], k: ["ranked", "Ranked"], c: ["crews", "Crews"],
+    w: ["workshop", "Workshop"], d: ["daily", "Daily charts"], l: ["downloads", "Download"], t: ["tools", "Rhythm tools"], u: ["updates", "Updates"],
+    s: ["supporter", "Supporter"], q: ["help", "Help"], p: ["me", "Your profile"], m: ["messages", "Messages"] };
+  function goKey(to) {
+    if (to === "me") to = me && me.playerId && me.hasCard && !me.banned ? profileHref(me.playerId) : "account";
+    if (!app || /\.html$|^play\//.test(to)) { location.href = BASE_PATH + routePath(to === "./" ? "" : to); return; }
+    go(to === "./" ? "" : to);
+  }
+  function shortcutsSheet() {
+    if (document.querySelector(".keys-layer")) return;
+    const row = (keys, what) => h("div.keys-row", {}, h("span.keys-k", {}, ...keys.map((k) => h("kbd", { text: k }))), h("span", { text: what }));
+    const layer = h("div.modal-layer.keys-layer", { onmousedown: (e) => { if (e.target === layer) layer.remove(); } },
+      h("div.keys-modal", { role: "dialog", "aria-label": "Keyboard shortcuts" },
+        h("div.keys-head", {}, h("h2", { text: "Keyboard shortcuts" }), h("button.btn.small.ghost", { type: "button", onclick: () => layer.remove() }, "Close")),
+        h("div.keys-cols", {},
+          h("div", {}, h("h3", { text: "Anywhere" }), row(["Ctrl", "K"], "Search"), row(["/"], "Search"), row(["M"], "Open or close the menu"), row(["?"], "This list"), row(["Esc"], "Close")),
+          h("div", {}, h("h3", { text: "Go to: press G, then" }), ...Object.entries(GO_KEYS).map(([k, [, n]]) => row([k.toUpperCase()], n))))));
+    document.body.append(layer);
+    const off = (e) => { if (e.key === "Escape") { layer.remove(); document.removeEventListener("keydown", off); } };
+    document.addEventListener("keydown", off);
+  }
+  let gAt = 0;
+  document.addEventListener("keydown", (e) => {
+    const t = e.target, typing = t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") { e.preventDefault(); qsLayer ? closeSearch() : openSearch(); return; }
+    if (typing || e.repeat || e.ctrlKey || e.metaKey || e.altKey || qsLayer || document.querySelector(".modal-layer")) return;
+    if (document.body.dataset.page === "tools" && document.querySelector(".tl-live")) return; // a test is listening to the keys
+    if (e.key === "/") { e.preventDefault(); openSearch(); return; }
+    if (e.key === "?") { e.preventDefault(); shortcutsSheet(); return; }
+    const k = e.key.toLowerCase();
+    if (gAt && Date.now() - gAt < 1200) { gAt = 0; if (GO_KEYS[k]) { e.preventDefault(); goKey(GO_KEYS[k][0]); } return; }
+    if (k === "g") { gAt = Date.now(); return; }
+    if (k === "m" && side) toggleSide("click");
+  });
+
   // ---------------------------------------------------------------- a secret: ↑ ↑ ↓ ↓ ← → ← → on the arrow keys
   // A wrong key starts it over straight away (the keys you just pressed still count if they begin the code again).
   const SECRET = ["ArrowUp", "ArrowUp", "ArrowDown", "ArrowDown", "ArrowLeft", "ArrowRight", "ArrowLeft", "ArrowRight"];
@@ -3947,10 +5717,19 @@ const fmtCount = (n) => n >= 1e6 ? (Math.floor(n / 1e4) / 100).toFixed(2) + "m" 
   document.addEventListener("keydown", (e) => {
     const t = e.target;
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return; // typing, not playing
+    if (document.body.dataset.page === "tools") return; // the key and tapping tests use the arrow keys too
     secretKeys.push(e.key);
     let k = Math.min(secretKeys.length, SECRET.length);
     while (k > 0 && !SECRET.slice(0, k).every((s, i) => s === secretKeys[secretKeys.length - k + i])) k--;
     secretKeys = secretKeys.slice(secretKeys.length - k);
     if (k === SECRET.length) { secretKeys = []; location.href = "https://www.youtube.com/watch?v=QDia3e12czc"; }
   });
+  // ---------------------------------------------------------------- start
+  if (app) route();
+  else {
+    // a page of its own (about.html, privacy.html…): the menu and search work, the page itself is already there
+    document.body.dataset.page ||= "about";
+    document.querySelectorAll(`.side-nav [data-nav="${document.body.dataset.page}"]`).forEach((a) => a.classList.add("active"));
+  }
+  load();
 })();

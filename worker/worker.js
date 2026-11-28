@@ -18,6 +18,10 @@
 
 // the game's judge, so plays are judged again from their replays (board scores, daily charts, dans): deploy judge.js with this file
 import { JUDGE_VERSION, JudgeDataError, loadChart, compileChart, packCompiled, unpackCompiled, readReplay, judgeReplay, parseMods, rateOf, signatureMatch, REPLAY_VERSION, chartStats, seededRandom, botPlay, starRating, playPR, gradeOf, ppAccuracy, STAR_VERSION, scoreWithRate } from "./judge.js";
+// (2.2.2) the profile card picture for shared profile links (needs npm install here: @resvg/resvg-wasm)
+import { profileCardSvg, cardPng, CARD_VERSION, PROFILE_CARD_VERSION, dataUri } from "./card.js";
+import { PAGE_CARDS_SVG, ITEM_CARDS_SVG, CARD_REVS } from "./pagecards.js";
+import { BOT_CARDS_SVG } from "./botcards.js";
 /**
  * The oldest replay version whose plays still count (boards, dailies, dans). 3 = 2.0 and newer (no early misses), raised
  * when 2.0 came out (2026-11-17): plays from 1.x get "Update the game and play it again".
@@ -87,7 +91,8 @@ const V = {
   maxPlayTimeMs: 100_000_000_000, // about three years of playing
   maxBig: 9_000_000_000_000_000,
   dayPR: 30_000,           // more PR than this within 24 hours waits for a moderator ((2.2.0) every new chart adds its full PR)
-  dayLevels: 25,           // the same for levels
+  dayLevels: 25,           // the same for levels...
+  dayXp: 200_000_000,      // ...when it's also more xp than a day of plays earns (2.2.0: low levels take a few plays each, so a new player's first day isn't held)
   maxCharts: 30_000,
 };
 const isNum = (v, lo, hi) => typeof v === "number" && Number.isFinite(v) && v >= lo && v <= hi;
@@ -284,10 +289,11 @@ async function rankFromPlays(env, cfg, playerId) {
   // chart and replay the game sent (see unverifiedPlay): the numbers the game syncs never count. Plays from before 2.0.1
   // that came in during the last day (the game sends earlier bests once) are left out of the day's pace check (pacePP).
   const nowMs = Date.now(), restoring = new Set();
+  const covered = await unverifiedCovered(env, judged);
   for (const p of Object.values(judged.unverified || {})) {
     if (!p || !isNum(p.pp, 0, V.maxTotalPR) || !(p.pp > 0) || !isNum(p.acc, 0, 100)) continue;
     if (resetAt && !(Date.parse(p.at) > resetAt)) continue;
-    if (p.song && (await boardSong(env, p.song).catch(() => false))) continue; // its song got verified: its board play counts
+    if (await covered(p)) continue; // its song got verified: its board play counts
     const play = { pp: round2(p.pp * UNVERIFIED_SHARE), acc: p.acc };
     plays.push(play);
     if (byChart.unverified.length < 300) byChart.unverified.push({ song: p.song || null, d: p.d || null, pp: round2(p.pp), counted: play.pp, stv: p.stv || 3 });
@@ -368,8 +374,8 @@ function countPlay(d, result, durationMs) {
  */
 function mergeJudged(cur, nw, forAch) {
   const out = cur && typeof cur === "object" ? { ...cur } : { pp: 0, acc: 0, fc: false, combo: 0, at: nw.at };
-  if (!cur || (nw.pp || 0) > (cur.pp || 0)) Object.assign(out, { pp: nw.pp || 0, acc: nw.acc, at: nw.at, m: nw.m || undefined });
-  for (const k of ["st", "k", "d", "song", "title"]) if (nw[k] !== undefined && nw[k] !== null && nw[k] !== "") out[k] = nw[k];
+  if (!cur || (nw.pp || 0) > (cur.pp || 0)) Object.assign(out, { pp: nw.pp || 0, acc: nw.acc, pa: nw.pa || undefined, at: nw.at, m: nw.m || undefined, sc: nw.sc, n: nw.n, mc: nw.mc });
+  for (const k of ["st", "k", "d", "song", "title", "board"]) if (nw[k] !== undefined && nw[k] !== null && nw[k] !== "") out[k] = nw[k];
   if (forAch) {
     if (nw.fc) out.fc = true;
     if (nw.pf) out.pf = true;
@@ -390,21 +396,43 @@ function pushRecent(d, play) {
 }
 const RECENT_KEEP = 30;
 
+/** (2.2.1) A judged play's score (sc), judgement counts (n) and max combo (mc), as kept with it; bad values left out. */
+function playDetail(score, counts, maxCombo) {
+  const out = {};
+  if (isNum(Number(score), 0, V.maxBig)) out.sc = Math.round(Number(score));
+  if (Array.isArray(counts) && counts.length >= 6 && counts.slice(0, 6).every((x) => isInt(Number(x), 0, V.maxCombo * 10))) out.n = counts.slice(0, 6).map(Number);
+  if (isInt(Number(maxCombo), 0, V.maxCombo)) out.mc = Number(maxCombo);
+  return out;
+}
+
+/**
+ * Keeps a judged board play: its chart's best (PR, grade, combo...), the recent plays and the play totals. Returns false
+ * when it's a play already kept (2.2.1: the same replay sent again, found by its timing signature, or for older recent
+ * plays the same accuracy, mods and grade): nothing is added to the recent plays or the totals then.
+ */
 async function rememberJudged(env, playerId, songId, chartId, entry, extra = {}) {
-  if (!entry) return;
+  if (!entry) return true;
   const pp = isNum(entry.pp, 0, V.maxTotalPR) ? entry.pp : 0;
+  let fresh = true;
   await r2update(env, judgedKey(playerId), () => ({ v: 1, charts: {} }), (d) => {
     d.charts ||= {};
     const k = `${songId}/${chartId}`;
-    pushRecent(d, { k, v: 1, pp, acc: entry.accuracy, g: entry.grade, fc: !!entry.fullCombo, m: entry.mods || undefined,
-      at: entry.date || new Date().toISOString(), st: extra.stars, keys: extra.keys, d: extra.difficulty });
+    // (2.2.1) the play's score, judgements and combo too, for the website's play details
+    const detail = playDetail(entry.score, entry.counts, entry.maxCombo);
+    const sameMods = (r) => String(r.m || "") === String(entry.mods || "");
+    fresh = !(Array.isArray(d.recent) ? d.recent : []).some((r) => r && r.v === 1 && r.k === k &&
+      (r.sg && extra.sig ? r.sg === extra.sig : r.acc === entry.accuracy && sameMods(r) && r.g === entry.grade));
+    if (fresh) pushRecent(d, { k, v: 1, pp, acc: entry.accuracy, g: entry.grade, fc: !!entry.fullCombo, m: entry.mods || undefined,
+      at: entry.date || new Date().toISOString(), st: extra.stars, keys: extra.keys, d: extra.difficulty, sg: extra.sig || undefined, ...detail });
     d.charts[k] = mergeJudged(d.charts[k], {
-      pp, acc: entry.accuracy, fc: !!entry.fullCombo, combo: entry.maxCombo || 0, g: entry.grade, pf: allPerfect(entry.counts),
-      at: entry.date || new Date().toISOString(), m: entry.mods || undefined, st: extra.stars, k: extra.keys, d: extra.difficulty,
+      pp, acc: entry.accuracy, pa: Array.isArray(entry.counts) && ppAccuracy(entry.counts) >= 0 ? round2(ppAccuracy(entry.counts)) : undefined,
+      fc: !!entry.fullCombo, combo: entry.maxCombo || 0, g: entry.grade, pf: allPerfect(entry.counts),
+      at: entry.date || new Date().toISOString(), m: entry.mods || undefined, st: extra.stars, k: extra.keys, d: extra.difficulty, ...detail,
     }, !(extra.rate < 1));
     noteFacts(d, extra.facts);
-    if (extra.result) countPlay(d, extra.result, extra.durationMs);
+    if (extra.result && fresh) countPlay(d, extra.result, extra.durationMs);
   });
+  return fresh;
 }
 
 // ---------------------------------------------------------------- achievements (2.0.1)
@@ -510,6 +538,9 @@ function shownAchievements(card, id) {
   return out;
 }
 
+/** (2.2.1) A Workshop upload's picture (its version keeps a changed one from being cached), or null without one. */
+const wsPicUrl = (it) => (it && it.preview ? `${WORKER_BASE}/api/preview/${it.id}?v=${it.version || 1}` : null);
+
 /** OCTIVE's own and verified charts by board key: stars, keys, difficulty, song title; and OCTIVE's own song ids. */
 let chartInfoCache = null, chartInfoAt = 0;
 async function boardChartInfo(env) {
@@ -524,7 +555,8 @@ async function boardChartInfo(env) {
       for (const c of sg.charts || []) {
         const ch = set > 0 && c.osuMd5 ? c.osuMd5 : c.chartId;
         if (!ch || charts.has(`${board}/${ch}`)) continue;
-        charts.set(`${board}/${ch}`, { stars: Number(c.stars) || 0, stv: Number(c.stv) || 3, stars3: Number(c.stars3 ?? c.stars) || 0, keys: Number(c.keys) || 0, difficulty: String(c.difficulty || ""), title: String(sg.title || "") });
+        charts.set(`${board}/${ch}`, { stars: Number(c.stars) || 0, stv: Number(c.stv) || 3, stars3: Number(c.stars3 ?? c.stars) || 0, keys: Number(c.keys) || 0, difficulty: String(c.difficulty || ""), title: String(sg.title || ""),
+          itemId: it.id, pic: wsPicUrl(it) }); // (2.2.1) the Workshop upload it's from, and its picture
       }
     }
   }
@@ -782,6 +814,28 @@ async function recomputeRanking(env, max = 6) {
   return state;
 }
 
+/**
+ * (2.2.1) Whether a player's unverified play is now covered by a verified board, so it mustn't count as well: its song
+ * or its board (an osu! set, kept since 2.2.1) got verified, or (older plays, which only name the player's own copy of
+ * the song) a chart the player has a verified play on has the same title, difficulty and keys.
+ */
+async function unverifiedCovered(env, judged) {
+  const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const same = new Set();
+  try {
+    const info = (await boardChartInfo(env)).charts;
+    for (const k of Object.keys((judged && judged.charts) || {})) {
+      const i = info.get(k);
+      if (i && i.title) same.add(`${norm(i.title)}|${norm(i.difficulty)}|${i.keys || 0}`);
+    }
+  } catch { /* boards unknown: only the ids are compared */ }
+  return async (p) => {
+    if (!p) return false;
+    for (const s of [p.song, p.board]) if (s && (await boardSong(env, s).catch(() => false))) return true;
+    return !!(p.title && same.has(`${norm(p.title)}|${norm(p.d)}|${p.k || 0}`));
+  };
+}
+
 /** A player's judged plays, built from the boards the first time (see above). */
 async function judgedPlays(env, playerId, charts) {
   const have = await r2json(env, judgedKey(playerId), null);
@@ -828,7 +882,7 @@ async function rememberDay(env, id, pp, acc, rank, level) {
   const day = new Date(Date.now()).toISOString().slice(0, 10);
   await r2update(env, historyKey(id), () => ({ v: 1, days: [] }), (d) => {
     d.days ||= [];
-    const point = [day, round2(Number(pp) || 0), round2(Number(acc) || 0), Number(rank) || 0, Number(level) || 1, TOTAL_V];
+    const point = [day, round2(Number(pp) || 0), round2(Number(acc) || 0), Number(rank) || 0, Number(level) || 1, HIST_V];
     const last = d.days[d.days.length - 1];
     if (last && last[0] === day) {
       if (last[1] === point[1] && last[2] === point[2] && last[3] === point[3] && last[4] === point[4] && last[5] === point[5]) return false;
@@ -843,12 +897,24 @@ async function rememberDay(env, id, pp, acc, rank, level) {
 // PR now minus their PR 7 days ago (the first day of the last 7 with the same kind of total, see rememberDay's TOTAL_V),
 // so the change to plain-sum totals in 2.2.0 doesn't count as a gain.
 const GAIN_DAYS = 7;
+// (2.2.1) which totals can be compared (history points carry it at [5]): 2 = 2.2.0's plain sums, 3 = rate plays priced
+// with the stars at their speed (rescored on 2026-11-26). A server-side repricing must never show up as a week's gain.
+const HIST_V = 3;
 async function rememberGain(env, id, name, pp) {
   const hist = await r2json(env, historyKey(id), null);
   const days = (hist && hist.days) || [];
   const since = new Date(Date.now() - GAIN_DAYS * 86_400_000).toISOString().slice(0, 10);
-  const base = days.find((d) => d[0] >= since && d[5] === TOTAL_V);
-  const gain = base ? round2(Math.max(0, (Number(pp) || 0) - (Number(base[1]) || 0))) : 0;
+  // (2.2.1) the start: the last day before the week (its PR is that day's end, before this week's plays); when there
+  // isn't one, the first day of the week with the same kind of total, or 0 for a player with no older history at all
+  const same = days.filter((d) => d[5] === HIST_V);
+  const before = same.filter((d) => d[0] < since).pop();
+  const firstInWeek = same.find((d) => d[0] >= since);
+  const olderHistory = days.some((d) => d[0] < since || d[5] !== HIST_V);
+  let base = null;
+  if (before) base = Number(before[1]) || 0;
+  else if (!olderHistory) base = 0; // a new player: everything is this week's
+  else if (firstInWeek) base = Number(firstInWeek[1]) || 0;
+  const gain = base !== null ? round2(Math.max(0, (Number(pp) || 0) - base)) : 0;
   await r2update(env, "rank/gainers.json", () => ({ players: {} }), (g) => {
     g.players ||= {};
     const now = Date.now();
@@ -865,7 +931,7 @@ async function topGainers(env, limit = 50) {
   if (Date.now() - boardAt > BOARD_TTL) { try { await loadModeration(config(env)); } catch { /* keep */ } }
   return Object.entries(g.players || {})
     .filter(([id, v]) => v && v.gain > 0 && now - Date.parse(v.at) <= GAIN_DAYS * 86_400_000 && !moderation.bans[id] && !isOfficial(id))
-    .map(([id, v]) => ({ playerId: id, name: v.name, gain: v.gain, pp: v.pp, at: v.at }))
+    .map(([id, v]) => ({ playerId: id, name: moderation.overrides[id]?.name || v.name, gain: v.gain, pp: v.pp, at: v.at })) // (2.2.1) a moderator's rename
     .sort((a, b) => b.gain - a.gain)
     .slice(0, limit)
     .map((x, i) => ({ ...x, rank: i + 1 }));
@@ -957,32 +1023,66 @@ async function playsOf(env, id) {
   const after = (at) => !resetAt || Date.parse(at) > resetAt;
   const verified = (await verifiedSongs(env).catch(() => ({ songs: {} }))).songs || {};
   const onBoard = (k) => { const sid = k.split("/")[0]; return officialSong(sid) || !!verified[sid]; };
+  // (2.2.1) each song's Workshop upload (by song id and by osu! set), so a play shows its picture and opens it:
+  // verified uploads first, then OCTIVE's own, then anyone's
+  const songItem = new Map();
+  {
+    const rank = (x) => (x.verified ? 0 : x.builtin ? 1 : 2);
+    const items = ((await judgeDb(env).catch(() => ({ items: [] }))).items || []).filter((x) => x && x.type === "charts" && !x.removed && x.meta);
+    for (const it of items.sort((a, c) => rank(a) - rank(c)))
+      for (const sg of it.meta.songs || []) {
+        if (!sg || !sg.songId) continue;
+        const keys = [sg.songId, Number(sg.osuSet) > 0 ? "osu-" + Math.round(Number(sg.osuSet)) : null].filter(Boolean);
+        for (const key of keys) if (!songItem.has(key)) songItem.set(key, { itemId: it.id, pic: wsPicUrl(it) });
+      }
+  }
+  const itemFor = (k, p) => {
+    const i = k ? info.get(k) : null;
+    if (i && i.itemId) return i;
+    for (const key of [k && k.split("/")[0], p.board, p.song]) if (key && songItem.has(key)) return songItem.get(key);
+    return null;
+  };
   const show = (k, p, v) => {
     const i = v ? info.get(k) : null;
+    const ws = itemFor(v ? k : null, p);
     return {
       title: (i && i.title) || p.title || p.t || "Unknown song", difficulty: (i && i.difficulty) || p.d || "", keys: (i && i.keys) || p.k || p.keys || 0,
       stars: round2((i && i.stars) || p.st || 0), pp: round2(v ? p.pp : (p.counted ?? p.pp * UNVERIFIED_SHARE)), acc: round2(p.acc || 0),
-      grade: p.g || null, fc: !!p.fc, mods: p.m || "", at: p.at || null, verified: !!v, board: v ? k : null,
+      grade: p.g || null, fc: !!p.fc, mods: p.m || "", at: p.at || null, verified: !!v, board: v ? k : null, pa: Number(p.pa) || 0,
+      item: ws ? ws.itemId : null, pic: ws ? ws.pic : null,
+      // (2.2.1) kept with plays since 2.2.1 (older ones: the website looks up their board score)
+      score: Number.isFinite(p.sc) ? p.sc : null, counts: Array.isArray(p.n) ? p.n : null, maxCombo: Number.isFinite(p.mc) ? p.mc : null,
     };
   };
   const top = [];
   for (const [k, p] of Object.entries((judged && judged.charts) || {}))
     if (p && p.pp > 0 && after(p.at) && onBoard(k)) top.push(show(k, p, true));
+  const covered = await unverifiedCovered(env, judged); // (2.2.1) not a song that's verified now (counted on its board)
   for (const p of Object.values((judged && judged.unverified) || {}))
-    if (p && p.pp > 0 && after(p.at) && !(p.song && onBoard(p.song))) top.push(show(null, { ...p, counted: p.pp * UNVERIFIED_SHARE }, false));
+    if (p && p.pp > 0 && after(p.at) && !(p.song && onBoard(p.song)) && !(await covered(p))) top.push(show(null, { ...p, counted: p.pp * UNVERIFIED_SHARE }, false));
   top.sort((a, c) => c.pp - a.pp);
-  // (2.2.0) every play counts its full PR; weight is the share of the chart's PR the accuracy earned (the accuracy curve)
-  for (const t of top) { t.earned = round2(accCurve((Number(t.acc) || 0) / 100) * 100); t.weight = t.earned; t.weighted = t.pp; }
+  // (2.2.0) every play counts its full PR; weight is the share of the chart's PR the accuracy earned (the accuracy curve).
+  // (2.2.1) with osu!mania's accuracy, as PR itself and the game use (pa, kept since 2.2.1; older plays: worked out from the shown one)
+  for (const t of top) { t.earned = round2(accCurve(t.pa > 0 ? t.pa / 100 : ppAccFromShown(Number(t.acc) || 0)) * 100); t.weight = t.earned; t.weighted = t.pp; delete t.pa; }
   // recent: what the server kept, then their best plays by date
   const recent = [];
+  const seenPlay = new Set(); // (2.2.1) a play the game sent more than once (kept before 2.2.1) shows once
   for (const r of Array.isArray(judged && judged.recent) ? judged.recent : []) {
     if (!r || !after(r.at)) continue;
-    if (r.v) recent.push(show(r.k, r, true));
+    const same = [r.k || r.h || r.t, r.acc, r.m || "", r.g].join("|");
+    if (seenPlay.has(same)) continue;
+    seenPlay.add(same);
+    // (2.2.1) the chart's best play shows its PR as it counts now (rate plays were priced again after they were kept)
+    const best = r.v && judged.charts ? judged.charts[r.k] : null;
+    const now = best && best.acc === r.acc && String(best.m || "") === String(r.m || "") ? { ...r, pp: best.pp, sc: r.sc ?? best.sc, n: r.n || best.n, mc: r.mc ?? best.mc } : r;
+    if (r.v) recent.push(show(r.k, now, true));
     else recent.push(show(null, { ...r, counted: r.pp }, false));
   }
   if (recent.length < 20) {
-    const seen = new Set(recent.map((r) => r.title + "|" + r.difficulty + "|" + r.at));
-    const older = top.filter((t) => t.at && !seen.has(t.title + "|" + t.difficulty + "|" + t.at)).sort((a, c) => Date.parse(c.at) - Date.parse(a.at));
+    // (2.2.1) best plays already listed (by chart, accuracy and mods: a copy's time can differ) aren't added again
+    const playKey = (t) => [t.title, t.difficulty, t.acc, t.mods || ""].join("|");
+    const seen = new Set(recent.map(playKey));
+    const older = top.filter((t) => t.at && !seen.has(playKey(t))).sort((a, c) => Date.parse(c.at) - Date.parse(a.at));
     for (const t of older) { if (recent.length >= 20) break; recent.push({ ...t, best: true }); }
   }
   return { top: top.slice(0, 100), recent: recent.slice(0, 20), total: top.length };
@@ -1033,7 +1133,8 @@ async function paceCheck(env, cfg, playerId, now) {
     if (level <= 1) {
       try { const c = (await publicItems(cfg, playerId, ["card"])).card; if (c && isInt(c.level, 1, V.maxLevel)) level = c.level; } catch { /* no card */ }
     }
-    rec = { pp, level, hist: [] };
+    // (2.2.1) already on today's totals: the one-time 2.2.0 restart mustn't publish a new account's first sync unchecked
+    rec = { pp, level, hist: [], tv: TOTAL_V };
   }
   return { key, rec };
 }
@@ -1312,6 +1413,7 @@ async function avatar(env, playerId, hash) {
 // ---------------------------------------------------------------- game updates
 // The game checks /releases/latest.json and downloads the files it names from the R2 bucket bound as
 // RELEASES (Worker → Settings → Bindings → R2 bucket, variable name RELEASES).
+const AUDIO_TYPES = { mp3: "audio/mpeg", ogg: "audio/ogg", opus: "audio/ogg", m4a: "audio/mp4", aac: "audio/aac", flac: "audio/flac", wav: "audio/wav" };
 const RELEASE_TYPES = { json: "application/json; charset=utf-8", zip: "application/zip", apk: "application/vnd.android.package-archive", exe: "application/vnd.microsoft.portable-executable" };
 
 async function release(env, key, request) {
@@ -1829,6 +1931,7 @@ async function me(env, who) {
     supporter: supportStatus(await r2json(env, `supporters/${who.playerId}.json`, null), who.playerId, await r2json(env, `boosters/${who.playerId}.json`, null)),
     gifts: await pendingGifts(env, who.playerId),
     looks: await r2json(env, `looks/${who.playerId}.json`, {}),
+    link: await linkOf(env, who.playerId), // (2.2.2) their own profile link (supporters)
   };
 }
 
@@ -2071,7 +2174,8 @@ async function account(request, env, route) {
       // a jump bigger than a day of real playing waits for a moderator
       const { key, rec } = await paceCheck(env, cfg, id, now);
       // (2.2.0) totals became a plain sum: the record starts over from the new total once, so the jump isn't held
-      if (rec.tv !== TOTAL_V) { rec.tv = TOTAL_V; rec.pp = r.pp; rec.hist = []; delete rec.held; }
+      // (2.2.1) a hold waiting for a moderator stays: the record isn't started over then
+      if (rec.tv !== TOTAL_V) { rec.tv = TOTAL_V; if (!rec.held) { rec.pp = r.pp; rec.hist = []; } }
       rec.hist = (rec.hist || []).filter((h) => now - h.t < 86_400_000);
       const basePR = Math.min(rec.pp, ...rec.hist.map((h) => h.pp));
       const baseLv = Math.min(rec.level, ...rec.hist.map((h) => h.level));
@@ -2080,7 +2184,7 @@ async function account(request, env, route) {
       const lvKnown = rec.level > 1 || rec.levelKnown === true;
       const approved = rec.approvedUntil && Date.parse(rec.approvedUntil) > now;
       let pub = r, held = null;
-      if (!official && !approved && ((r.pacePP ?? r.pp) - basePR > V.dayPR || (lvKnown && r.level - baseLv > V.dayLevels))) {
+      if (!official && !approved && ((r.pacePP ?? r.pp) - basePR > V.dayPR || (lvKnown && r.level - baseLv > V.dayLevels && xpForLevel(r.level) - xpForLevel(baseLv + 1) > V.dayXp))) {
         held = { pp: r.pp, level: r.level, at: new Date(now).toISOString() };
         pub = lvKnown ? { ...r, pp: Math.min(r.pp, rec.pp), level: Math.min(r.level, rec.level), levelProgress: r.level > rec.level ? 1 : r.levelProgress } : { ...r, pp: Math.min(r.pp, rec.pp) };
         if (!lvKnown) { rec.level = r.level; rec.levelKnown = true; }
@@ -2225,7 +2329,7 @@ async function account(request, env, route) {
       if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) fail(400, "That player can't be found.");
       const token = [...crypto.getRandomValues(new Uint8Array(20))].map((x) => x.toString(16).padStart(2, "0")).join("");
       await env.RELEASES.put(`reset-links/${token}.json`, JSON.stringify({ playerId: id, exp: Date.now() + 86_400_000, by: who.playerId }), { httpMetadata: { contentType: "application/json" } });
-      return reply({ ok: true, url: `${SITE}#/reset?link=${token}` });
+      return reply({ ok: true, url: `${SITE}reset?link=${token}` });
     }
     case "reset/link": {
       const b = await bodyOf(request);
@@ -2604,7 +2708,6 @@ const DISCORD_PUBLIC_KEY = "57eae870ba2f5c8833c8c2df8ee0552e5a2d034eb3409d2a7475
 const SITE = "https://senterraslays.github.io/octive/";
 const WORKER_BASE = "https://octive-rankings-api.lunalazum18.workers.dev";
 const EPHEMERAL = 64;
-const BADGE_EMOJI = { DEV: "🛠️ DEV", MOD: "🛡️ MOD", CREATOR: "🎬 CREATOR", CHARTER: "🎼 CHARTER", VIP: "⭐ VIP", TESTER: "🧪 TESTER" };
 
 function hexBytes(hex) { const b = new Uint8Array(hex.length / 2); for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16); return b; }
 
@@ -2669,32 +2772,13 @@ async function profileOf(env, playerId) {
 
 // ---------------------------------------------------------------- the commands' look
 const C_ACCENT = 0x8B7BFF, C_PINK = 0xFF6FAE, C_GREEN = 0x3DDC84, C_GOLD = 0xF2C14E, C_DEV = 0xB69BFF, C_CREATOR = 0xFF2133;
-const FOOTER = { text: "OCTIVE · senterraslays.github.io/octive" };
 const clean = (s) => String(s || "").replace(/[*_`~|>\\]/g, "").slice(0, 60) || "Player";
 const unix = (iso) => Math.floor(Date.parse(iso) / 1000);
-const bar = (f, n = 12) => { const k = Math.max(0, Math.min(n, Math.round((f || 0) * n))); return "█".repeat(k) + "░".repeat(n - k); };
 const linkButton = (label, url, emoji) => ({ type: 2, style: 5, label, url, ...(emoji ? { emoji: { name: emoji } } : {}) });
 const row = (...buttons) => ({ type: 1, components: buttons.filter(Boolean).slice(0, 5) });
 const GIFTER_TIERS = [[36, "Star Gifter", "🌟"], [24, "Platinum Gifter", "💎"], [12, "Gold Gifter", "🥇"], [6, "Silver Gifter", "🥈"], [3, "Bronze Gifter", "🥉"], [1, "Gift Starter", "🎁"]];
 const gifterTier = (m) => GIFTER_TIERS.find(([n]) => m >= n) || null;
 const supNo = (n) => "#" + String(n).padStart(4, "0");
-
-function discordStatus(p) {
-  if (!p.online) return p.lastSeen ? `Last online <t:${unix(p.lastSeen)}:R>` : "Offline";
-  const dev = /-dev$/.test(p.status || "");
-  return "🟢 " + (STATUS_TEXT[(p.status || "").replace(/-dev$/, "")] || "Online") + (dev ? " · DEV build" : "");
-}
-
-/** The supporter line for a profile: tier, Supporter number, gifting. */
-function supporterLine(p, st) {
-  const parts = [];
-  if (st?.active) parts.push(st.lifetime ? "💖 Lifetime supporter" : st.booster ? "💖 Supporter · Server Booster" : `💖 Supporter (${fmtN(st.months)} month${st.months === 1 ? "" : "s"})`);
-  else if (st?.days > 0) parts.push("🤍 Former supporter");
-  if (p.supporterNo != null) parts.push(`Supporter ${supNo(p.supporterNo)}`);
-  const g = gifterTier(p.gifted || 0);
-  if (g) parts.push(`${g[2]} ${g[1]} · ${fmtN(p.gifted)} month${p.gifted === 1 ? "" : "s"} gifted`);
-  return parts.join("  ·  ");
-}
 
 let achCache = null, achAt = 0;
 async function achievementDefs() {
@@ -2703,36 +2787,498 @@ async function achievementDefs() {
   return achCache || [];
 }
 
-function profileEmbed(p, st, achTotal) {
-  const badges = (p.badges || []).map((b) => BADGE_EMOJI[b] || b).join("  ");
-  const color = (p.badges || []).includes("DEV") ? C_DEV : st?.active ? C_PINK : (p.badges || []).includes("CREATOR") ? C_CREATOR : C_ACCENT;
-  const bio = stripBio(p.bio);
-  const sup = supporterLine(p, st);
-  const got = Object.keys(p.achievements || {}).length;
-  const e = {
-    author: { name: p.rank ? `#${fmtN(p.rank)} on the OCTIVE ranking` : "OCTIVE player" },
-    title: clean(p.name),
-    url: `${SITE}#/u/${encodeURIComponent(p.id)}`,
-    color,
-    description: [badges || null, sup || null, bio ? `> ${bio.slice(0, 280).replace(/\n/g, "\n> ")}` : null].filter(Boolean).join("\n") || undefined,
-    fields: [
-      { name: "Performance", value: `**${fmtN(p.pp)} PR**`, inline: true },
-      { name: "Accuracy", value: `${fmtN(p.accuracy, 2)}%`, inline: true },
-      { name: "Level", value: `Lv${p.level}`, inline: true },
-      { name: `Progress to Lv${(p.level || 1) + 1}`, value: `\`${bar(p.levelProgress)}\` ${Math.round((p.levelProgress || 0) * 100)}%`, inline: false },
-      { name: "Plays", value: fmtN(p.playCount), inline: true },
-      { name: "Full combos", value: fmtN(p.fullCombos), inline: true },
-      { name: "Max combo", value: p.maxCombo ? `${fmtN(p.maxCombo)}x` : "—", inline: true },
-      { name: "Play time", value: playTimeText(p.playTimeMs), inline: true },
-      { name: "Achievements", value: achTotal ? `${got} / ${achTotal}` : fmtN(got), inline: true },
-      { name: "Status", value: discordStatus(p), inline: true },
-    ],
-    footer: FOOTER,
+// ---------------------------------------------------------------- (2.2.2) shared profile links and their card
+// GET /u/<link or player id>: what Discord (and other sites) read when a profile link is shared: a title, a line of
+// numbers and the card picture (card.js); people are sent on to the profile on the website. GET /card/<id>.png: the
+// picture (kept in R2 at cards/<id>.png until the numbers on it change). Supporters choose a link of their own
+// (POST /support/link: /u/Senterra), kept after their supporter time ends; links/index.json
+// { "<link, lower case>": { id, link, at } }.
+const LINKS_KEY = "links/index.json";
+const LINK_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{2,19}$/;
+const LINK_RESERVED = new Set(["admin", "administrator", "mod", "mods", "moderator", "moderators", "staff", "octive", "official", "support", "supporter",
+  "supporters", "help", "system", "root", "null", "undefined", "api", "dev", "developer", "developers", "owner", "team", "discord", "ranking", "rankings",
+  "ranked", "workshop", "account", "settings", "download", "downloads", "about", "privacy", "terms", "everyone", "here", "me", "you", "player", "players",
+  "crew", "crews", "daily", "home", "login", "signup", "signin", "card", "cards", "link", "links", "profile", "profiles", "senterraslays"]);
+const LINK_STAFF_WORDS = /octive|official|admin|moderat|developer/i;
+// offensive words: anywhere in the link (folded: lower case, 0→o 1→i 3→e 4→a 5→s 7→t @→a $→s, - and _ dropped)…
+const LINK_BAD_ANY = ["nigg", "nigr", "faggot", "fagg", "retard", "kike", "chink", "tranny", "hitler", "heil", "cunt", "fuck", "shit", "bitch",
+  "whore", "slut", "pussy", "penis", "vagina", "dildo", "porn", "hentai", "milf", "nsfw", "xxx", "boob", "jizz", "molest", "pedophil", "paedo",
+  "onlyfans", "killyourself", "rapist", "asshole", "bastard", "wank", "blowjob", "handjob", "orgasm", "erotic", "horny", "nude", "naked",
+  "kkk", "swastika", "genocide", "terroris", "beaner", "wetback", "gook", "towelhead", "raghead", "cocksuck", "motherf", "spastic", "coon"];
+// …and short ones only as a whole part (between - and _) or where the link starts or ends, so "grape" and "class" are fine
+const LINK_BAD_PART = ["rape", "sex", "cum", "anal", "cock", "tits", "titty", "dick", "fag", "nazi", "spic", "pedo", "twat", "ass", "kys", "dyke", "negro", "semen", "porno", "thot"];
+const LINK_BAD_OK = ["analog", "analys", "analyt", "cockpit", "cockatoo", "peacock", "sextet", "sussex", "essex", "cumul", "cucumber", "assist", "assassin", "assault", "assem", "asset", "class", "grass", "glass", "bass", "mass", "pass", "brass", "compass", "dickens", "titan", "title"];
+function linkFold(s) {
+  return String(s).toLowerCase().replace(/[013457@$]/g, (c) => ({ 0: "o", 1: "i", 3: "e", 4: "a", 5: "s", 7: "t", "@": "a", $: "s" })[c]).replace(/[^a-z]/g, "");
+}
+/** Why a link can't be used (null: it can). Staff can use the reserved names, never the offensive words. */
+function linkProblem(link, staff) {
+  if (!LINK_RE.test(link)) return "A link is 3 to 20 letters, numbers, - and _ (starting with a letter or number).";
+  const lower = link.toLowerCase(), fold = linkFold(link);
+  const parts = lower.split(/[-_]+/).map(linkFold).filter(Boolean);
+  if (LINK_BAD_ANY.some((w) => fold.includes(w))) return "That link isn't allowed.";
+  // a part on its own always counts ("b_ass"); the start and end are checked with harmless words taken out ("TheAssassin")
+  const rest = LINK_BAD_OK.reduce((x, w) => x.split(w).join(""), fold);
+  if (LINK_BAD_PART.some((w) => parts.includes(w) || (rest && (rest.startsWith(w) || rest.endsWith(w))))) return "That link isn't allowed.";
+  if (!staff && (LINK_RESERVED.has(lower) || LINK_RESERVED.has(fold) || LINK_STAFF_WORDS.test(fold))) return "That link is kept for OCTIVE.";
+  return null;
+}
+let linksCache = null, linksAt = 0;
+async function profileLinks(env) {
+  if (linksCache && Date.now() - linksAt < 30_000) return linksCache;
+  linksCache = await r2json(env, LINKS_KEY, {}); linksAt = Date.now();
+  return linksCache;
+}
+async function linkOf(env, playerId) {
+  for (const v of Object.values(await profileLinks(env))) if (v && v.id === playerId) return v.link;
+  return null;
+}
+/** A link or a player id to { id, link } (null: nobody). Player ids are 28 characters, links 20 at most. */
+async function resolveProfile(env, key) {
+  key = String(key || "");
+  const hit = (await profileLinks(env))[key.toLowerCase()];
+  if (hit && hit.id) return { id: hit.id, link: hit.link };
+  if (okPlayerId(key) && key.length > 20) return { id: key, link: await linkOf(env, key) };
+  return null;
+}
+const shareUrl = (key) => `${WORKER_BASE}/u/${encodeURIComponent(key)}`;
+
+const CARD_BADGES = { DEV: "#b69bff", MOD: "#3ee089", CREATOR: "#ff4d5e", CHARTER: "#ffd23f", VIP: "#ffb547", TESTER: "#36d6ff" };
+/** What a player's card shows (null: no profile). */
+async function cardInput(env, playerId) {
+  const raw = await profileOf(env, playerId);
+  if (!raw) return null;
+  const { p, st } = await withSupport(env, raw);
+  let players = [];
+  try { players = (await leaderboard(env)).players || []; } catch { /* no country rank */ }
+  const countryRank = p.country ? players.filter((x) => x.country === p.country && !isOfficial(x.id)).sort((a, b) => a.rank - b.rank).findIndex((x) => x.id === playerId) + 1 : 0;
+  let place = "";
+  try { place = p.country ? new Intl.DisplayNames(["en"], { type: "region" }).of(p.country) || "" : ""; } catch { place = ""; }
+  const defs = await achievementDefs().catch(() => []);
+  const got = p.achievements || {};
+  const badges = (p.badges || []).filter((b) => CARD_BADGES[b]).map((b) => [b, CARD_BADGES[b]]);
+  if (st?.active) badges.push(["SUPPORTER", "#ff6fae"]);
+  return {
+    id: playerId, avatarHash: p.avatarHash || "", official: isOfficial(playerId),
+    name: p.name || "Player", level: p.level || 1, place, rank: p.rank || 0, countryRank, pp: p.pp || 0, accuracy: p.accuracy || 0,
+    playCount: p.playCount || 0, playTimeMs: p.playTimeMs || 0, maxCombo: p.maxCombo || 0,
+    achievements: defs.length ? defs.filter((d) => got[d.id]).length : Object.keys(got).length, supporter: !!st?.active, badges,
   };
-  if (st?.gif) e.thumbnail = { url: `${WORKER_BASE}/looks/gif/${encodeURIComponent(p.id)}?v=${encodeURIComponent(st.gif)}` };
-  else if (p.avatarHash) e.thumbnail = { url: `${WORKER_BASE}/avatar/${encodeURIComponent(p.id)}?v=${encodeURIComponent(p.avatarHash)}` };
-  if (st?.active && st.banner) e.image = { url: `${WORKER_BASE}/looks/banner/${encodeURIComponent(p.id)}?v=${encodeURIComponent(st.banner)}` };
-  return e;
+}
+/** The card's version: changes with anything on it (picture links carry it, so a changed card is fetched again). */
+async function cardVersionOf(c) {
+  const { id, ...shown } = c;
+  return PROFILE_CARD_VERSION + "-" + (await sha256Hex(JSON.stringify(shown))).slice(0, 12);
+}
+async function profileCardRoute(env, playerId) {
+  const c = await cardInput(env, playerId);
+  if (!c) return cors(new Response("Not found", { status: 404 }));
+  const v = await cardVersionOf(c);
+  const headers = { "Content-Type": "image/png", "Cache-Control": "public, max-age=3600" };
+  const key = `cards/${playerId}.png`;
+  const have = await env.RELEASES.get(key);
+  if (have && have.customMetadata?.v === v) return cors(new Response(have.body, { headers }));
+  let avatarBytes = null;
+  if (c.avatarHash) {
+    try { const r = await avatar(env, playerId, c.avatarHash); if (r.ok) avatarBytes = new Uint8Array(await r.arrayBuffer()); } catch { /* the first letter instead */ }
+  }
+  const png = await cardPng(profileCardSvg({ ...c, avatar: avatarBytes }));
+  await env.RELEASES.put(key, png, { httpMetadata: { contentType: "image/png" }, customMetadata: { v } }).catch((e) => console.log("card keep", e && e.message));
+  return cors(new Response(png, { headers }));
+}
+const SHARE_BOTS = /bot\b|bot\/|crawler|spider|preview|discord|slack|twitter|facebookexternalhit|whatsapp|telegram|embedly|skype|linkedin|mastodon|bluesky|cardyb|iframely|vkshare|pinterest|google-?inspect|bingpreview|snapchat|signal/i;
+const htmlEsc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+async function profileSharePage(env, key, request) {
+  const who = await resolveProfile(env, key);
+  const site = `${SITE}u/${encodeURIComponent(who ? who.link || who.id : key)}`;
+  // people go straight to the profile; link previews (Discord, X, Slack…) read the page below
+  if (!SHARE_BOTS.test(request.headers.get("User-Agent") || "")) return new Response(null, { status: 302, headers: { Location: site, "Cache-Control": "no-store" } });
+  const c = who ? await cardInput(env, who.id) : null;
+  const meta = [];
+  const add = (prop, content, name) => meta.push(`<meta ${name ? "name" : "property"}="${prop}" content="${htmlEsc(content)}">`);
+  let title = "OCTIVE player", desc = "This player isn't on OCTIVE (yet). OCTIVE is a free rhythm game with osu!mania maps, rankings and a Workshop.";
+  add("og:site_name", "OCTIVE");
+  if (c) {
+    title = `${c.name} · OCTIVE Player Stats`;
+    const num = (n, d = 0) => fmtN(n, d);
+    desc = `${c.official ? "The official OCTIVE account" : [c.rank ? `#${num(c.rank)} global` : null, `${num(c.pp)} PR`, `${num(c.accuracy, 2)}% accuracy`, `Level ${num(c.level)}`].filter(Boolean).join(" · ")}. View ${c.name}'s OCTIVE profile: top plays, recent plays and achievements.`;
+    add("og:type", "profile");
+    add("og:image", `${WORKER_BASE}/card/${encodeURIComponent(c.id)}.png?v=${await cardVersionOf(c)}`);
+    add("og:image:width", "1200"); add("og:image:height", "600"); add("og:image:type", "image/png");
+    add("og:image:alt", `${c.name}'s OCTIVE stats`);
+    add("twitter:card", "summary_large_image", true);
+    add("theme-color", c.supporter ? "#ff6fae" : "#ffd23f", true);
+  } else add("og:image", `${SITE}logo-512.png`);
+  add("og:title", title); add("og:description", desc); add("og:url", shareUrl(who ? who.link || who.id : key));
+  add("twitter:title", title, true); add("twitter:description", desc, true);
+  const page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${htmlEsc(title)}</title>
+<meta name="description" content="${htmlEsc(desc)}">${meta.join("")}
+<link rel="canonical" href="${htmlEsc(site)}"><meta http-equiv="refresh" content="0; url=${htmlEsc(site)}"></head>
+<body><p><a href="${htmlEsc(site)}">Open ${htmlEsc(c ? c.name : "the profile")} on OCTIVE</a></p></body></html>`;
+  return new Response(page, { status: c ? 200 : 404, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=300" } });
+}
+
+// ---------------------------------------------------------------- (2.2.2) every page's own picture
+// Every page of the website (the ranking, Ranked, crews, the Workshop, the daily charts…) and every thing on it (a
+// Workshop item, a crew, an update) has a card picture for link previews, drawn by pagecards.js and kept in R2
+// (cards/<kind>/<key>.png) until what's on it changes: /card/page/<name>.png, /card/ws/<id>.png, /card/crew/<id>.png and
+// /card/update/<version>.png (a player's is /card/<id>.png). syncProfilePages writes the pages that show them.
+const CARD_COL = { pink: "#ff4d9d", purple: "#a764ff", gold: "#ffd23f", green: "#3ee089", cyan: "#36d6ff", orange: "#ff9a3d", lilac: "#b880ff", dim: "#a59cc4" };
+const RK_TIER_COLORS = ["#99A3B8", "#E08F54", "#CCDBF2", "#FFCC4D", "#54DEF5", "#B880FF", "#FF6180", "#FFE894"];
+const WS_KINDS = ["charts", "skins", "themes", "styles"];
+const WS_HEX = { charts: "#8b7bff", skins: "#ff5c8a", themes: "#4fd6e8", styles: "#ffb84f" };
+const DAILY_HEX = { easy: CARD_COL.green, normal: CARD_COL.cyan, hard: CARD_COL.orange, extreme: CARD_COL.pink };
+
+/** A colour a dark card can show (a dark crew colour is lightened). */
+function cardHex(hex) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ""));
+  if (!m) return CARD_COL.lilac;
+  const n = parseInt(m[1], 16), r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+  if (lum >= 0.4) return "#" + m[1];
+  const k = Math.min(0.85, (0.4 - lum) / 0.6 + 0.25), mix = (c) => Math.round(c + (255 - c) * k);
+  return "#" + [mix(r), mix(g), mix(b)].map((v) => v.toString(16).padStart(2, "0")).join("");
+}
+function regionOf(code) {
+  try { return code && /^[A-Z]{2}$/.test(code) ? new Intl.DisplayNames(["en"], { type: "region" }).of(code) || "" : ""; } catch { return ""; }
+}
+const cardDate = (iso) => { const t = Date.parse(iso); return isNaN(t) ? "" : new Date(t).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" }); };
+const plural = (n, word) => `${fmtN(n)} ${word}${n === 1 ? "" : "s"}`;
+
+/**
+ * A card picture, drawn again only when what's on it changed (input: the data on it, never image bytes). Drawing one
+ * takes far more CPU than the Worker's plan gives a request (fine now and then; a burst of them fails with 1102), so a
+ * card in the same look with older numbers is answered at once and drawn again after the answer; only a card that has
+ * never been drawn in this look is drawn before answering.
+ */
+async function cachedCard(env, key, input, build, ctx, look = String(CARD_VERSION), { fresh = false } = {}) {
+  const v = look + "-" + (await sha256Hex(JSON.stringify(input))).slice(0, 12);
+  const headers = { "Content-Type": "image/png", "Cache-Control": "public, max-age=1800" };
+  const have = await env.RELEASES.get(key);
+  if (have && have.customMetadata?.v === v) return cors(new Response(have.body, { headers }));
+  const draw = async () => {
+    const png = await cardPng(await build());
+    await env.RELEASES.put(key, png, { httpMetadata: { contentType: "image/png" }, customMetadata: { v } }).catch((e) => console.log("card keep", key, e && e.message));
+    return png;
+  };
+  // (a command's card is never answered with older numbers: whoever used it is looking at it now)
+  if (!fresh && have && ctx && String(have.customMetadata?.v || "").startsWith(look + "-")) {
+    ctx.waitUntil(draw().catch((e) => console.log("card redraw", key, e && e.message)));
+    return cors(new Response(have.body, { headers: { ...headers, "Cache-Control": "public, max-age=300" } }));
+  }
+  return cors(new Response(await draw(), { headers }));
+}
+/** One of this Worker's GET routes, called directly: its JSON (null when it fails). */
+async function innerJson(env, path) {
+  try {
+    const url = new URL(WORKER_BASE + path), req = new Request(url.toString());
+    const res = path.startsWith("/play/") ? await playRoutes(req, env, url) : path.startsWith("/social/") ? await supportRoutes(req, env, url, { waitUntil() {} }) : null;
+    return res && res.ok ? await res.json() : null;
+  } catch (e) { console.log("card data", path, e && e.message); return null; }
+}
+async function avatarBytes(env, id, hash) {
+  if (!hash) return null;
+  try { const r = await avatar(env, id, hash); return r.ok ? new Uint8Array(await r.arrayBuffer()) : null; } catch { return null; }
+}
+async function previewBytes(env, itemId) {
+  try { const o = await env.RELEASES.get(`workshop/previews/${itemId}`); return o && o.size <= 3_000_000 ? new Uint8Array(await o.arrayBuffer()) : null; } catch { return null; }
+}
+/** A Workshop item's songs, their key counts, the top stars and the most notes. */
+function wsCardStats(it) {
+  const songs = (it.meta && it.meta.songs) || [];
+  const charts = songs.flatMap((s) => s.charts || []);
+  return {
+    songs, keys: [...new Set(charts.map((c) => Number(c.keys)).filter((k) => k > 0))].sort((a, b) => a - b),
+    stars: Math.max(0, ...charts.map((c) => Number(c.stars) || 0)), notes: Math.max(0, ...charts.map((c) => Number(c.notes) || 0)),
+  };
+}
+/** An update's bullet points (its announcement's), without Markdown. */
+function announcementBullets(text) {
+  return String(text || "").split("\n").map((l) => l.trim()).filter((l) => /^([•*-]|\d+\.)\s+/.test(l))
+    .map((l) => l.replace(/^([•*-]|\d+\.)\s+/, "").replace(/\*\*|__|`/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").trim())
+    .filter(Boolean);
+}
+
+/** A page card's look: CARD_VERSION, and the page's own number when only its card changed (pagecards.js CARD_REVS). */
+const pageCardLook = (name) => (CARD_REVS[name] ? `${CARD_VERSION}.${CARD_REVS[name]}` : String(CARD_VERSION));
+/** Up to n Workshop pictures for a card, from these items in order: small files only (every picture drawn is decoded). */
+async function smallPreviews(env, items, n, maxBytes) {
+  const heads = await Promise.all(items.map((it) => env.RELEASES.head(`workshop/previews/${it.id}`).catch(() => null)));
+  const pick = items.filter((_, i) => heads[i] && heads[i].size <= maxBytes).slice(0, n);
+  return (await Promise.all(pick.map((it) => previewBytes(env, it.id)))).filter(Boolean);
+}
+
+/** The website's pages' cards (drawn by pagecards.js): each gives the data on it (to know when it changed) and the SVG. */
+const PAGE_CARDS = {
+  async home(env) {
+    const board = await leaderboard(env).catch(() => ({ players: [] }));
+    const db = await r2json(env, WS_DB, { items: [] });
+    const latest = await r2json(env, "latest.json", null);
+    const players = board.players || [];
+    const data = { n: players.length, on: players.filter((p) => p.online).length, ws: (db.items || []).filter((x) => !x.removed).length, v: latest && latest.version };
+    return { data, card: async () => PAGE_CARDS_SVG.home({ players: data.n, online: data.on, workshop: data.ws, version: data.v }) };
+  },
+  async rankings(env) {
+    const players = ((await leaderboard(env).catch(() => null)) || { players: [] }).players || [];
+    const top = players.filter((p) => !isOfficial(p.id) && p.rank > 0).sort((a, b) => a.rank - b.rank).slice(0, 3);
+    const data = { n: players.length, top: top.map((p) => [p.id, p.name, Math.round(p.pp || 0), p.avatarHash || ""]) };
+    return {
+      data, card: async () => PAGE_CARDS_SVG.rankings({
+        total: data.n, top: await Promise.all(top.map(async (p) => ({ name: p.name, pp: Math.round(p.pp || 0), avatar: await avatarBytes(env, p.id, p.avatarHash) }))),
+      }),
+    };
+  },
+  async ranked(env) {
+    const b = (await innerJson(env, "/play/ranked/public-board")) || { players: [] };
+    const top = (b.players || []).slice(0, 2);
+    const av = new Map((((await leaderboard(env).catch(() => null)) || {}).players || []).map((p) => [p.id, p.avatarHash || ""]));
+    const data = { s: b.season, n: b.total, top: top.map((p) => [p.id, p.name, p.tier, p.rank, p.wins, p.losses, av.get(p.id) || ""]) };
+    return {
+      data, card: async () => PAGE_CARDS_SVG.ranked({
+        season: b.season ?? 0, total: b.total || 0, groups: RK_GROUP_NAMES.slice(1).map((name, i) => [name, RK_TIER_COLORS[i + 1]]),
+        top: await Promise.all(top.map(async (p) => ({ name: p.name, rank: p.rank, group: rkGroupOf(p.tier), wins: p.wins || 0, losses: p.losses || 0, avatar: await avatarBytes(env, p.id, av.get(p.id)) }))),
+      }),
+    };
+  },
+  async crews(env) {
+    const idx = await r2json(env, CREW_INDEX, { crews: {} });
+    const all = Object.entries(idx.crews || {}).map(([id, c]) => ({ id, ...c })).sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
+    const top = all.slice(0, 3);
+    const data = { n: all.length, top: top.map((c) => [c.id, c.name, c.tag, c.color, c.members, Math.round(c.score || 0)]) };
+    return {
+      data, card: async () => PAGE_CARDS_SVG.crews({ total: all.length, top: top.map((c) => ({ name: c.name, tag: c.tag, color: cardHex(c.color), members: c.members || 0, score: Math.round(c.score || 0) })) }),
+    };
+  },
+  async workshop(env) {
+    const db = await r2json(env, WS_DB, { items: [] });
+    const items = (db.items || []).filter((x) => !x.removed);
+    const count = (t) => items.filter((x) => x.type === t).length;
+    // the most downloaded charts with a picture: the mosaic takes the first six small enough
+    const charts = items.filter((x) => x.type === "charts" && x.preview).sort((a, b) => (b.downloads || 0) - (a.downloads || 0)).slice(0, 24);
+    const data = { n: items.length, c: WS_KINDS.map(count), pics: charts.map((x) => x.id) };
+    return {
+      data, card: async () => PAGE_CARDS_SVG.workshop({
+        total: items.length, counts: WS_KINDS.map((t) => [t, count(t), WS_HEX[t]]), pics: await smallPreviews(env, charts, 6, 250 * 1024),
+      }),
+    };
+  },
+  async daily(env) {
+    const d = (await innerJson(env, "/play/daily")) || { tiers: [] };
+    const tiers = d.tiers || [];
+    const data = { date: d.date, t: tiers.map((t) => [t.tier, t.title, t.stars, t.itemId || ""]) };
+    const name = (t) => (DAILY_TIERS.find((x) => x.tier === t.tier) || {}).name || t.tier;
+    return {
+      data, card: async () => PAGE_CARDS_SVG.daily({
+        date: d.date ? cardDate(d.date + "T00:00:00Z") : "",
+        tiers: await Promise.all(tiers.map(async (t) => ({ name: name(t), color: DAILY_HEX[t.tier] || CARD_COL.cyan, title: t.title, stars: Number(t.stars) || 0, pic: t.itemId ? await previewBytes(env, t.itemId) : null }))),
+      }),
+    };
+  },
+  async downloads(env) {
+    const m = await r2json(env, "latest.json", null);
+    const mb = (o) => (o && o.size ? Math.round(o.size / 1048576) : 0);
+    const data = { v: m && m.version, w: mb(m && m.windows), a: mb(m && m.android) };
+    return { data, card: async () => PAGE_CARDS_SVG.downloads({ version: data.v, winMB: data.w, apkMB: data.a }) };
+  },
+  async updates(env) {
+    const h = await r2json(env, "history.json", []);
+    const list = (Array.isArray(h) ? h : []).slice(0, 5);
+    const data = list.map((e) => [e.version, e.published, e.notes]);
+    return {
+      data, card: async () => PAGE_CARDS_SVG.updates({
+        latest: list[0] ? { version: list[0].version, date: cardDate(list[0].published), notes: list[0].notes || "" } : {},
+        list: list.map((e) => ({ version: e.version, date: cardDate(e.published) })),
+      }),
+    };
+  },
+  async supporter(env) {
+    let n = 0;
+    try { n = Object.values(await supporters(env)).filter((s) => s && s.active).length; } catch { /* unknown */ }
+    return { data: { n }, card: async () => PAGE_CARDS_SVG.supporter({ count: n }) };
+  },
+  async live(env) {
+    const l = (await innerJson(env, "/social/live")) || {};
+    const live = l.live || {};
+    const players = new Map((((await leaderboard(env).catch(() => null)) || {}).players || []).map((p) => [p.id, p]));
+    const ids = Object.keys(live).sort((a, b) => (b === OWNER) - (a === OWNER) || (live[b].viewers || 0) - (live[a].viewers || 0));
+    const data = ids.slice(0, 1).map((id) => [id, live[id].title, live[id].viewers || 0, (players.get(id) || {}).avatarHash || ""]).concat([ids.length]);
+    return {
+      data, card: async () => PAGE_CARDS_SVG.live({
+        // the first stream is the one shown (its picture is the only one drawn); the rest are counted
+        streams: await Promise.all(ids.map(async (id, i) => {
+          const p = players.get(id) || {}, s = live[id];
+          return { name: p.name || s.name || "Player", title: s.title || "", viewers: s.viewers || 0, avatar: i === 0 ? await avatarBytes(env, id, p.avatarHash) : null };
+        })),
+      }),
+    };
+  },
+};
+// the pages that show the same thing to everyone
+for (const k of ["help", "messages", "about", "privacy", "terms", "osumania", "fnf", "play", "tools"]) PAGE_CARDS[k] = async () => ({ data: 1, card: async () => PAGE_CARDS_SVG[k]() });
+
+/** A Workshop item's card (null: no such item). */
+async function wsCard(env, id) {
+  const db = await r2json(env, WS_DB, { items: [] });
+  const it = (db.items || []).find((x) => x.id === id && !x.removed);
+  if (!it) return null;
+  const c = wsCardStats(it), label = WS_LABEL[it.type] || "Item";
+  const data = [it.id, it.title, it.creator, it.type, it.downloads || 0, it.likes || 0, !!it.verified, !!it.builtin, c.keys, c.stars, c.notes, c.songs.length, it.size || 0, it.version || 1, !!it.preview];
+  return {
+    data, card: async () => ITEM_CARDS_SVG.ws({
+      title: it.title || "Untitled", kind: label, color: WS_HEX[it.type] || CARD_COL.cyan, creator: it.creator, keys: c.keys, stars: c.stars, notes: c.notes,
+      downloads: it.downloads || 0, likes: it.likes || 0, verified: !!it.verified, official: !!it.builtin, songs: c.songs.length,
+      sizeMB: ((it.size || 0) / 1048576).toFixed(1), isChart: it.type === "charts", pic: it.preview ? await previewBytes(env, it.id) : null,
+    }),
+  };
+}
+/** A crew's card (null: no such crew). */
+async function crewCard(env, id) {
+  const c = await r2json(env, crewKey(id), null);
+  if (!c || c.gone) return null;
+  const idx = await r2json(env, CREW_INDEX, { crews: {} });
+  const rank = Object.values(idx.crews || {}).filter((x) => (x.score || 0) > (c.score || 0)).length + 1;
+  const members = (c.members || []).slice().sort((a, b) => (b.pp || 0) - (a.pp || 0));
+  const av = new Map((((await leaderboard(env).catch(() => null)) || {}).players || []).map((p) => [p.id, p.avatarHash || ""]));
+  const data = [c.id, c.name, c.tag, c.color, rank, Math.round(c.score || 0), members.slice(0, 6).map((m) => [m.id, m.name, av.get(m.id) || ""]), members.length];
+  return {
+    data, card: async () => ITEM_CARDS_SVG.crew({
+      name: c.name, tag: c.tag, color: cardHex(c.color), rank, score: Math.round(c.score || 0), count: members.length,
+      members: await Promise.all(members.slice(0, 6).map(async (m) => ({ name: m.name, avatar: await avatarBytes(env, m.id, av.get(m.id)) }))),
+    }),
+  };
+}
+/** An update's card (null: no such version). */
+async function updateCard(env, version) {
+  const h = await r2json(env, "history.json", []);
+  const e = (Array.isArray(h) ? h : []).find((x) => x.version === version);
+  if (!e) return null;
+  // each bullet's first sentence: the card has room for a line or two each
+  const bullets = announcementBullets(e.announcement).slice(0, 3).map((b) => b.split(/(?<=[.!?])\s+(?=[A-Z])/)[0]);
+  const data = [e.version, e.published, e.notes, bullets];
+  return { data, card: async () => ITEM_CARDS_SVG.update({ version: e.version, date: cardDate(e.published), notes: e.notes || "", lines: bullets }) };
+}
+
+// ---------------------------------------------------------------- (2.2.2) the website's pages (no #)
+// Every page lives at senterraslays.github.io/octive/<page>: rankings, workshop/<id>, crew/<id>, u/<player or link>…
+// GitHub Pages only serves files, so the pages that are shared get a file of their own in the site's repo: the site's
+// index.html with the page's title, line, card picture and address in its head (what Discord and others show), the
+// site itself for everyone else; any other address gets 404.html (the same site). Written with the GitHub API (secret
+// GITHUB_TOKEN: a fine-grained token with Contents read/write on SITE_REPO only), one commit for every change, from the
+// hourly cron, after a supporter changes their link, and from /api/admin/profile-pages. links/pages.json keeps what
+// was written: { tpl, files: { "<file>": signature } }. Pages with things under them (workshop/<id>, updates/<v>) are
+// folder pages (workshop/index.html): a file and a folder of the same name don't mix on GitHub Pages.
+const SITE_REPO = "SenterraSlays/octive", SITE_BRANCH = "main", PAGES_KEY = "links/pages.json";
+const SITE_PAGES = [
+  ["rankings.html", "rankings", "Performance Ranking · OCTIVE", "The OCTIVE global ranking: every player, ranked by their total performance rating (PR).", "rankings"],
+  ["ranked.html", "ranked", "Ranked · OCTIVE", "OCTIVE Ranked: 1v1 matches, best of 3, on a 4K and a 7K ladder. Climb from Contender to Legend.", "ranked"],
+  ["crews.html", "crews", "Crews · OCTIVE", "OCTIVE crews: teams of up to 12 players, ranked by their five best members' PR.", "crews"],
+  ["workshop/index.html", "workshop/", "Workshop · OCTIVE", "Charts, skins, themes and styles shared by OCTIVE players, free to download.", "workshop"],
+  ["daily.html", "daily", "Daily charts · OCTIVE", "Today's OCTIVE daily charts: new charts every day, their scores and your streak.", "daily"],
+  ["downloads.html", "downloads", "Download OCTIVE", "Download OCTIVE, a free rhythm game, for Windows or Android, or play it in your browser.", "downloads"],
+  ["updates/index.html", "updates/", "Updates · OCTIVE", "Every OCTIVE update and its patch notes.", "updates"],
+  ["supporter.html", "supporter", "OCTIVE Supporter", "Support OCTIVE, a free game: 3× daily points, a coloured name, a banner, profile effects, a profile link of your own and more.", "supporter"],
+  ["help.html", "help", "Help · OCTIVE", "Common questions about OCTIVE: accounts, osu!mania maps, PR, timing windows, multiplayer and more.", "help"],
+  ["live.html", "live", "Live now · OCTIVE", "OCTIVE players streaming on Twitch right now.", "live"],
+  ["tools.html", "tools", "Rhythm tools · OCTIVE", "Free rhythm game tools: a keyboard ghosting test for 4K and 7K, a tapping speed test (BPM and unstable rate) and an audio offset finder.", "tools"],
+  ["messages.html", "messages", "Messages · OCTIVE", "Message your OCTIVE friends from the website: the same conversations as in the game, on every device.", "messages"],
+];
+async function siteGit(env, method, path, body) {
+  const r = await fetch(`https://api.github.com/repos/${SITE_REPO}${path}`, {
+    method, body: body ? JSON.stringify(body) : undefined,
+    headers: { Authorization: `Bearer ${env.GITHUB_TOKEN}`, Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "octive-worker", ...(body ? { "Content-Type": "application/json" } : {}) },
+  });
+  const text = await r.text();
+  if (!r.ok) { const e = new Error(`GitHub ${method} ${path}: ${r.status} ${text.slice(0, 200)}`); e.status = r.status; throw e; }
+  return text ? JSON.parse(text) : null;
+}
+/** index.html as one page of the site: its title, line, card picture and address in its head (for link previews). */
+function pageHtml(tpl, p) {
+  const url = SITE + p.path, e = htmlEsc;
+  const meta = (attr, k, v) => (html) => html.replace(new RegExp(`<meta ${attr}="${k}" content="[^"]*">`), `<meta ${attr}="${k}" content="${e(v)}">`);
+  let html = tpl.replace(/<title>[^<]*<\/title>/, `<title>${e(p.title)}</title>`)
+    .replace(/<link rel="canonical" href="[^"]*">/, `<link rel="canonical" href="${e(url)}">`)
+    .replace(/\s*<script type="application\/ld\+json">[\s\S]*?<\/script>/, "")
+    .replace(/\s*<meta property="og:image:(width|height|alt)" content="[^"]*">/g, "");
+  for (const fn of [meta("name", "description", p.desc), meta("property", "og:type", p.type || "website"), meta("property", "og:title", p.title), meta("property", "og:description", p.desc),
+    meta("property", "og:url", url), meta("property", "og:image", p.image), meta("name", "twitter:card", "summary_large_image"), meta("name", "twitter:title", p.title),
+    meta("name", "twitter:description", p.desc), meta("name", "twitter:image", p.image)]) html = fn(html);
+  return html.replace(/(<meta property="og:image" content="[^"]*">)/, `$1\n  <meta property="og:image:width" content="1200">\n  <meta property="og:image:height" content="600">\n  <meta property="og:image:alt" content="${e(p.alt || p.title)}">`);
+}
+const cleanLine = (s, n) => String(s || "").replace(/[\u0000-\u001F\u007F]/g, " ").replace(/\s+/g, " ").trim().slice(0, n);
+async function syncProfilePages(env, { force = false, dry = false } = {}) {
+  if (!env.GITHUB_TOKEN) return { skipped: "No GITHUB_TOKEN secret yet." };
+  const ref = await siteGit(env, "GET", `/git/ref/heads/${SITE_BRANCH}`);
+  const head = ref.object.sha;
+  const commit = await siteGit(env, "GET", `/git/commits/${head}`);
+  const file = await siteGit(env, "GET", `/contents/index.html?ref=${head}`);
+  const tpl = new TextDecoder().decode(b64Bytes(String(file.content || "").replace(/\s/g, "")));
+  if (!tpl.includes("<base href=")) return { skipped: "The site's index.html has no <base> yet." };
+  const tplSig = (await sha256Hex(tpl)).slice(0, 12);
+  const want = new Map(); // file -> { path, title, desc, image, alt, type }
+  // the site's pages
+  for (const [f, path, title, desc, card] of SITE_PAGES) want.set(f, { path, title, desc, image: `${WORKER_BASE}/card/page/${card}.png?v=${pageCardLook(card)}` });
+  // every ranked player and the official account (by id), and every supporter link
+  const board = await leaderboard(env);
+  const names = new Map((board.players || []).map((p) => [p.id, p.name || "Player"]));
+  names.set(OFFICIAL_ID, "OCTIVE");
+  try { const o = await officialProfile(env); if (o && o.name) names.set(OFFICIAL_ID, o.name); } catch { /* the default name */ }
+  const profile = (key, id, name) => ({ path: `u/${encodeURIComponent(key)}`, type: "profile", title: `${name} · OCTIVE Player Stats`,
+    desc: `${name}'s OCTIVE profile: global rank, PR, accuracy, top plays and achievements.`, image: `${WORKER_BASE}/card/${encodeURIComponent(id)}.png`, alt: `${name}'s OCTIVE stats` });
+  for (const [id, name] of names) want.set(`u/${id}.html`, profile(id, id, name));
+  linksCache = null;
+  for (const v of Object.values(await profileLinks(env))) {
+    if (!v || !v.id || !v.link) continue;
+    const name = names.get(v.id) || (await profileOf(env, v.id).catch(() => null))?.name;
+    if (!name) continue;
+    want.set(`u/${v.link}.html`, profile(v.link, v.id, name));
+    if (v.link.toLowerCase() !== v.link) want.set(`u/${v.link.toLowerCase()}.html`, profile(v.link, v.id, name));
+  }
+  // every Workshop item
+  for (const it of (await r2json(env, WS_DB, { items: [] })).items || []) {
+    if (!it || it.removed || !/^[a-z0-9]{16,40}$/.test(String(it.id))) continue;
+    const label = WS_LABEL[it.type] || "Item", c = wsCardStats(it);
+    const about = cleanLine(it.description, 220);
+    want.set(`workshop/${it.id}.html`, {
+      path: `workshop/${it.id}`, title: `${cleanLine(it.title, 90) || "Untitled"} · OCTIVE Workshop`, image: `${WORKER_BASE}/card/ws/${it.id}.png?v=${CARD_VERSION}`,
+      desc: about || `A ${label.toLowerCase()} by ${cleanLine(it.creator, 40) || "a player"} on the OCTIVE Workshop${c.keys.length ? ` · ${c.keys.map((k) => k + "K").join(", ")}` : ""}. Free to download.`,
+    });
+  }
+  // every crew
+  for (const [id, x] of Object.entries((await r2json(env, CREW_INDEX, { crews: {} })).crews || {})) {
+    if (!/^[a-z0-9]{10,24}$/.test(id)) continue;
+    want.set(`crew/${id}.html`, {
+      path: `crew/${id}`, title: `${cleanLine(x.name, 40)} [${x.tag}] · OCTIVE crew`, image: `${WORKER_BASE}/card/crew/${id}.png?v=${CARD_VERSION}`,
+      desc: `${cleanLine(x.name, 40)} [${x.tag}] is a crew on OCTIVE, the free rhythm game: its members, score and place on the crew board.`,
+    });
+  }
+  // every update
+  const history = await r2json(env, "history.json", []);
+  for (const e of Array.isArray(history) ? history : []) {
+    if (!e || !/^[0-9][0-9.]{0,15}$/.test(String(e.version))) continue;
+    want.set(`updates/${e.version}.html`, {
+      path: `updates/${e.version}`, title: `OCTIVE ${e.version} · Update`, image: `${WORKER_BASE}/card/update/${e.version}.png?v=${CARD_VERSION}`,
+      desc: cleanLine(e.notes, 220) || `What's new in OCTIVE ${e.version}.`,
+    });
+  }
+  const kept = await r2json(env, PAGES_KEY, { tpl: "", files: {} });
+  const files = {}, changes = [];
+  for (const [f, p] of want) {
+    const sig = `${tplSig}|${p.path}|${p.title}|${p.desc}|${p.image}`;
+    files[f] = sig;
+    if (force || kept.files[f] !== sig) changes.push({ path: f, mode: "100644", type: "blob", content: pageHtml(tpl, p) });
+  }
+  const removed = Object.keys(kept.files || {}).filter((f) => !want.has(f));
+  for (const path of removed) changes.push({ path, mode: "100644", type: "blob", sha: null });
+  const out = { pages: want.size, written: changes.length - removed.length, removed: removed.length, commit: null };
+  if (dry || !changes.length) return out;
+  // in parts (GitHub takes a big tree slowly), each tree built on the one before, then one commit
+  let tree = commit.tree.sha;
+  for (let i = 0; i < changes.length; i += 50) tree = (await siteGit(env, "POST", "/git/trees", { base_tree: tree, tree: changes.slice(i, i + 50) })).sha;
+  const made = await siteGit(env, "POST", "/git/commits", { message: `Site pages: ${out.written} written, ${out.removed} removed`, tree, parents: [head] });
+  await siteGit(env, "PATCH", `/git/refs/heads/${SITE_BRANCH}`, { sha: made.sha });
+  await r2put(env, PAGES_KEY, { tpl: tplSig, files, at: new Date().toISOString() });
+  out.commit = made.sha;
+  return out;
 }
 
 async function linkedPlayer(env, discordId) {
@@ -2745,7 +3291,7 @@ async function linkedPlayer(env, discordId) {
 const opt = (data, name) => (data.options || []).find((o) => o.name === name)?.value;
 const notLinked = (who, self) => ({
   content: self
-    ? `Your Discord isn't linked to an OCTIVE account yet. Sign in at ${SITE}#/account?tab=preferences, press **Link Discord**, then use \`/link\` with the code.`
+    ? `Your Discord isn't linked to an OCTIVE account yet. Sign in at ${SITE}account?tab=preferences, press **Link Discord**, then use \`/link\` with the code.`
     : `<@${who}> hasn't linked an OCTIVE account.`,
   flags: EPHEMERAL, allowed_mentions: { parse: [] },
 });
@@ -2785,50 +3331,343 @@ async function withSupport(env, p) {
   return { p: { ...p, gifted: p.gifted ?? gi.gifted, supporterNo: p.supporterNo ?? gi.supporterNo }, st };
 }
 
+// ---------------------------------------------------------------- (2.2.2) the bot's command cards
+// Every command answers with a picture (botcards/, drawn like the link-preview cards) instead of text fields. The
+// reply's embed shows GET /card/bot/<kind>/<arg>.png?v=<what's on it>: Discord fetches that picture itself (its own
+// request, so drawing it isn't part of answering the command) and it's kept in R2 (cards/bot/…) until what's on it
+// changes. BOT_CARD_DATA[kind](env, arg, q) → { data (what's on it, never picture bytes), card: async () => svg } or null.
+const BOT_CARD_LOOK = "b1"; // bump when a bot card's look changes (botcards/)
+const MS_STORE_URL = "https://apps.microsoft.com/detail/9NWSQ5L9XWB7";
+const BOT_ARG = /^[A-Za-z0-9_~.-]{1,140}$/;
+const supState = (st) => (st?.lifetime ? "lifetime" : st?.active && st?.booster ? "booster" : st?.active ? "active" : st?.days > 0 ? "former" : "none");
+/** "Online · Desktop", "On the website", "Last online 3 hours ago", "Offline". */
+function botStatus(p) {
+  if (!p.online) return p.lastSeen ? `Last online ${agoText(p.lastSeen)}` : "Offline";
+  const s = String(p.status || "").replace(/-dev$/, "");
+  const t = s === "site" ? "On the website" : STATUS_TEXT[s] ? STATUS_TEXT[s].replace(/^Online /, "Online · ") : "Online";
+  return t + (/-dev$/.test(p.status || "") && p.id === OWNER ? " · DEV build" : ""); // (only Senterra shows DEV)
+}
+const roundPP = (n) => Math.round(Number(n) || 0);
+const num2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+/**
+ * Which picture a Workshop item's tile on a card can show: its small copy (workshop/thumbs/, made by wsThumbTick) when
+ * that matches the current picture, else the picture itself when it's small (every picture on a card is decoded while
+ * drawing it, and a song's full-size background is far too slow), else none. Returns { key, tag } or null.
+ */
+const WS_THUMB_MAX = 250_000;
+async function cardPicOf(env, id) {
+  try {
+    const [h, t] = await Promise.all([env.RELEASES.head(`workshop/previews/${id}`), env.RELEASES.head(`workshop/thumbs/${id}.png`)]);
+    if (!h) return null;
+    if (t && t.customMetadata?.of === String(h.etag || h.size)) return { key: `workshop/thumbs/${id}.png`, tag: "t" + t.customMetadata.of };
+    return h.size <= WS_THUMB_MAX ? { key: `workshop/previews/${id}`, tag: String(h.etag || h.size) } : null;
+  } catch { return null; }
+}
+async function cardPicBytes(env, pic) {
+  if (!pic) return null;
+  try { const o = await env.RELEASES.get(pic.key); return o ? new Uint8Array(await o.arrayBuffer()) : null; } catch { return null; }
+}
+/**
+ * (cron :45) Small copies (400×225 PNG) of the newest Workshop pictures that are too big for a card, a couple an hour.
+ * Its own cron: decoding a big picture takes a lot of CPU, and a run that goes over takes everything else in it down.
+ * A picture that fails 3 times is left alone (workshop/thumbs/<id>.try counts the tries).
+ */
+async function wsThumbTick(env, n = 2) {
+  const db = await r2json(env, WS_DB, { items: [] });
+  const items = (db.items || []).filter((it) => it && !it.removed).sort((a, b) => b.at - a.at).slice(0, 60);
+  let made = 0;
+  for (const it of items) {
+    if (made >= n) break;
+    const [h, t] = await Promise.all([env.RELEASES.head(`workshop/previews/${it.id}`), env.RELEASES.head(`workshop/thumbs/${it.id}.png`)]);
+    if (!h || h.size <= WS_THUMB_MAX || h.size > 8_000_000) continue;
+    const of = String(h.etag || h.size);
+    if (t && t.customMetadata?.of === of) continue;
+    const tryKey = `workshop/thumbs/${it.id}.try`, tries = await r2json(env, tryKey, { of: "", n: 0 });
+    if (tries.of === of && tries.n >= 3) continue;
+    await r2put(env, tryKey, { of, n: (tries.of === of ? tries.n : 0) + 1 });
+    const bytes = await previewBytes(env, it.id) || new Uint8Array(await (await env.RELEASES.get(`workshop/previews/${it.id}`)).arrayBuffer());
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="225" viewBox="0 0 400 225"><image width="400" height="225" preserveAspectRatio="xMidYMid slice" href="${dataUri(bytes)}"/></svg>`;
+    const png = await cardPng(svg, 400);
+    await env.RELEASES.put(`workshop/thumbs/${it.id}.png`, png, { httpMetadata: { contentType: "image/png" }, customMetadata: { of } });
+    await env.RELEASES.delete(tryKey);
+    made++;
+  }
+  return made;
+}
+const COMPARE_ROWS = [
+  ["Rank", (p) => p.rank || 1e9, (p) => (p.rank ? "#" + fmtN(p.rank) : "—"), true],
+  ["Performance", (p) => roundPP(p.pp), (p) => fmtN(p.pp) + " PR"],
+  ["Accuracy", (p) => num2(p.accuracy), (p) => fmtN(p.accuracy, 2) + "%"],
+  ["Level", (p) => (p.level || 1) + (p.levelProgress || 0), (p) => "Lv" + (p.level || 1)],
+  ["Plays", (p) => p.playCount || 0, (p) => fmtN(p.playCount || 0)],
+  ["Full combos", (p) => p.fullCombos || 0, (p) => fmtN(p.fullCombos || 0)],
+  ["Max combo", (p) => p.maxCombo || 0, (p) => fmtN(p.maxCombo || 0) + "x"],
+  ["Play time", (p) => p.playTimeMs || 0, (p) => playTimeText(p.playTimeMs)],
+  ["Total score", (p) => p.totalScore || 0, (p) => fmtN(p.totalScore || 0)],
+];
+const ONLINE_GROUPS = [["desktop", "Desktop", (s) => /^desktop/.test(s)], ["mobile", "Mobile", (s) => /^mobile/.test(s)], ["web", "Browser", (s) => /^web/.test(s)], ["site", "On the website", (s) => s === "site"]];
+const HELP = [
+  ["/profile", "A player's profile: rank, PR, accuracy, level and more"],
+  ["/compare", "Two players head to head"],
+  ["/leaderboard", "The performance ranking, with page buttons"],
+  ["/online", "Who's playing OCTIVE right now"],
+  ["/achievements", "A player's achievements, by group"],
+  ["/supporter", "Supporter status, Supporter number and gifter badge"],
+  ["/stats", "OCTIVE in numbers"],
+  ["/workshop", "The newest charts, skins, themes and styles"],
+  ["/download", "Get OCTIVE for Windows, Android or the browser"],
+  ["/link · /unlink", "Connect your Discord to your OCTIVE account"],
+  ["/update", "Re-check your supporter status, boost and role"],
+  ["/help", "Everything the OCTIVE bot can do"],
+];
+
+const BOT_CARD_DATA = {
+  async profile(env, id) {
+    if (!okPlayerId(id)) return null;
+    const raw = await profileOf(env, id);
+    if (!raw) return null;
+    const { p, st } = await withSupport(env, raw);
+    let web = {};
+    try { web = await webVisitors(env); } catch { /* the game's status only */ }
+    let players = [];
+    try { players = (await leaderboard(env)).players || []; } catch { /* no country rank */ }
+    const defs = await achievementDefs().catch(() => []);
+    const got = p.achievements || {}, official = isOfficial(id), state = supState(st), g = gifterTier(p.gifted || 0);
+    const badges = (p.badges || []).filter((b) => CARD_BADGES[b]).map((b) => [b, CARD_BADGES[b]]);
+    if (st?.active) badges.push(["SUPPORTER", "#ff6fae"]);
+    const pw = withWeb(p, web);
+    const data = {
+      id, name: p.name || "Player", official, rank: official ? 0 : p.rank || 0,
+      countryRank: p.country && !official ? players.filter((x) => x.country === p.country && !isOfficial(x.id)).sort((a, b) => a.rank - b.rank).findIndex((x) => x.id === id) + 1 : 0,
+      place: regionOf(p.country), level: p.level || 1, levelProgress: p.levelProgress || 0, pp: roundPP(p.pp), accuracy: num2(p.accuracy),
+      playCount: p.playCount || 0, fullCombos: p.fullCombos || 0, maxCombo: p.maxCombo || 0, playTimeMs: p.playTimeMs || 0, totalScore: p.totalScore || 0,
+      achievements: { have: official ? defs.length : defs.length ? defs.filter((d) => got[d.id]).length : Object.keys(got).length, total: defs.length || Object.keys(got).length },
+      badges, supporter: state === "none" ? null : { state, months: st?.months || 0 }, supporterNo: p.supporterNo ?? null,
+      gifter: g ? { tier: g[1], months: p.gifted } : null, online: !!pw.online, status: official ? "Online" : botStatus(pw),
+      bio: stripBio(p.bio).replace(/\s+/g, " ").slice(0, 280), avatarHash: p.avatarHash || "",
+    };
+    return { data, card: async () => BOT_CARDS_SVG.profile({ ...data, avatar: await avatarBytes(env, id, p.avatarHash) }) };
+  },
+  async compare(env, arg) {
+    const [ia, ib] = arg.split("~");
+    if (!okPlayerId(ia) || !okPlayerId(ib) || ia === ib) return null;
+    const [pa, pb] = await Promise.all([profileOf(env, ia), profileOf(env, ib)]);
+    if (!pa || !pb) return null;
+    let sup = {};
+    try { sup = await supporters(env); } catch { /* no rings */ }
+    const rows = COMPARE_ROWS.map(([label, val, show, low]) => {
+      const av = val(pa), bv = val(pb);
+      return { label, a: show(pa), b: show(pb), win: av === bv ? null : (low ? av < bv : av > bv) ? "a" : "b", av, bv, low: !!low };
+    });
+    const side = (p) => ({ name: p.name || "Player", rank: p.rank || 0, level: p.level || 1, supporter: !!sup[p.id]?.active, avatarHash: p.avatarHash || "" });
+    const data = { a: side(pa), b: side(pb), rows, score: { a: rows.filter((r) => r.win === "a").length, b: rows.filter((r) => r.win === "b").length } };
+    return {
+      data, card: async () => {
+        const [x, y] = await Promise.all([avatarBytes(env, ia, pa.avatarHash), avatarBytes(env, ib, pb.avatarHash)]);
+        return BOT_CARDS_SVG.compare({ ...data, a: { ...data.a, avatar: x }, b: { ...data.b, avatar: y } });
+      },
+    };
+  },
+  /** arg: "<page>~<the caller's player id, or x>" */
+  async leaderboard(env, arg) {
+    const [pg, me] = arg.split("~");
+    const board = await leaderboard(env);
+    const pages = Math.max(1, Math.min(LB_PAGES, Math.ceil(board.players.length / 10)));
+    const page = Math.max(1, Math.min(pages, Number(pg) || 1));
+    const mine = okPlayerId(me) ? me : null;
+    const list = board.players.slice((page - 1) * 10, page * 10);
+    const meRow = mine && !list.some((p) => p.id === mine) ? board.players.find((p) => p.id === mine) : null;
+    const data = {
+      page, pages, total: board.total, online: board.online,
+      rows: list.map((p) => ({ rank: p.rank, name: p.name || "Player", pp: roundPP(p.pp), accuracy: num2(p.accuracy), level: p.level || 1, online: !!p.online, me: p.id === mine, country: p.country || "", avatarHash: p.avatarHash || "" })),
+      you: meRow ? { rank: meRow.rank, pp: roundPP(meRow.pp), accuracy: num2(meRow.accuracy) } : null,
+    };
+    return {
+      data, card: async () => {
+        const av = await Promise.all(list.map((p) => avatarBytes(env, p.id, p.avatarHash)));
+        return BOT_CARDS_SVG.leaderboard({ ...data, rows: data.rows.map((r, i) => ({ ...r, avatar: av[i] })) });
+      },
+    };
+  },
+  async online(env) {
+    const board = await leaderboard(env);
+    let web = {};
+    try { web = await webVisitors(env); } catch { /* none */ }
+    // Senterra always comes first in whichever place she's in (the rest stay in ranking order)
+    const all = board.players.map((p) => withWeb(p, web)).filter((p) => p.online).sort((a, b) => (b.id === OWNER) - (a.id === OWNER));
+    // the DEV tag is Senterra's alone (people on a test build get none: it read as the developer badge)
+    const who = (p) => ({ id: p.id, name: p.name || "Player", rank: p.rank || 0, dev: p.id === OWNER, avatarHash: p.avatarHash || "" });
+    const groups = [], used = new Set();
+    for (const [key, label, test] of ONLINE_GROUPS) {
+      const list = all.filter((p) => test(p.status || ""));
+      list.forEach((p) => used.add(p.id));
+      if (list.length) groups.push({ key, label, players: list.map(who) });
+    }
+    const rest = all.filter((p) => !used.has(p.id));
+    if (rest.length) groups.push({ key: "game", label: "In game", players: rest.map(who) });
+    const data = { total: all.length, groups };
+    return {
+      data, card: async () => {
+        // pictures only for who can be drawn: the first 10 of each place (with hundreds online, the card shows about 18
+        // names and "+N more" per place), at most 50
+        const flat = groups.flatMap((g) => g.players.slice(0, 10)).slice(0, 50);
+        const av = new Map(await Promise.all(flat.map(async (p) => [p.id, await avatarBytes(env, p.id, p.avatarHash)])));
+        return BOT_CARDS_SVG.online({ ...data, groups: groups.map((g) => ({ ...g, players: g.players.map((p) => ({ ...p, avatar: av.get(p.id) || null })) })) });
+      },
+    };
+  },
+  async achievements(env, id) {
+    if (!okPlayerId(id)) return null;
+    const p = isOfficial(id) ? await officialProfile(env) : await profileOf(env, id);
+    if (!p) return null;
+    const defs = await achievementDefs();
+    const got = p.achievements || {};
+    const groups = [...new Set(defs.map((d) => d.group))].map((g) => {
+      const list = defs.filter((d) => d.group === g);
+      return { name: g, have: list.filter((d) => got[d.id]).length, total: list.length };
+    });
+    const latest = Object.entries(got).sort((a, b) => Date.parse(b[1]) - Date.parse(a[1]))
+      .map(([aid, at]) => { const d = defs.find((x) => x.id === aid); return d ? { title: d.title, desc: d.desc, ago: agoText(at) } : null; }).filter(Boolean).slice(0, 5);
+    const data = { name: p.name || "Player", have: defs.filter((d) => got[d.id]).length, total: defs.length, groups, latest, avatarHash: p.avatarHash || "" };
+    return { data, card: async () => BOT_CARDS_SVG.achievements({ ...data, avatar: await avatarBytes(env, id, p.avatarHash) }) };
+  },
+  async supporter(env, id) {
+    if (!okPlayerId(id)) return null;
+    const raw = await profileOf(env, id);
+    if (!raw) return null;
+    const { p, st } = await withSupport(env, raw);
+    const state = supState(st), g = gifterTier(p.gifted || 0);
+    const data = {
+      name: p.name || "Player", state, months: st?.months || 0, days: st?.days || 0, since: st?.since ? cardDate(st.since) : "",
+      until: state === "active" || state === "booster" ? (st?.until ? cardDate(st.until) : "") : "", supporterNo: p.supporterNo ?? null,
+      gifted: p.gifted || 0, gifterTier: g ? g[1] : null, note: "", avatarHash: p.avatarHash || "", bannerV: st?.active && st.banner ? String(st.banner) : "",
+    };
+    return {
+      data, card: async () => {
+        let banner = null;
+        if (data.bannerV) try { const o = await env.RELEASES.get(`looks/banner/${id}.jpg`); if (o && o.size <= 1_500_000) banner = new Uint8Array(await o.arrayBuffer()); } catch { /* none */ }
+        return BOT_CARDS_SVG.supporter({ ...data, avatar: await avatarBytes(env, id, p.avatarHash), banner });
+      },
+    };
+  },
+  async stats(env) {
+    const board = await leaderboard(env);
+    let sup = {}, m = null;
+    try { sup = await supporters(env); } catch { /* none */ }
+    try { const o = await env.RELEASES.get("latest.json"); m = o ? await o.json() : null; } catch { /* none */ }
+    const ws = ((await r2json(env, WS_DB, { items: [] })).items || []).filter((it) => it && !it.removed);
+    const ps = board.players, sum = (fn) => ps.reduce((n, p) => n + (fn(p) || 0), 0);
+    const top = ps[0] || null;
+    const data = {
+      ranked: board.total || ps.length, online: board.online || 0, supporters: Object.values(sup).filter((s) => s.active).length,
+      songsPlayed: sum((p) => p.playCount), timePlayedMs: sum((p) => p.playTimeMs), fullCombos: sum((p) => p.fullCombos),
+      monthsGifted: Object.values(giftedIndex).reduce((n, x) => n + x, 0),
+      top: top ? { name: top.name || "Player", pp: roundPP(top.pp), avatarHash: top.avatarHash || "" } : null,
+      version: m?.version || "", released: m?.published ? cardDate(m.published) : "",
+      workshop: { total: ws.length, ...Object.fromEntries(WS_KINDS.map((k) => [k, ws.filter((it) => it.type === k).length])) },
+    };
+    return { data, card: async () => BOT_CARDS_SVG.stats({ ...data, top: top ? { ...data.top, avatar: await avatarBytes(env, top.id, top.avatarHash) } : null }) };
+  },
+  /** arg: the kind ("all", "charts"…); q: the search */
+  async workshop(env, arg, q) {
+    const type = WS_KINDS.includes(arg) ? arg : null;
+    const shownQ = String(q || "").trim().slice(0, 60), lq = shownQ.toLowerCase();
+    const db = await r2json(env, WS_DB, { items: [] });
+    let items = (db.items || []).filter((it) => it && !it.removed && (!type || it.type === type));
+    if (lq) items = items.filter((it) => `${it.title} ${it.creator} ${it.description}`.toLowerCase().includes(lq));
+    items.sort((a, b) => b.at - a.at);
+    const shown = items.slice(0, 6);
+    // which picture each tile gets is part of what's on the card (a new small copy draws the card again)
+    const pics = await Promise.all(shown.map((it) => cardPicOf(env, it.id)));
+    const data = {
+      kind: type || "all", label: type ? WS_LABEL[type] + "s" : "Workshop", color: type ? WS_HEX[type] : "#8b7bff", query: shownQ, total: items.length,
+      items: shown.map((it, i) => {
+        const c = wsCardStats(it);
+        return {
+          id: it.id, v: it.version || 1, title: it.title || "Untitled", type: it.type, creator: it.creator || "", sizeMB: Math.round((it.size || 0) / 104857.6) / 10,
+          downloads: it.downloads || 0, likes: it.likes || 0, ago: agoText(new Date(Number(it.at) || Date.parse(it.at) || Date.now()).toISOString()),
+          keys: it.type === "charts" ? c.keys : [], stars: it.type === "charts" ? num2(c.stars) : 0, verified: !!it.verified, official: !!it.builtin,
+          picTag: pics[i] ? pics[i].tag : "",
+        };
+      }),
+    };
+    return {
+      data, items: shown, card: async () => {
+        const bytes = await Promise.all(pics.map((p) => cardPicBytes(env, p)));
+        return BOT_CARDS_SVG.workshop({ ...data, items: data.items.map((x, i) => ({ ...x, pic: bytes[i] })) });
+      },
+    };
+  },
+  async download(env) {
+    let m = null;
+    try { const o = await env.RELEASES.get("latest.json"); m = o ? await o.json() : null; } catch { /* none */ }
+    if (!m) return null;
+    const data = {
+      version: m.version || "", released: m.published ? cardDate(m.published) : "", notes: cleanLine(m.notes, 200),
+      windowsMB: m.windows?.size ? Math.round(m.windows.size / 1048576) : 0, androidMB: m.android?.size ? Math.round(m.android.size / 1048576) : 0,
+      web: !!m.web, store: true,
+    };
+    return { data, m, card: async () => BOT_CARDS_SVG.download(data) };
+  },
+  async help() {
+    const data = { commands: HELP.map(([name, desc]) => ({ name, desc })) };
+    return { data, card: async () => BOT_CARDS_SVG.help(data) };
+  },
+  async linked(env, id) {
+    if (!okPlayerId(id)) return null;
+    const p = await profileOf(env, id);
+    if (!p) return null;
+    const data = { name: p.name || "Player", rank: p.rank || 0, pp: roundPP(p.pp), level: p.level || 1, avatarHash: p.avatarHash || "" };
+    return { data, card: async () => BOT_CARDS_SVG.linked({ ...data, avatar: await avatarBytes(env, id, p.avatarHash) }) };
+  },
+  async unlinked() {
+    return { data: {}, card: async () => BOT_CARDS_SVG.unlinked({}) };
+  },
+};
+
+/** GET /card/bot/<kind>/<arg>.png[?q=<search>]: a command's picture. */
+async function botCardRoute(env, kind, arg, url, ctx) {
+  if (!Object.prototype.hasOwnProperty.call(BOT_CARD_DATA, kind) || !BOT_CARDS_SVG[kind] || !BOT_ARG.test(arg)) return cors(new Response("Not found", { status: 404 }));
+  const q = String(url.searchParams.get("q") || "").slice(0, 60);
+  const c = await BOT_CARD_DATA[kind](env, arg, q);
+  if (!c) return cors(new Response("Not found", { status: 404 }));
+  const key = `cards/bot/${kind}/${arg}${q ? "-" + (await sha256Hex(q.trim().toLowerCase())).slice(0, 10) : ""}.png`;
+  return await cachedCard(env, key, c.data, c.card, ctx, BOT_CARD_LOOK, { fresh: true });
+}
+/**
+ * A command's card for its reply: { image (the picture's address; its v= changes with what's on it, so Discord fetches
+ * a changed card again), data, …what the builder returned } or null when there's nothing to show.
+ */
+async function botCard(env, kind, arg = "x", q = "") {
+  const c = await BOT_CARD_DATA[kind](env, arg, q);
+  if (!c) return null;
+  const v = BOT_CARD_LOOK + "-" + (await sha256Hex(JSON.stringify(c.data))).slice(0, 12);
+  return { ...c, image: `${WORKER_BASE}/card/bot/${kind}/${encodeURIComponent(arg)}.png?${q ? `q=${encodeURIComponent(q)}&` : ""}v=${v}` };
+}
+/** A reply's embed around a card: a linked title, a line of text (also what shows if the picture can't load) and the picture. */
+const cardEmbed = (title, url, color, image, description) => ({ title, ...(url ? { url } : {}), color, ...(description ? { description } : {}), image: { url: image } });
+
 // ---------------------------------------------------------------- leaderboard pages (with buttons)
 const LB_PAGES = 10;
 async function leaderboardMessage(env, page, callerId) {
   const board = await leaderboard(env);
   const pages = Math.max(1, Math.min(LB_PAGES, Math.ceil(board.players.length / 10)));
   page = Math.max(1, Math.min(pages, page));
-  const rows = board.players.slice((page - 1) * 10, page * 10);
   const mine = callerId ? await linkedPlayer(env, callerId) : null;
-  const medal = (r) => (r === 1 ? "🥇" : r === 2 ? "🥈" : r === 3 ? "🥉" : `\`#${String(r).padStart(2, " ")}\``);
-  const lines = rows.map((p) => {
-    const me = p.id === mine;
-    const name = me ? `__**${clean(p.name)}**__` : `**${clean(p.name)}**`;
-    return `${medal(p.rank)} ${name}${p.online ? " 🟢" : ""}\n　 ${fmtN(p.pp)} PR · ${fmtN(p.accuracy, 2)}% · Lv${p.level}`;
-  });
-  const meRow = mine && !rows.some((p) => p.id === mine) ? board.players.find((p) => p.id === mine) : null;
-  if (meRow) lines.push(`\n**You:** #${fmtN(meRow.rank)} · ${fmtN(meRow.pp)} PR · ${fmtN(meRow.accuracy, 2)}%`);
+  const c = await botCard(env, "leaderboard", `${page}~${mine || "x"}`);
   return {
-    embeds: [{
-      title: "🏆 OCTIVE Performance Ranking", url: `${SITE}#/rankings`, color: C_ACCENT,
-      description: lines.join("\n") || "No ranked players yet.",
-      footer: { text: `Page ${page} of ${pages} · ${fmtN(board.total)} ranked · ${fmtN(board.online)} online` },
-    }],
+    embeds: [cardEmbed("🏆 OCTIVE Performance Ranking", `${SITE}rankings`, C_ACCENT, c.image, `Page ${page} of ${pages} · ${fmtN(board.total)} ranked · ${fmtN(board.online)} online`)],
+    // every button's id must be different (on page 2, First and Previous both go to page 1: Discord refused the whole
+    // edit with COMPONENT_CUSTOM_ID_DUPLICATED, so the page never changed)
     components: [row(
-      { type: 2, style: 2, label: "First", custom_id: "lb:1", disabled: page <= 1, emoji: { name: "⏮️" } },
-      { type: 2, style: 1, label: "Previous", custom_id: `lb:${page - 1}`, disabled: page <= 1 },
-      { type: 2, style: 1, label: "Next", custom_id: `lb:${page + 1}`, disabled: page >= pages },
-      linkButton("Full ranking", `${SITE}#/rankings`),
+      { type: 2, style: 2, label: "First", custom_id: "lb:1:first", disabled: page <= 1, emoji: { name: "⏮️" } },
+      { type: 2, style: 1, label: "Previous", custom_id: `lb:${Math.max(1, page - 1)}:prev`, disabled: page <= 1 },
+      { type: 2, style: 1, label: "Next", custom_id: `lb:${Math.min(pages, page + 1)}:next`, disabled: page >= pages },
+      linkButton("Full ranking", `${SITE}rankings`),
     )],
     allowed_mentions: { parse: [] },
   };
 }
-
-const HELP = [
-  ["/profile", "A player's profile: rank, PR, accuracy, level, supporter status (yours when you leave it empty)"],
-  ["/compare", "Two players side by side"],
-  ["/leaderboard", "The performance ranking, with page buttons"],
-  ["/online", "Who's playing OCTIVE right now"],
-  ["/achievements", "A player's achievements, by group"],
-  ["/supporter", "Supporter status, Supporter number and gifter badge"],
-  ["/stats", "OCTIVE in numbers"],
-  ["/download", "Get OCTIVE for Windows, Android or the browser"],
-  ["/link · /unlink", "Connect your Discord to your OCTIVE account"],
-  ["/update", "Re-check your supporter status, boost and role"],
-];
 
 async function discordCommand(env, it) {
   const data = it.data || {};
@@ -2837,15 +3676,16 @@ async function discordCommand(env, it) {
     case "profile": {
       const t = await target(env, data, user);
       if (t.error) return t.error;
-      const raw = await profileOf(env, t.id);
-      if (!raw) return { content: "That profile isn't available (no plays online yet).", flags: EPHEMERAL };
-      const { p, st } = await withSupport(env, raw);
-      const defs = await achievementDefs();
+      const c = await botCard(env, "profile", t.id);
+      if (!c) return { content: "That profile isn't available (no plays online yet).", flags: EPHEMERAL };
+      const d = c.data;
+      const color = d.badges.some(([b]) => b === "DEV") ? C_DEV : d.supporter && d.supporter.state !== "former" ? C_PINK : d.badges.some(([b]) => b === "CREATOR") ? C_CREATOR : C_ACCENT;
+      const line = d.official ? "The official OCTIVE account" : [d.rank ? `#${fmtN(d.rank)} global` : "Unranked", `${fmtN(d.pp)} PR`, `${fmtN(d.accuracy, 2)}%`, `Lv${d.level}`].join(" · ");
       return {
-        embeds: [profileEmbed(p, st, defs.length)],
+        embeds: [cardEmbed(clean(d.name), `${SITE}u/${encodeURIComponent(t.id)}`, color, c.image, line)],
         components: [row(
-          linkButton("View profile", `${SITE}#/u/${encodeURIComponent(p.id)}`, "👤"),
-          (it.member?.user?.id || it.user?.id) && !st?.lifetime ? linkButton("Gift supporter", `${SITE}#/supporter?gift=${encodeURIComponent(p.id)}`, "🎁") : null,
+          linkButton("View profile", `${SITE}u/${encodeURIComponent(t.id)}`, "👤"),
+          d.supporter?.state !== "lifetime" ? linkButton("Gift supporter", `${SITE}supporter?gift=${encodeURIComponent(t.id)}`, "🎁") : null,
         )],
         allowed_mentions: { parse: [] },
       };
@@ -2864,208 +3704,107 @@ async function discordCommand(env, it) {
         if (!bId) return notLinked(user.id, true);
       }
       if (a.id === bId) return { content: "Pick two different players.", flags: EPHEMERAL };
-      const [pa, pb] = await Promise.all([profileOf(env, a.id), profileOf(env, bId)]);
-      if (!pa || !pb) return { content: "One of those profiles isn't available yet.", flags: EPHEMERAL };
-      const stats = [
-        ["Rank", (p) => p.rank || 1e9, (p) => (p.rank ? "#" + fmtN(p.rank) : "—"), true],
-        ["Performance", (p) => p.pp, (p) => fmtN(p.pp) + " PR"],
-        ["Accuracy", (p) => p.accuracy, (p) => fmtN(p.accuracy, 2) + "%"],
-        ["Level", (p) => p.level + (p.levelProgress || 0), (p) => "Lv" + p.level],
-        ["Plays", (p) => p.playCount, (p) => fmtN(p.playCount)],
-        ["Full combos", (p) => p.fullCombos, (p) => fmtN(p.fullCombos)],
-        ["Max combo", (p) => p.maxCombo, (p) => fmtN(p.maxCombo) + "x"],
-        ["Play time", (p) => p.playTimeMs, (p) => playTimeText(p.playTimeMs)],
-        ["Total score", (p) => p.totalScore, (p) => fmtN(p.totalScore)],
-      ];
-      let wa = 0, wb = 0;
-      const left = [], right = [], names = [];
-      for (const [label, val, show, lowWins] of stats) {
-        const va = val(pa), vb = val(pb);
-        const aWins = lowWins ? va < vb : va > vb, bWins = lowWins ? vb < va : vb > va;
-        if (aWins) wa++; if (bWins) wb++;
-        names.push(label);
-        left.push((aWins ? "▲ " : "　") + show(pa));
-        right.push((bWins ? "▲ " : "　") + show(pb));
-      }
+      const c = await botCard(env, "compare", `${a.id}~${bId}`);
+      if (!c) return { content: "One of those profiles isn't available yet.", flags: EPHEMERAL };
+      const { a: pa, b: pb, score } = c.data;
       return {
-        embeds: [{
-          title: `⚔️ ${clean(pa.name)} vs ${clean(pb.name)}`, color: C_ACCENT, url: `${SITE}#/u/${encodeURIComponent(pa.id)}`,
-          description: wa === wb ? "Neck and neck!" : `**${clean(wa > wb ? pa.name : pb.name)}** leads ${Math.max(wa, wb)}–${Math.min(wa, wb)}.`,
-          fields: [
-            { name: "　", value: names.map((n) => `**${n}**`).join("\n"), inline: true },
-            { name: clean(pa.name), value: left.join("\n"), inline: true },
-            { name: clean(pb.name), value: right.join("\n"), inline: true },
-          ],
-          footer: FOOTER,
-        }],
+        embeds: [cardEmbed(`⚔️ ${clean(pa.name)} vs ${clean(pb.name)}`, `${SITE}u/${encodeURIComponent(a.id)}`, C_ACCENT, c.image,
+          score.a === score.b ? "Neck and neck!" : `**${clean(score.a > score.b ? pa.name : pb.name)}** leads ${Math.max(score.a, score.b)}–${Math.min(score.a, score.b)}.`)],
+        components: [row(linkButton(clean(pa.name).slice(0, 70), `${SITE}u/${encodeURIComponent(a.id)}`, "👤"), linkButton(clean(pb.name).slice(0, 70), `${SITE}u/${encodeURIComponent(bId)}`, "👤"))],
         allowed_mentions: { parse: [] },
       };
     }
     case "leaderboard":
       return leaderboardMessage(env, Number(opt(data, "page") || 1), user.id);
     case "online": {
-      const board = await leaderboard(env);
-      let web = {};
-      try { web = await webVisitors(env); } catch { /* none */ }
-      const all = board.players.map((p) => withWeb(p, web)).filter((p) => p.online);
-      const groups = [["🖥️ Desktop", (s) => /^desktop/.test(s)], ["📱 Mobile", (s) => /^mobile/.test(s)], ["🌐 Browser", (s) => /^web/.test(s)], ["👀 On the website", (s) => s === "site"]];
-      const fields = [];
-      for (const [label, test] of groups) {
-        const list = all.filter((p) => test(p.status || ""));
-        if (list.length) fields.push({ name: `${label} — ${list.length}`, value: list.slice(0, 20).map((p) => `**${clean(p.name)}** · #${p.rank}${/-dev$/.test(p.status || "") ? " · 🧪" : ""}`).join("\n").slice(0, 1024), inline: true });
-      }
-      const rest = all.filter((p) => !groups.some(([, t]) => t(p.status || "")));
-      if (rest.length) fields.push({ name: `🎮 In game — ${rest.length}`, value: rest.slice(0, 20).map((p) => `**${clean(p.name)}** · #${p.rank}`).join("\n").slice(0, 1024), inline: true });
+      const c = await botCard(env, "online");
+      const n = c.data.total;
       return {
-        embeds: [{
-          title: `🟢 ${all.length} player${all.length === 1 ? "" : "s"} online`, color: C_GREEN, url: `${SITE}#/rankings`,
-          description: all.length ? undefined : "Nobody on the ranking is online right now.",
-          fields, footer: { text: "🧪 = playing a DEV / test build" },
-        }],
+        embeds: [cardEmbed(`🟢 ${n} player${n === 1 ? "" : "s"} online`, `${SITE}rankings`, C_GREEN, c.image, n ? undefined : "Nobody on the ranking is online right now.")],
         allowed_mentions: { parse: [] },
       };
     }
     case "achievements": {
       const t = await target(env, data, user);
       if (t.error) return t.error;
-      const p = await profileOf(env, t.id);
-      if (!p) return { content: "That profile isn't available yet.", flags: EPHEMERAL };
-      const defs = await achievementDefs();
-      const got = p.achievements || {};
-      const groups = [...new Set(defs.map((d) => d.group))];
-      const icon = { Milestones: "⭐", Skill: "✅", Supporter: "💖", "OCTIVE Remixes": "🎵" };
-      const fields = groups.map((g) => {
-        const list = defs.filter((d) => d.group === g);
-        const n = list.filter((d) => got[d.id]).length;
-        return { name: `${icon[g] || "🏅"} ${g}`, value: `\`${bar(list.length ? n / list.length : 0, 10)}\` ${n}/${list.length}`, inline: true };
-      });
-      const recent = Object.entries(got).sort((a, b) => Date.parse(b[1]) - Date.parse(a[1])).slice(0, 5)
-        .map(([id, at]) => { const d = defs.find((x) => x.id === id); return d ? `**${d.title}** — ${d.desc} · <t:${unix(at)}:R>` : null; }).filter(Boolean);
-      const total = defs.length, have = defs.filter((d) => got[d.id]).length;
+      const c = await botCard(env, "achievements", t.id);
+      if (!c) return { content: "That profile isn't available yet.", flags: EPHEMERAL };
+      const { name, have, total } = c.data;
       return {
-        embeds: [{
-          title: `🏅 ${clean(p.name)}'s achievements`, url: `${SITE}#/u/${encodeURIComponent(p.id)}`, color: C_GOLD,
-          description: `**${have} of ${total}** unlocked (${total ? Math.round(have / total * 100) : 0}%)` + (recent.length ? `\n\n**Latest**\n${recent.join("\n")}` : ""),
-          fields, footer: FOOTER,
-        }],
+        embeds: [cardEmbed(`🏅 ${clean(name)}'s achievements`, `${SITE}u/${encodeURIComponent(t.id)}`, C_GOLD, c.image, `**${have} of ${total}** unlocked (${total ? Math.round(have / total * 100) : 0}%)`)],
         allowed_mentions: { parse: [] },
       };
     }
     case "supporter": {
       const t = await target(env, data, user);
       if (t.error) return t.error;
-      const raw = await profileOf(env, t.id);
-      if (!raw) return { content: "That profile isn't available yet.", flags: EPHEMERAL };
-      const { p, st } = await withSupport(env, raw);
-      const g = gifterTier(p.gifted || 0);
-      const fields = [];
-      if (st && (st.active || st.days > 0)) {
-        fields.push({ name: "Status", value: st.lifetime ? "Lifetime supporter" : st.booster ? "Supporter · Server Booster" : st.active ? "Supporter" : "Former supporter", inline: true });
-        fields.push({ name: "Supported for", value: `${fmtN(st.months)} month${st.months === 1 ? "" : "s"} (${fmtN(st.days)} days)`, inline: true });
-        if (st.since) fields.push({ name: "Since", value: `<t:${unix(st.since)}:D>`, inline: true });
-        if (!st.lifetime && st.active && st.until) fields.push({ name: "Until", value: `<t:${unix(st.until)}:D>`, inline: true });
-      }
-      if (p.supporterNo != null) fields.push({ name: "Supporter number", value: supNo(p.supporterNo), inline: true });
-      fields.push({ name: "Gifted to others", value: g ? `${g[2]} **${g[1]}** · ${fmtN(p.gifted)} month${p.gifted === 1 ? "" : "s"}` : "Nothing yet", inline: true });
-      const isSup = st?.active;
+      const c = await botCard(env, "supporter", t.id);
+      if (!c) return { content: "That profile isn't available yet.", flags: EPHEMERAL };
+      const { name, state } = c.data, isSup = state !== "none" && state !== "former";
       return {
-        embeds: [{
-          title: `💖 ${clean(p.name)}`, url: `${SITE}#/u/${encodeURIComponent(p.id)}`, color: isSup ? C_PINK : C_ACCENT,
-          description: isSup ? "Thank you for supporting OCTIVE!" : st?.days > 0 ? "A former OCTIVE supporter." : "Not an OCTIVE supporter (yet).",
-          fields, footer: { text: "Supporters get a badge, banner, name colours, profile effects and an animated picture" },
-          ...(st?.active && st.banner ? { image: { url: `${WORKER_BASE}/looks/banner/${encodeURIComponent(p.id)}?v=${encodeURIComponent(st.banner)}` } } : {}),
-        }],
+        embeds: [cardEmbed(`💖 ${clean(name)}`, `${SITE}u/${encodeURIComponent(t.id)}`, isSup ? C_PINK : C_ACCENT, c.image,
+          isSup ? "Thank you for supporting OCTIVE!" : state === "former" ? "A former OCTIVE supporter." : "Not an OCTIVE supporter (yet).")],
         components: [row(
-          linkButton("Become a supporter", `${SITE}#/supporter`, "💖"),
-          st?.lifetime ? null : linkButton(`Gift ${clean(p.name).slice(0, 30)}`, `${SITE}#/supporter?gift=${encodeURIComponent(p.id)}`, "🎁"),
+          linkButton("Become a supporter", `${SITE}supporter`, "💖"),
+          state === "lifetime" ? null : linkButton(`Gift ${clean(name).slice(0, 30)}`, `${SITE}supporter?gift=${encodeURIComponent(t.id)}`, "🎁"),
         )],
         allowed_mentions: { parse: [] },
       };
     }
     case "workshop": {
       // the newest shared items (all four channels, or one kind), with links to their posts and downloads
-      const type = opt(data, "type"), q = String(opt(data, "search") || "").trim().toLowerCase();
-      const db = await r2json(env, WS_DB, { items: [] });
-      let items = (db.items || []).filter((it) => !it.removed && (!type || it.type === type));
-      if (q) items = items.filter((it) => `${it.title} ${it.creator} ${it.description}`.toLowerCase().includes(q));
-      items.sort((a, b) => b.at - a.at);
-      const shown = items.slice(0, 8);
-      const label = type ? WS_LABEL[type] + "s" : "Workshop";
-      if (!shown.length) return { embeds: [{ color: C_ACCENT, title: `🧰 ${label}`, description: q ? `Nothing matches **${clean(q)}**.` : "Nothing shared yet. Share yours from OCTIVE: Play → Workshop → Share yours." }] };
-      const lines = shown.map((it) => {
-        const post = it.channelId && it.messageId ? `https://discord.com/channels/${it.guildId || env.DISCORD_GUILD_ID}/${it.channelId}/${it.messageId}` : null;
-        const mb = (it.size / 1048576).toFixed(it.size < 1048576 ? 2 : 1);
-        return `**${clean(it.title)}** · ${WS_LABEL[it.type]} by ${clean(it.creator)}
-　${post ? `[Post](${post}) · ` : ""}[Download](${WORKER_BASE}/api/download/${it.id}?redirect=1) · ${mb} MB · ${fmtN(it.downloads || 0)} ⬇ · <t:${unix(new Date(it.at).toISOString())}:R>`;
-      });
-      return {
-        embeds: [{ color: type ? WS_COLOR[type] : C_ACCENT, title: `🧰 ${label}`, url: `${SITE}#/workshop`, description: lines.join("\n\n"),
-          footer: { text: `${items.length} shared${q ? " matching" : ""} · get them in OCTIVE: Play → Workshop` } }],
-        components: [row(linkButton("Open the Workshop", `${SITE}#/workshop`, "🧰"))],
-      };
+      const type = WS_KINDS.includes(opt(data, "type")) ? opt(data, "type") : null, q = String(opt(data, "search") || "").trim().slice(0, 60);
+      const c = await botCard(env, "workshop", type || "all", q);
+      const { label, total, items } = c.data;
+      const color = type ? WS_COLOR[type] : C_ACCENT;
+      const desc = total ? `${fmtN(total)} ${q ? "matching" : "shared"} · get them in OCTIVE: Play → Workshop`
+        : q ? `Nothing matches **${clean(q)}**.` : "Nothing shared yet. Share yours from OCTIVE: Play → Workshop → Share yours.";
+      // a button per item on the card ("1. Title"…), three to a row, then the Workshop itself
+      const short = (t) => (t.length > 70 ? t.slice(0, 69).trimEnd() + "…" : t);
+      const buttons = items.map((x, i) => linkButton(short(`${i + 1}. ${String(x.title || "Untitled").replace(/[*_`~|>\\]/g, "")}`), `${SITE}workshop/${x.id}`));
+      const rows = [];
+      for (let i = 0; i < buttons.length; i += 3) rows.push(row(...buttons.slice(i, i + 3)));
+      rows.push(row(linkButton("Open the Workshop", `${SITE}workshop`, "🧰")));
+      return { embeds: [cardEmbed(`🧰 ${label}`, `${SITE}workshop`, color, c.image, desc)], components: rows, allowed_mentions: { parse: [] } };
     }
     case "stats": {
-      const board = await leaderboard(env);
-      let sup = {}, m = null;
-      try { sup = await supporters(env); } catch { /* none */ }
-      try { const o = await env.RELEASES.get("latest.json"); m = o ? await o.json() : null; } catch { /* none */ }
-      const ps = board.players;
-      const sum = (f) => ps.reduce((n, p) => n + (f(p) || 0), 0);
-      // (not named "supporters": that would hide the supporters() function above and the count would always be 0)
-      const supCount = Object.values(sup).filter((s) => s.active).length;
-      const gifted = Object.values(giftedIndex).reduce((n, x) => n + x, 0);
+      const c = await botCard(env, "stats");
+      const v = c.data.version;
       return {
-        embeds: [{
-          title: "📊 OCTIVE in numbers", url: SITE, color: C_ACCENT,
-          fields: [
-            { name: "Ranked players", value: fmtN(board.total), inline: true },
-            { name: "Online now", value: fmtN(board.online), inline: true },
-            { name: "Supporters", value: fmtN(supCount), inline: true },
-            { name: "Songs played", value: fmtN(sum((p) => p.playCount)), inline: true },
-            { name: "Time played", value: playTimeText(sum((p) => p.playTimeMs)), inline: true },
-            { name: "Full combos", value: fmtN(sum((p) => p.fullCombos)), inline: true },
-            { name: "Months gifted", value: fmtN(gifted), inline: true },
-            { name: "Top player", value: ps[0] ? `**${clean(ps[0].name)}** · ${fmtN(ps[0].pp)} PR` : "—", inline: true },
-            { name: "Latest version", value: m ? `v${m.version}` + (m.published ? ` · <t:${unix(m.published)}:R>` : "") : "—", inline: true },
-          ],
-          footer: FOOTER,
-        }],
+        embeds: [cardEmbed("📊 OCTIVE in numbers", SITE, C_ACCENT, c.image, `${fmtN(c.data.ranked)} ranked players · ${fmtN(c.data.online)} online${v ? ` · v${v}` : ""}`)],
+        components: [row(linkButton("Rankings", `${SITE}rankings`, "🏆"), linkButton("Workshop", `${SITE}workshop`, "🧰"))],
         allowed_mentions: { parse: [] },
       };
     }
-    case "help":
+    case "help": {
+      const c = await botCard(env, "help");
       return {
-        embeds: [{
-          title: "OCTIVE bot", url: SITE, color: C_ACCENT,
-          description: HELP.map(([c, d]) => `**${c}** — ${d}`).join("\n") + `\n\nMost commands take a player's name, or a Discord user who linked their account. Leave it empty for yourself once you've used \`/link\`.`,
-          footer: FOOTER,
-        }],
-        components: [row(linkButton("Website", SITE, "🌐"), linkButton("Download", `${SITE}#/download`, "⬇️"), linkButton("Link Discord", `${SITE}#/account?tab=preferences`, "🔗"))],
+        embeds: [cardEmbed("OCTIVE bot", SITE, C_ACCENT, c.image, "Most commands take a player's name, or a Discord user who linked their account. Leave it empty for yourself once you've used `/link`.")],
+        components: [row(linkButton("Website", SITE, "🌐"), linkButton("Download", `${SITE}downloads`, "⬇️"), linkButton("Link Discord", `${SITE}account?tab=preferences`, "🔗"))],
         flags: EPHEMERAL,
       };
+    }
     case "download": {
-      let m = null;
-      try { const o = await env.RELEASES.get("latest.json"); m = o ? await o.json() : null; } catch { /* none */ }
+      const c = await botCard(env, "download");
+      const m = c?.m;
+      const buttons = row(
+        linkButton("Windows", `${WORKER_BASE}/releases/OCTIVE-Installer.exe`, "🪟"),
+        linkButton("Microsoft Store", MS_STORE_URL, "🛍️"),
+        m?.android ? linkButton("Android", `${WORKER_BASE}/releases/${m.android.file}`, "🤖") : null,
+        m?.web ? linkButton("Play in browser", `${SITE}play/`, "🌐") : null,
+      );
+      if (!c) return { embeds: [{ title: "⬇️ Download OCTIVE", url: `${SITE}downloads`, color: C_ACCENT, description: "Free on Windows and Android, or play right in your browser." }], components: [buttons] };
       return {
-        embeds: [{
-          title: m ? `⬇️ Download OCTIVE ${m.version}` : "⬇️ Download OCTIVE", url: `${SITE}#/download`, color: C_ACCENT,
-          description: "Free on Windows and Android, or play right in your browser. The game updates itself."
-            + (m?.notes ? `\n\n**What's new in ${m.version}**\n${String(m.notes).slice(0, 1500)}` : ""),
-          footer: m?.published ? { text: `Released ${new Date(m.published).toLocaleDateString("en-GB", { dateStyle: "long" })}` } : FOOTER,
-        }],
-        components: [row(
-          linkButton("Windows", `${WORKER_BASE}/releases/OCTIVE-Installer.exe`, "🪟"),
-          m?.android ? linkButton("Android", `${WORKER_BASE}/releases/${m.android.file}`, "🤖") : null,
-          m?.web ? linkButton("Play in browser", `${SITE}play/`, "🌐") : null,
-        )],
+        embeds: [cardEmbed(`⬇️ Download OCTIVE ${m.version}`, `${SITE}downloads`, C_ACCENT, c.image, "Free on Windows and Android, or play right in your browser. The game updates itself.")],
+        components: [buttons],
       };
     }
     case "link": {
       const code = String(opt(data, "code") || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-      if (code.length !== 8) return { content: `That code doesn't look right. Get one at ${SITE}#/account?tab=preferences → **Link Discord**.`, flags: EPHEMERAL };
+      if (code.length !== 8) return { content: `That code doesn't look right. Get one at ${SITE}account?tab=preferences → **Link Discord**.`, flags: EPHEMERAL };
       const o = await env.RELEASES.get(`discord-codes/${code}.json`);
       const c = o ? await o.json() : null;
-      if (!c || c.exp < Date.now()) return { content: `That code isn't valid or ran out (codes work for 10 minutes). Make a new one at ${SITE}#/account?tab=preferences.`, flags: EPHEMERAL };
+      if (!c || c.exp < Date.now()) return { content: `That code isn't valid or ran out (codes work for 10 minutes). Make a new one at ${SITE}account?tab=preferences.`, flags: EPHEMERAL };
       await env.RELEASES.delete(`discord-codes/${code}.json`);
       const old = await linkedPlayer(env, user.id);
       if (old && old !== c.playerId) {
@@ -3078,9 +3817,11 @@ async function discordCommand(env, it) {
       await saveRecord(env, c.playerId, rec);
       await env.RELEASES.put(`discord/${user.id}.json`, JSON.stringify({ playerId: c.playerId, at: rec.discord.at }), { httpMetadata: { contentType: "application/json" } });
       await syncSupporterRole(env, c.playerId, user.id, env.DISCORD_GUILD_ID && it.guild_id === env.DISCORD_GUILD_ID ? it.member : undefined);
-      let name = "your account";
-      try { const p = await profileOf(env, c.playerId); if (p) name = `**${clean(p.name)}**`; } catch { /* fine */ }
-      return { embeds: [{ color: C_GREEN, title: "✅ Linked", description: `Your Discord is now linked to ${name}.\nTry \`/profile\`, \`/achievements\` or \`/compare\`.` }], flags: EPHEMERAL };
+      let card = null;
+      try { card = await botCard(env, "linked", c.playerId); } catch { /* the text alone */ }
+      const name = card ? `**${clean(card.data.name)}**` : "your account";
+      const text = `Your Discord is now linked to ${name}.\nTry \`/profile\`, \`/achievements\` or \`/compare\`.`;
+      return { embeds: [card ? cardEmbed("✅ Linked", null, C_GREEN, card.image, text) : { color: C_GREEN, title: "✅ Linked", description: text }], flags: EPHEMERAL };
     }
     case "update": {
       // re-checks the server boost and gives or takes the OCTIVE Supporter role right now
@@ -3098,7 +3839,10 @@ async function discordCommand(env, it) {
         : st.active ? `a supporter until <t:${unix(st.until)}:D>`
         : "not a supporter right now";
       const role = !env.DISCORD_SUPPORTER_ROLE_ID ? "" : !member ? "\nJoin the OCTIVE Discord server to get the supporter role." : st.active ? "\nYou have the **OCTIVE Supporter** role." : "\nThe supporter role was removed.";
-      return { embeds: [{ color: st.active ? C_PINK : C_ACCENT, title: "🔄 Updated", description: `${name}: you're ${what}.${role}` }], flags: EPHEMERAL };
+      let card = null;
+      try { card = await botCard(env, "supporter", id); } catch { /* the text alone */ }
+      const text = `${name}: you're ${what}.${role}`;
+      return { embeds: [card ? cardEmbed("🔄 Updated", null, st.active ? C_PINK : C_ACCENT, card.image, text) : { color: st.active ? C_PINK : C_ACCENT, title: "🔄 Updated", description: text }], flags: EPHEMERAL };
     }
     case "tournament": {
       // staff only (Senterra and the official account, by their linked Discord): the same as the game's /tournament
@@ -3122,7 +3866,9 @@ async function discordCommand(env, it) {
       await syncSupporterRole(env, id, user.id, undefined, true);
       await env.RELEASES.delete(`discord/${user.id}.json`);
       const rec = await record(env, id); delete rec.discord; await saveRecord(env, id, rec);
-      return { embeds: [{ color: C_ACCENT, title: "Unlinked", description: "Your OCTIVE account and Discord aren't connected any more." }], flags: EPHEMERAL };
+      const card = await botCard(env, "unlinked").catch(() => null);
+      const text = "Your OCTIVE account and Discord aren't connected any more.";
+      return { embeds: [card ? cardEmbed("Unlinked", null, C_ACCENT, card.image, text) : { color: C_ACCENT, title: "Unlinked", description: text }], flags: EPHEMERAL };
     }
     default:
       return { content: "I don't know that command (yet). Try `/help`.", flags: EPHEMERAL };
@@ -3140,15 +3886,25 @@ async function discordAutocomplete(env, it) {
   return new Response(JSON.stringify({ type: 8, data: { choices: hits } }), { headers: { "Content-Type": "application/json" } });
 }
 
-/** Buttons on our messages: the leaderboard's pages. */
-async function discordComponent(env, it) {
+/**
+ * Buttons on our messages: the leaderboard's pages. Answered "edit coming" (type 6) at once, then the message is edited
+ * through the interaction's webhook: the ranking can take a couple of seconds to rebuild (Discord gives a button 3 s),
+ * and unlike an answer in place, a refused webhook edit says why (logged).
+ */
+async function discordComponent(env, it, ctx) {
   const id = String(it.data?.custom_id || "");
-  const m = id.match(/^lb:(\d{1,2})$/);
-  if (m) {
-    const msg = await leaderboardMessage(env, Number(m[1]), (it.member?.user || it.user || {}).id);
-    return new Response(JSON.stringify({ type: 7, data: msg }), { headers: { "Content-Type": "application/json" } });
-  }
-  return dReply({ content: "That button doesn't work any more.", flags: EPHEMERAL });
+  const m = id.match(/^lb:(\d{1,2})(?::(?:first|prev|next))?$/); // (messages from before have plain "lb:<page>")
+  if (!m) return dReply({ content: "That button doesn't work any more.", flags: EPHEMERAL });
+  ctx.waitUntil((async () => {
+    let msg = null;
+    try { msg = await leaderboardMessage(env, Number(m[1]), (it.member?.user || it.user || {}).id); } catch (e) { console.log("discord button failed", e && e.stack || e); }
+    if (!msg) return;
+    const res = await fetch(`https://discord.com/api/v10/webhooks/${DISCORD_APP_ID}/${it.token}/messages/@original`, {
+      method: "PATCH", headers: { "Content-Type": "application/json", "User-Agent": "DiscordBot (https://senterraslays.github.io/octive, 1.0)" }, body: JSON.stringify(msg),
+    });
+    if (!res.ok) console.log("discord page edit failed", m[1], res.status, (await res.text()).slice(0, 500));
+  })().catch((e) => console.log("discord page edit error", e && e.message)));
+  return new Response(JSON.stringify({ type: 6 }), { headers: { "Content-Type": "application/json" } });
 }
 
 async function discordInteraction(request, env, ctx) {
@@ -3166,16 +3922,16 @@ async function discordInteraction(request, env, ctx) {
     })().catch(() => {}));
   if (it.type === 1) return new Response(JSON.stringify({ type: 1 }), { headers: { "Content-Type": "application/json" } }); // PING
   if (it.type === 4) return await discordAutocomplete(env, it); // name suggestions while typing
-  if (it.type === 3) return await discordComponent(env, it); // buttons
+  if (it.type === 3) return await discordComponent(env, it, ctx); // buttons
   if (it.type !== 2) return dReply({ content: "Not supported.", flags: EPHEMERAL });
-  // answer straight away when the result is ready within ~2.5 s (Discord allows 3 s); otherwise answer
-  // "thinking…" and edit the reply when it's done (the ranking can be slow on a cold start)
+  // answer straight away when the result is ready within 2 s (Discord allows 3 s, network included); otherwise
+  // answer "thinking…" and edit the reply when it's done (the ranking can be slow on a cold start)
   const ephemeral = ["link", "unlink", "update", "help"].includes(it.data?.name);
   const result = discordCommand(env, it).catch((e) => {
     console.log("discord command failed", e && e.stack || e);
     return { content: "Something went wrong: " + String(e.message || e).slice(0, 300) };
   });
-  const quick = await Promise.race([result, new Promise((r) => setTimeout(() => r(null), 2500))]);
+  const quick = await Promise.race([result, new Promise((r) => setTimeout(() => r(null), 2000))]);
   if (quick) {
     if (ephemeral) quick.flags = EPHEMERAL;
     return dReply(quick);
@@ -3329,7 +4085,11 @@ async function boardRatesBackfill(env, songId, chartId, data) {
       if (e.rc || !found.has(e.playerId)) continue;
       const m = found.get(e.playerId);
       // only when the replay is of this score (the letters it has match), so a newer score's replay never relabels an older one
-      if (m != null && m.replace(/ ?[0-9.]+x$/, "") === String(e.mods || "").trim()) e.mods = m;
+      if (m != null && m.replace(/ ?[0-9.]+x$/, "") === String(e.mods || "").trim()) {
+        // (2.2.1) a rate found now on a score readBoard already converted (rs) as 1.0x: its speed bonus is added here
+        if (e.rs && rateOf(e.mods) === 1 && rateOf(m) !== 1 && Number(e.score) > 0) e.score = scoreWithRate(Number(e.score), rateOf(m));
+        e.mods = m;
+      }
       e.rc = 1; changed = true;
     }
     if (!changed) return false;
@@ -3448,9 +4208,12 @@ async function chartScores(request, env, url) {
     };
     // (2.1.3) the PR is worked out here from the judged hits when the server has rated the chart (v5) and it was played at
     // normal speed: what the game sent doesn't count (older games work it out with the old stars and curve)
+    // (2.2.0) and at a song speed, with the chart's stars at that speed (before, a rate play got no more than normal speed's)
     const info5 = (await boardChartInfo(env).catch(() => null))?.charts.get(`${songId}/${chartId}`) || null;
-    if (info5 && info5.stv === STAR_VERSION && info5.stars > 0 && rateOf(replay.mods) === 1)
-      entry.pp = playPR(info5.stars, result.counts, where.compiled.time.length, replay.result?.failed === true, replay.mods);
+    const playRate = rateOf(replay.mods);
+    const st5 = info5 && info5.stv === STAR_VERSION && info5.stars > 0 ? await boardStarsAt(env, where, songId, chartId, info5.stars, playRate) : null;
+    if (st5 > 0)
+      entry.pp = playPR(st5, result.counts, where.compiled.time.length, replay.result?.failed === true, replay.mods);
     else
       // a verified chart's stars are known here: the PR on its board is never more than they give at that accuracy
       try {
@@ -3460,13 +4223,17 @@ async function chartScores(request, env, url) {
       } catch { /* as sent, within the limits above */ }
     // the server-made ranking: this judged play's PR counts (its best per board), whether or not it beats their board score
     // (2.0.1) with what achievements read from it: the chart's stars and keys, its difficulty, Hidden / Hard Rock / speed plays
+    let freshPlay = true;
     {
       const info = (await boardChartInfo(env).catch(() => null))?.charts.get(`${songId}/${chartId}`) || null;
       const st1 = Number(info?.stars) || 0, rate = rateOf(replay.mods);
-      await rememberJudged(env, who.playerId, songId, chartId, entry, {
-        stars: st1 || undefined, keys: where.compiled.keyCount, difficulty: where.difficulty || info?.difficulty || undefined, rate,
+      // (2.2.1) the replay's timing signature: the same play sent again (the game re-sends earlier bests, sometimes twice
+      // at once) isn't another play for recent plays, play counts or missions
+      const sig = result.signature ? (await sha256Hex(result.signature)).slice(0, 16) : "";
+      freshPlay = await rememberJudged(env, who.playerId, songId, chartId, entry, {
+        stars: st1 || undefined, keys: where.compiled.keyCount, difficulty: where.difficulty || info?.difficulty || undefined, rate, sig,
         facts: playFacts(result, replay, rate >= 1 ? st1 : 0), result: versionBefore(replay.octiveVersion, "2.0.1") ? null : result, durationMs: chartMs(where.compiled) / rate,
-      }).catch((e) => console.log("judged play", e && e.message));
+      }).catch((e) => { console.log("judged play", e && e.message); return true; });
     }
     const key = `scores/${songId}/${chartId}.json`;
     boards.delete(key);
@@ -3515,7 +4282,7 @@ async function chartScores(request, env, url) {
     // crew wars: a better play on one of the week's charts can raise your crew's score
     if (improved || i < 0) await warPlay(env, who.playerId, songId, chartId, entry.pp).catch((e) => console.log("war", e && e.message));
     // weekly (and event) missions: this judged play counts
-    const missions = await missionEvent(env, who.playerId, { kind: "board", chart: `${songId}/${chartId}`, acc: entry.accuracy, fc: !!result.fullCombo, fresh: i < 0 })
+    const missions = freshPlay === false ? [] : await missionEvent(env, who.playerId, { kind: "board", chart: `${songId}/${chartId}`, acc: entry.accuracy, fc: !!result.fullCombo, fresh: i < 0 })
       .catch((e) => { console.log("missions", e && e.message); return []; });
     // what the server's judging gave (the game shows it if it differs from its own)
     return reply({ ok: true, improved, rank: rank || null, total: data.entries.length, missions: missions.length ? missions : undefined,
@@ -3672,9 +4439,13 @@ async function unverifiedPlay(request, env) {
   const failed = replay.result.failed === true;
   const pp = playPR(stars, result.counts, compiled.time.length, failed, replay.mods);
   const entry = {
-    pp, acc: round2(result.accuracy), fc: !!result.fullCombo, combo: result.maxCombo || 0, g: result.grade, pf: allPerfect(result.counts),
+    pp, acc: round2(result.accuracy), pa: ppAccuracy(result.counts) >= 0 ? round2(ppAccuracy(result.counts)) : undefined,
+    fc: !!result.fullCombo, combo: result.maxCombo || 0, g: result.grade, pf: allPerfect(result.counts),
     at: new Date().toISOString(), m: String(replay.mods || "").slice(0, 40) || undefined, st: round2(stars1), k: compiled.keyCount,
     song: songId, title: title || undefined, d: difficulty || undefined,
+    ...playDetail(result.score, result.counts, result.maxCombo), // (2.2.1) for the website's play details
+    // (2.2.1) the board it would have (an osu! set's): once that's verified, this play stops counting here
+    board: /^osu-[0-9]{1,12}$/.test(String(b.board || "")) ? String(b.board) : undefined,
   };
   const old = versionBefore(replay.octiveVersion, "2.0.1");
   let improved = false;
@@ -3687,7 +4458,7 @@ async function unverifiedPlay(request, env) {
     if (improved) { next.sig = sig; next.stv = STAR_VERSION; if (old) next.old = true; else delete next.old; }
     d.unverified[hash] = next;
     if (!redo) pushRecent(d, { h: hash, v: 0, pp: round2(pp * UNVERIFIED_SHARE), raw: pp, acc: entry.acc, g: entry.g, fc: entry.fc, m: entry.m,
-      at: entry.at, st: entry.st, keys: entry.k, d: entry.d, t: entry.title, song: entry.song });
+      at: entry.at, st: entry.st, keys: entry.k, d: entry.d, t: entry.title, song: entry.song, sc: entry.sc, n: entry.n, mc: entry.mc });
     noteFacts(d, playFacts(result, replay, stars));
     if (!old && !redo) countPlay(d, result, chartMs(compiled) / rate); // (earlier plays are in the totals the server started from)
     const keys = Object.keys(d.unverified);
@@ -4121,16 +4892,55 @@ async function grantMonths(env, playerId, months, session) {
 async function grantLifetime(env, playerId, session) {
   const key = `supporters/${playerId}.json`;
   let added = false;
+  let twice = false;
   await r2update(env, key, () => ({ periods: [], purchases: [] }), (rec) => {
     rec.periods ||= []; rec.purchases ||= [];
     if (rec.purchases.some((p) => p.session === session.id)) return false;
+    // (2.2.1) already lifetime (a second checkout left open and paid): kept as a payment to refund, not a second purchase
+    if (rec.lifetime === true) {
+      rec.purchases.push({ at: new Date().toISOString(), months: 0, lifetime: true, twice: true, amount: session.amount_total, currency: session.currency, session: session.id });
+      twice = true;
+      return;
+    }
     rec.lifetime = true;
     rec.lifetimeAt = new Date().toISOString();
-    rec.purchases.push({ at: rec.lifetimeAt, months: 0, lifetime: true, amount: session.amount_total, currency: session.currency, session: session.id });
+    rec.purchases.push({ at: rec.lifetimeAt, months: 0, lifetime: true, amount: session.amount_total, currency: session.currency, session: session.id,
+      paymentIntent: typeof session.payment_intent === "string" ? session.payment_intent : undefined });
     added = true;
   });
   supportIndex = null;
+  if (twice) await flagPlayer(env, playerId, `paid for lifetime supporter twice: refund checkout ${session.id} in Stripe`);
   return added;
+}
+
+/**
+ * (2.2.1) A lifetime payment refunded in full or disputed: lifetime (and its title) go. Stripe sends charge.refunded and
+ * charge.dispute.created when the webhook is subscribed to them; the payment's metadata names the player.
+ */
+async function revokeLifetime(env, chargeOrDispute) {
+  const piId = typeof chargeOrDispute.payment_intent === "string" ? chargeOrDispute.payment_intent : chargeOrDispute.payment_intent?.id;
+  if (!piId) return;
+  const pi = await stripe(env, "payment_intents/" + encodeURIComponent(piId));
+  const id = pi?.metadata?.playerId;
+  if (!id || pi.metadata?.lifetime !== "1") return; // months: as before
+  let changed = false;
+  await r2update(env, `supporters/${id}.json`, () => ({ periods: [], purchases: [] }), (rec) => {
+    rec.purchases ||= [];
+    const kept = rec.purchases.filter((p) => p.lifetime && !p.twice && !p.refunded);
+    // only when no other paid lifetime purchase is left (a refunded second payment changes nothing)
+    const mine = kept.find((p) => p.paymentIntent === piId) || (kept.length === 1 ? kept[0] : null);
+    if (!rec.lifetime || !mine) return false;
+    mine.refunded = new Date().toISOString();
+    if (rec.purchases.some((p) => p.lifetime && !p.twice && !p.refunded)) return;
+    rec.lifetime = false; delete rec.lifetimeAt;
+    changed = true;
+  });
+  if (!changed) return;
+  supportIndex = null;
+  await walletUpdate(env, id, (w) => { const i = (w.owned || []).indexOf(LIFETIME_TITLE); if (i < 0) return false; w.owned.splice(i, 1); if (w.equipped && w.equipped.title === LIFETIME_TITLE) delete w.equipped.title; })
+    .then((w) => (w ? writeCosmetics(env, id, w) : null)).catch((e) => console.log("lifetime title off", e && e.message));
+  await syncSupporterRole(env, id).catch(() => {});
+  await flagPlayer(env, id, `lifetime supporter taken back (payment refunded or disputed: ${piId})`);
 }
 
 async function supportRoutes(request, env, url, ctx) {
@@ -4171,6 +4981,9 @@ async function supportRoutes(request, env, url, ctx) {
         }
       }
     }
+    // (2.2.1) a lifetime payment refunded in full, or disputed
+    if ((ev.type === "charge.refunded" && ev.data.object.refunded === true) || ev.type === "charge.dispute.created")
+      await revokeLifetime(env, ev.data.object).catch((e) => console.log("lifetime refund", e && e.message));
     return new Response("ok");
   }
   if (path === "/support/checkout") {
@@ -4184,8 +4997,8 @@ async function supportRoutes(request, env, url, ctx) {
       const fromGame = b.from === "game";
       const s = await stripe(env, "checkout/sessions", {
         mode: "payment",
-        success_url: fromGame ? `${url.origin}/support/done?paid=1` : `${SITE}#/supporter?thanks=1`,
-        cancel_url: fromGame ? `${url.origin}/support/done?cancel=1` : `${SITE}#/supporter`,
+        success_url: fromGame ? `${url.origin}/support/done?paid=1` : `${SITE}supporter?thanks=1`,
+        cancel_url: fromGame ? `${url.origin}/support/done?cancel=1` : `${SITE}supporter`,
         client_reference_id: who.playerId,
         "metadata[playerId]": who.playerId,
         "metadata[months]": "0",
@@ -4199,6 +5012,8 @@ async function supportRoutes(request, env, url, ctx) {
         "line_items[0][price_data][product_data][description]": "Supporter forever: pay once, it never runs out",
         "payment_intent_data[metadata][playerId]": who.playerId,
         "payment_intent_data[metadata][lifetime]": "1",
+        // (2.2.1) a forgotten window can't be paid much later (Stripe's shortest is 30 minutes)
+        expires_at: String(Math.floor(Date.now() / 1000) + 31 * 60),
       });
       return reply({ url: s.url, session: s.id });
     }
@@ -4212,6 +5027,9 @@ async function supportRoutes(request, env, url, ctx) {
       if (target !== who.playerId) {
         const card = (await publicItems(config(env), target, ["card"])).card;
         if (!card || moderation.bans[target]) fail(400, "That player can't be found (they need to have played online once).");
+        // (2.2.1) months would do nothing for a lifetime supporter
+        if (supportStatus(await r2json(env, `supporters/${target}.json`, null), target, null).lifetime)
+          fail(409, "That player is a lifetime supporter already, so months wouldn't do anything for them.");
       }
     }
     // (2.1.4) a lifetime supporter can't buy months for themselves (they never run out); gifts are fine
@@ -4222,8 +5040,8 @@ async function supportRoutes(request, env, url, ctx) {
     const fromGame = b.from === "game";
     const s = await stripe(env, "checkout/sessions", {
       mode: "payment",
-      success_url: fromGame ? `${url.origin}/support/done?paid=1` : `${SITE}#/supporter?thanks=1`,
-      cancel_url: fromGame ? `${url.origin}/support/done?cancel=1` : `${SITE}#/supporter`,
+      success_url: fromGame ? `${url.origin}/support/done?paid=1` : `${SITE}supporter?thanks=1`,
+      cancel_url: fromGame ? `${url.origin}/support/done?cancel=1` : `${SITE}supporter`,
       client_reference_id: target,
       "metadata[playerId]": target,
       "metadata[months]": String(months),
@@ -4301,7 +5119,40 @@ h1{margin:0 0 10px;font-size:30px}p{margin:0;color:#aab0c4;line-height:1.55}.s{m
     const who = await signedIn(request, env);
     const rec = await r2json(env, `supporters/${who.playerId}.json`, null);
     const looks = await r2json(env, `looks/${who.playerId}.json`, {});
-    return reply({ ...supportStatus(rec, who.playerId, await r2json(env, `boosters/${who.playerId}.json`, null)), looks, history: (rec?.purchases || []).map((p) => ({ at: p.at, months: p.months, amount: p.amount, currency: p.currency })) });
+    return reply({ ...supportStatus(rec, who.playerId, await r2json(env, `boosters/${who.playerId}.json`, null)), looks, link: await linkOf(env, who.playerId), history: (rec?.purchases || []).map((p) => ({ at: p.at, months: p.months, amount: p.amount, currency: p.currency })) });
+  }
+  if (path === "/support/link") {
+    // (2.2.2) a supporter's own profile link (/u/<link>): set or changed while they're a supporter, kept after
+    // (taking it off works any time). Not another player's name, nothing offensive, nothing kept for OCTIVE.
+    if (request.method !== "POST") fail(405, "Use POST.");
+    const b = await bodyOf(request);
+    const who = await signedIn(request, env);
+    const me = who.playerId, staff = me === OWNER || isOfficial(me);
+    const want = String(b.link ?? "").trim();
+    if (want) {
+      const st = supportStatus(await r2json(env, `supporters/${me}.json`, null), me, await r2json(env, `boosters/${me}.json`, null));
+      if (!st.active && !staff) fail(403, "A profile link of your own is a supporter perk.");
+      const why = linkProblem(want, staff);
+      if (why) fail(400, why);
+      if (!staff) {
+        let players = [];
+        try { players = (await leaderboard(env)).players || []; } catch { /* checked again by moderators */ }
+        if (players.some((x) => x.id !== me && String(x.name || "").toLowerCase() === want.toLowerCase())) fail(409, "That's another player's name.");
+      }
+    }
+    let taken = false;
+    await r2update(env, LINKS_KEY, () => ({}), (L) => {
+      taken = false;
+      const k = want.toLowerCase();
+      if (want && L[k] && L[k].id !== me) { taken = true; return false; }
+      for (const [kk, v] of Object.entries(L)) if (v && v.id === me && kk !== k) delete L[kk];
+      if (want) L[k] = { id: me, link: want, at: (L[k] && L[k].id === me && L[k].at) || new Date().toISOString() };
+    });
+    if (taken) fail(409, "Someone has that link already.");
+    linksCache = null;
+    // its page on the website (u/<link>.html), so the link shows their card where it's shared (a minute or so)
+    ctx?.waitUntil?.(syncProfilePages(env).catch((e) => console.log("profile pages", e && e.message)));
+    return reply({ ok: true, link: want || null, share: `${SITE}u/${encodeURIComponent(want || me)}`, site: `${SITE}u/${encodeURIComponent(want || me)}` });
   }
   if (path === "/support/gif") {
     // a supporter's animated picture, sent as the raw file (up to 8 MB; base64 JSON would be too slow)
@@ -4434,7 +5285,7 @@ h1{font-size:22px;margin:0 0 8px}p{color:#b9bdd6;margin:0}</style></head><body><
     rec.twitchPrefs ||= { show: true };
     await saveRecord(env, st.playerId, rec);
     await r2put(env, `twitch/${user.id}.json`, { playerId: st.playerId, at: rec.twitch.at });
-    if (st.site) return Response.redirect(SITE + "?twitch=linked#/account", 302);
+    if (st.site) return Response.redirect(SITE + "account?twitch=linked", 302);
     return page("Twitch linked!", `${esc(rec.twitch.name)} is now linked to your OCTIVE account. You can close this tab and go back to the game.`, true);
   }
   // following
@@ -4452,7 +5303,9 @@ h1{font-size:22px;margin:0 0 8px}p{color:#b9bdd6;margin:0}</style></head><body><
     let discord = null, discordUser = null, twitch = null;
     try {
       const rec = await record(env, id);
-      if (rec.twitch?.id && rec.twitchPrefs?.show !== false) twitch = { login: rec.twitch.login, name: rec.twitch.name || rec.twitch.login, live: await twitchLiveOf(env, rec.twitch.id) };
+      // (2.2.1) "live" is left out when they aren't streaming (and "twitch" below when not linked): games up to 2.2.1
+      // read a JSON null there as an error and showed "—" for the follower counts
+      if (rec.twitch?.id && rec.twitchPrefs?.show !== false) twitch = { login: rec.twitch.login, name: rec.twitch.name || rec.twitch.login, live: (await twitchLiveOf(env, rec.twitch.id)) || undefined };
       if (rec.discord?.id && rec.discordPrefs?.show) {
         discord = rec.discord.name || null;
         // the username (what people type to add them); links made before 1.5 get it from Discord once
@@ -4462,7 +5315,7 @@ h1{font-size:22px;margin:0 0 8px}p{color:#b9bdd6;margin:0}</style></head><body><
         discordUser = rec.discord.username || null;
       }
     } catch { /* none */ }
-    return reply({ following, followers, friends, youFollow, owner: OWNER, discord, discordUser, twitch });
+    return reply({ following, followers, friends, youFollow, owner: OWNER, discord, discordUser, twitch: twitch || undefined });
   }
   if (path === "/follow") {
     const b = await bodyOf(request);
@@ -5115,7 +5968,9 @@ function readShareReply(text) {
 
 /** Compares the model's reading with the play: any one of the score, accuracy, name or song title is enough. */
 function matchSharePicture(r, want) {
-  if (r.results === false || /^\s*false\s*$/i.test(String(r.results ?? ""))) return { check: "fake", read: r };
+  // (2.2.0) the model's "is it a results screen" is often wrong on real ones (it reads the right score and accuracy and
+  // still says false), so a picture is only fake when it says so AND nothing it read matches the play
+  const saysNot = r.results === false || /^\s*false\s*$/i.test(String(r.results ?? ""));
   const digits = (v) => String(v ?? "").replace(/[^0-9]/g, "");
   const got = digits(r.score);
   const scoreOk = got.length >= 3 && digitEdits(got, String(Math.round(want.score))) <= 1;
@@ -5124,6 +5979,9 @@ function matchSharePicture(r, want) {
   const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
   const near = (x, y, min) => { x = norm(x); y = norm(y); return x.length >= min && y.length >= min && (x.includes(y) || y.includes(x)); };
   const nameOk = near(r.player, want.name, 2), titleOk = near(r.title, want.title, 3);
+  // a picture the model says isn't a results screen needs the play's own numbers on it (a name or title alone is too easy
+  // to match: short readings like "na" are inside many names)
+  if (saysNot) return scoreOk || accOk ? { check: "ok", read: r } : { check: "fake", read: r };
   if (scoreOk || accOk || nameOk || titleOk) return { check: "ok", read: r };
   return { check: got !== "" || norm(r.player) !== "" ? "different" : "unread", read: r };
 }
@@ -5332,6 +6190,18 @@ async function wsMoveFiles(env, it) {
 // ---- the Workshop's Discord posts: a card with the details and buttons (the file itself is on B2)
 const WS_EMOJI = { charts: "🎵", skins: "🎨", themes: "🖼️", styles: "✨" };
 const wsMd = (v, n) => String(v || "").replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, "").replace(/@(everyone|here)/gi, "@\u200b$1").replace(/([*_`~|\\>])/g, "\\$1").trim().slice(0, n);
+/** (2.2.0) The player with exactly this name (any case) on the ranking, or the official account; null when nobody or several. */
+async function wsPlayerNamed(env, name) {
+  const q = String(name || "").trim().toLowerCase();
+  if (!q) return null;
+  try {
+    const hits = (await leaderboard(env)).players.filter((p) => (moderation.overrides[p.id]?.name || p.name || "").toLowerCase() === q);
+    if (hits.length === 1) return hits[0].id;
+    if (hits.length) return null;
+    const off = await profileOf(env, OFFICIAL_ID).catch(() => null);
+    return off && String(off.name || "").toLowerCase() === q ? OFFICIAL_ID : null;
+  } catch { return null; }
+}
 async function wsCreatorDiscord(env, playerId) { try { return (await record(env, playerId)).discord?.id || null; } catch { return null; } }
 function wsPostBody(it, creatorDiscord) {
   const songs = (it.type === "charts" && it.meta && it.meta.songs) || [];
@@ -5356,8 +6226,8 @@ function wsPostBody(it, creatorDiscord) {
     fields.push({ name: "Leaderboard", value: it.verified ? "✅ Verified: global board" : "Community upload", inline: true });
   }
   const embed = {
-    title: `${WS_EMOJI[it.type] || ""} ${String(it.title || "Untitled")}`.trim().slice(0, 256), url: `${SITE}#/open/workshop/${it.id}`, color: WS_COLOR[it.type],
-    author: { name: `${WS_LABEL[it.type]} by ${it.creator || "Player"}`.slice(0, 256), url: `${SITE}#/u/${encodeURIComponent(it.creatorId || "")}` },
+    title: `${WS_EMOJI[it.type] || ""} ${String(it.title || "Untitled")}`.trim().slice(0, 256), url: `${SITE}open/workshop/${it.id}`, color: WS_COLOR[it.type],
+    author: { name: `${WS_LABEL[it.type]} by ${it.creator || "Player"}`.slice(0, 256), url: `${SITE}u/${encodeURIComponent(it.creatorId || "")}` },
     description: lines.join("\n").slice(0, 4000) || undefined,
     fields,
     image: it.preview ? { url: `${WORKER_BASE}/api/preview/${it.id}?v=${it.version || 1}` } : undefined,
@@ -5366,7 +6236,7 @@ function wsPostBody(it, creatorDiscord) {
   };
   return {
     embeds: [embed], allowed_mentions: { parse: [] }, attachments: [],
-    components: [row(linkButton("Open in OCTIVE", `${SITE}#/open/workshop/${it.id}`, "🎮"), linkButton("Download", `${WORKER_BASE}/api/download/${it.id}?redirect=1`, "⬇️"), linkButton("Creator", `${SITE}#/u/${encodeURIComponent(it.creatorId || "")}`, "👤"))],
+    components: [row(linkButton("Open in OCTIVE", `${SITE}open/workshop/${it.id}`, "🎮"), linkButton("Download", `${WORKER_BASE}/api/download/${it.id}?redirect=1`, "⬇️"), linkButton("Creator", `${SITE}u/${encodeURIComponent(it.creatorId || "")}`, "👤"))],
   };
 }
 /** Posts an upload's card in its channel (the old post, if any, is deleted after). */
@@ -5717,6 +6587,27 @@ async function judgeManifest(env, f) {
   return judgeMemo(rk, m);
 }
 
+/**
+ * (2.2.0) A board chart's stars at a song speed: the board's own stars (v5, or OCTIVE's hand-set numbers) times how much
+ * harder the speed makes it (the star rating at that speed over the one at normal speed). Kept in R2 per chart and speed.
+ * Null when it can't be worked out (the caller keeps the old limit then).
+ */
+async function boardStarsAt(env, where, board, chart, baseStars, rate) {
+  if (!(baseStars > 0) || !where || typeof where.text !== "function") return null;
+  if (rate === 1) return baseStars;
+  const key = `stars/rate/v${STAR_VERSION}/${board}/${chart}/${rate}.json`;
+  let k = await r2json(env, key, null).catch(() => null);
+  if (!k || !(k.at1 > 0) || !(k.atRate > 0)) {
+    try {
+      const text = await where.text();
+      k = { at1: starRating(text, 1), atRate: starRating(text, rate) };
+    } catch (e) { console.log("rate stars", board, chart, rate, e && e.message); return null; }
+    if (!(k.at1 > 0) || !(k.atRate > 0)) return null;
+    await r2put(env, key, k).catch(() => {});
+  }
+  return Math.min(V.maxStars, baseStars * (k.atRate / k.at1));
+}
+
 /** One of a package's charts, compiled for judging: read from B2 the first time, then kept in R2. */
 async function judgeCompiled(env, f, m, i) {
   const rk = `judge/${JUDGE_VERSION}/${f.key}/chart-${i}.json`;
@@ -5758,7 +6649,12 @@ async function judgeChartOf(env, it, songId, want) {
       if (i < 0 && want.osuMd5) i = m.charts.findIndex((c) => c.osuMd5 === want.osuMd5);
       if (i < 0 && want.difficulty) i = m.charts.findIndex((c) => c.difficulty === want.difficulty && !(want.osuMd5 && c.osuMd5));
       if (i < 0) return null;
-      return { compiled: await judgeCompiled(env, f, m, i), itemId: it.id, songId: m.songId, chartId: m.charts[i].chartId, difficulty: m.charts[i].difficulty };
+      const entryName = m.charts[i].entry;
+      return {
+        compiled: await judgeCompiled(env, f, m, i), itemId: it.id, songId: m.songId, chartId: m.charts[i].chartId, difficulty: m.charts[i].difficulty,
+        // (2.2.0) the chart file itself, for its stars at a song speed (read only when asked)
+        text: async () => new TextDecoder().decode(await judgeZipFile(env, f, entryName)),
+      };
     }
   } catch (e) {
     if (e.status) throw e;
@@ -6103,7 +6999,7 @@ async function judgeFlags(env, playerId, what, result, claimed) {
     color: proof ? 0xFF4D6D : 0xF2C14E,
     description: cfg.bans === true ? "Bans are on." : "Watching only: nothing was done to the player or the play.",
     fields: [
-      { name: "Player", value: `${modText(name, 60)} · \`${playerId}\`\n${SITE}#/u/${encodeURIComponent(playerId)}`, inline: false },
+      { name: "Player", value: `${modText(name, 60)} · \`${playerId}\`\n${SITE}u/${encodeURIComponent(playerId)}`, inline: false },
       { name: "Play", value: modText(what, 200) || "?", inline: false },
       { name: "Signs", value: signs.map((s) => `${s.strong ? "•" : "◦"} ${s.text}${repeated && s.id === repeated.id ? ` (on ${counts[s.id]} plays now)` : ""}`).join("\n").slice(0, 1000), inline: false },
     ],
@@ -6522,6 +7418,7 @@ const SHOP = [
     .map(([id, name]) => ({ id: "title-" + id, kind: "title", name, price: 300 })),
   ...[["legend", "Legend"], ["unstoppable", "Unstoppable"], ["rhythm-royalty", "Rhythm Royalty"], ["the-one", "The One"], ["beyond-human", "Beyond Human"], ["octive-elite", "OCTIVE Elite"]]
     .map(([id, name]) => ({ id: "title-" + id, kind: "title", name, price: 1500 })),
+  { id: "title-ln-hater", kind: "title", name: "LN HATER", price: 1000 }, // (2.2.2)
   ...[["gold", "Gold", "#FFC94D", 500], ["silver", "Silver", "#CFD8E3", 500], ["neon", "Neon", "#39FFB0", 800], ["sakura", "Sakura", "#FF9EC7", 800],
      ["ocean", "Ocean", "#3FA9FF", 800], ["ember", "Ember", "#FF6A3D", 1000], ["void", "Void", "#8A5CFF", 1000], ["diamond", "Diamond", "#B9F2FF", 1500],
      ["bronze", "Bronze", "#CD7F32", 500], ["rose", "Rose", "#FF5C8A", 600], ["lemon", "Lemon", "#FFF06B", 600], ["lavender", "Lavender", "#C3A6FF", 600],
@@ -6590,7 +7487,10 @@ async function retireItems(env, id) {
   if (!cur.ltChecked && !(cur.owned || []).includes(LIFETIME_TITLE)) {
     let life = LIFETIME_SUPPORTERS.includes(id);
     if (!life) { try { life = !!supportStatus(await r2json(env, `supporters/${id}.json`, null), id, null).lifetime; } catch { life = false; } }
-    cur = (await walletUpdate(env, id, (w) => { w.ltChecked = true; if (life && !w.owned.includes(LIFETIME_TITLE)) w.owned.push(LIFETIME_TITLE); })) || cur;
+    // (2.2.1) a player with no wallet who isn't lifetime is left alone: this runs for anyone looked up (public pages),
+    // and writing a wallet for every id asked about would fill points/ with nobodies
+    if (life || (await env.RELEASES.head(`points/${id}.json`)))
+      cur = (await walletUpdate(env, id, (w) => { w.ltChecked = true; if (life && !w.owned.includes(LIFETIME_TITLE)) w.owned.push(LIFETIME_TITLE); })) || cur;
     if (life) await writeCosmetics(env, id, cur);
   }
   // icons became shapes + colours: what you had looks the same (the shape, its colour for free, still on)
@@ -6983,7 +7883,7 @@ async function fileReport(env, who, id, reasonKey, detailsRaw, whereRaw) {
   const posted = await modPost(env, {
     title: `Player report: ${REASONS[reason]}`, color: 0xFF8A3D,
     fields: [
-      { name: "Reported", value: `${modText(name, 60)} (${id}) ${SITE}#/u/${encodeURIComponent(id)}`, inline: false },
+      { name: "Reported", value: `${modText(name, 60)} (${id}) ${SITE}u/${encodeURIComponent(id)}`, inline: false },
       { name: "By", value: `${modText(byName, 60)} (${who.playerId})`, inline: true },
       { name: "Where", value: where, inline: true },
       ...(details ? [{ name: "What they said", value: details, inline: false }] : []),
@@ -7782,7 +8682,7 @@ async function rankedShare(request, env) {
   const avatarHash = moderation.overrides[id]?.avatar ? "mod-" + Date.parse(moderation.overrides[id].at) : (card.avatar || "");
   const embed = {
     color: parseInt(RK_HEX[rkGroupOf(tier)].slice(1), 16),
-    author: { name, url: `${SITE}#/u/${encodeURIComponent(id)}`, ...(avatarHash ? { icon_url: `${WORKER_BASE}/avatar/${encodeURIComponent(id)}?v=${encodeURIComponent(avatarHash)}` } : {}) },
+    author: { name, url: `${SITE}u/${encodeURIComponent(id)}`, ...(avatarHash ? { icon_url: `${WORKER_BASE}/avatar/${encodeURIComponent(id)}?v=${encodeURIComponent(avatarHash)}` } : {}) },
     title: title.slice(0, 256), fields, ...(bytes ? { image: { url: `attachment://rank.${kind}` } } : {}),
     footer: { text: `Shared from OCTIVE · Ranked${k7 ? " 7K" : ""}` }, timestamp: new Date().toISOString(),
   };
@@ -8515,9 +9415,11 @@ async function crewIndexSet(env, c) {
   await r2update(env, CREW_INDEX, () => ({ crews: {} }), (d) => {
     d.crews ||= {};
     if (!c || c.gone) { if (c) delete d.crews[c.id]; return; }
-    d.crews[c.id] = { name: c.name, tag: c.tag, color: c.color, members: (c.members || []).length, score: c.score || 0, updated: new Date(Date.now()).toISOString() };
+    d.crews[c.id] = crewIndexLine(c);
   });
 }
+/** A crew's line on the crew board (owner: so one player can't make two at once). */
+const crewIndexLine = (c) => ({ name: c.name, tag: c.tag, color: c.color, owner: c.owner, members: (c.members || []).length, score: c.score || 0, updated: new Date(Date.now()).toISOString() });
 /** Puts a player's crew on their wallet and cosmetics (null: none). */
 async function crewSetMember(env, playerId, c) {
   const w = await walletUpdate(env, playerId, (w) => { if (c) w.crew = crewBadge(c); else { if (!w.crew) return false; delete w.crew; } });
@@ -8718,16 +9620,25 @@ async function crewRoutes(request, env, url, path) {
     if ((await walletOf(env, me)).crew) fail(409, "You're in a crew already: leave it first.");
     const name = cleanText(b.name, 24), tag = String(b.tag || "").trim().toUpperCase();
     crewCheck(name, tag, staff);
-    const idx = await r2json(env, CREW_INDEX, { crews: {} });
-    for (const x of Object.values(idx.crews || {})) {
-      if (x.tag === tag) fail(409, `The tag ${tag} is taken.`);
-      if (String(x.name).toLowerCase() === name.toLowerCase()) fail(409, "A crew has that name already.");
-    }
     const c = { id: rkNewId().slice(0, 16), name, tag, color: crewColor(b.color), desc: cleanText(b.desc, 120), owner: me, created: new Date(Date.now()).toISOString(),
       members: [{ id: me, name: myName, joined: new Date(Date.now()).toISOString() }], invites: [] };
     c.score = await crewScore(env, c);
+    // (2.2.2) the name, tag and owner are checked and claimed in one write to the crew board: the same request sent
+    // again a second later (a double click) made the same crew three times, each checking the board before any was on it
+    let taken = null;
+    await r2update(env, CREW_INDEX, () => ({ crews: {} }), (d) => {
+      d.crews ||= {};
+      taken = null;
+      for (const x of Object.values(d.crews)) {
+        if (x.owner === me) { taken = "You're in a crew already: leave it first."; break; }
+        if (x.tag === tag) { taken = `The tag ${tag} is taken.`; break; }
+        if (String(x.name).toLowerCase() === name.toLowerCase()) { taken = "A crew has that name already."; break; }
+      }
+      if (taken) return false;
+      d.crews[c.id] = crewIndexLine(c);
+    });
+    if (taken) fail(409, taken);
     await r2put(env, crewKey(c.id), c);
-    await crewIndexSet(env, c);
     await crewSetMember(env, me, c);
     return reply({ ok: true, crew: crewPublic(c, me) });
   }
@@ -10037,13 +10948,14 @@ async function workshopRoutes(request, env, url, ctx) {
       : sort === "requested" ? (a, b) => ((a.verifyRequest && Date.parse(a.verifyRequest.at)) || 0) - ((b.verifyRequest && Date.parse(b.verifyRequest.at)) || 0)
       : (a, b) => b.at - a.at);
     const counts = {};
-    for (const it of db.items || []) if (!it.removed) counts[it.type] = (counts[it.type] || 0) + 1;
+    let verifiedCharts = 0; // (2.2.2) the website's front page shows it
+    for (const it of db.items || []) if (!it.removed) { counts[it.type] = (counts[it.type] || 0) + 1; if (it.type === "charts" && it.verified) verifiedCharts++; }
     // a spotlight (bought in the points shop) puts an upload first for a day
     if (sort === "new" || sort === "popular") {
       const lit = (it) => it.spotlightUntil && Date.parse(it.spotlightUntil) > Date.now();
       items = [...items.filter(lit), ...items.filter((it) => !lit(it))];
     }
-    return reply({ items: items.slice(0, 300).map((it) => ({ ...wsPublic(it), keys: [...new Set(((it.meta && it.meta.songs) || []).flatMap((sg) => (sg.charts || []).map((c) => c.keys)))].filter(Boolean).sort((a, b) => a - b), topStars: it.type === "charts" ? topStars(it) : undefined, topPR: it.type === "charts" ? wsTopPR(it) : undefined })), counts, pending, tagList: WS_TAGS, maxBytes: await wsMaxBytes(env).catch(() => null) });
+    return reply({ items: items.slice(0, 300).map((it) => ({ ...wsPublic(it), keys: [...new Set(((it.meta && it.meta.songs) || []).flatMap((sg) => (sg.charts || []).map((c) => c.keys)))].filter(Boolean).sort((a, b) => a - b), topStars: it.type === "charts" ? topStars(it) : undefined, topPR: it.type === "charts" ? wsTopPR(it) : undefined })), counts, verifiedCharts, pending, tagList: WS_TAGS, maxBytes: await wsMaxBytes(env).catch(() => null) });
   }
 
   // ---- a file of an item, through this server (the browser version can't read Discord's files directly)
@@ -10209,6 +11121,41 @@ async function workshopRoutes(request, env, url, ctx) {
     const o = await env.RELEASES.get(`workshop/previews/${m[1]}`);
     if (!o) return cors(new Response("Not found", { status: 404 }));
     return cors(new Response(o.body, { headers: { "Content-Type": o.httpMetadata?.contentType || "image/png", "Cache-Control": "public, max-age=86400" } }));
+  }
+
+  // ---- (3.0) a chart's song, to listen to on the website before downloading it (the little player on the Workshop's
+  // pictures): pulled out of the package once (its biggest sound file; for FNF songs the instrumental before the vocals),
+  // kept in R2 as workshop/audio/<id>-v<version>, then served from there in byte ranges so the player can scrub.
+  // It doesn't count as a download.
+  m = path.match(/^\/api\/audio\/([a-z0-9]{16,40})$/);
+  if (m && (request.method === "GET" || request.method === "HEAD")) {
+    const db = await r2json(env, WS_DB, { items: [] });
+    const it = (db.items || []).find((x) => x.id === m[1] && !x.removed);
+    if (!it || !(it.b2Files && it.b2Files.length)) fail(404, "There's no song to play for that item.");
+    const key = `workshop/audio/${it.id}-v${it.version || 1}`;
+    if (!(await env.RELEASES.head(key))) {
+      const f = it.b2Files[0];
+      const dir = await judgeZipDir(env, f);
+      const sounds = [...dir.entries()].filter(([n, e]) => /\.(mp3|ogg|opus|m4a|aac|flac|wav)$/i.test(n) && e.size > 64 * 1024);
+      sounds.sort((a, b) => (/(voices|vocals?)\b/i.test(a[0]) - /(voices|vocals?)\b/i.test(b[0])) || b[1].size - a[1].size);
+      if (!sounds.length) fail(404, "That item has no song in it.");
+      const [name, e] = sounds[0];
+      const bytes = await judgeZipFile(env, f, e, 40 * 1048576);
+      await env.RELEASES.put(key, bytes, { httpMetadata: { contentType: AUDIO_TYPES[name.split(".").pop().toLowerCase()] || "application/octet-stream" } });
+    }
+    const range = request.headers.get("Range");
+    const obj = await env.RELEASES.get(key, range ? { range: request.headers } : undefined);
+    if (!obj) fail(404, "That song couldn't be read right now.");
+    const ah = new Headers({ "Content-Type": obj.httpMetadata?.contentType || "audio/mpeg", "Cache-Control": "public, max-age=31536000, immutable", "Accept-Ranges": "bytes", ETag: obj.httpEtag });
+    const body = request.method === "HEAD" ? null : obj.body;
+    if (obj.range && range) {
+      const off = obj.range.offset ?? 0, len = obj.range.length ?? obj.size - off;
+      ah.set("Content-Range", `bytes ${off}-${off + len - 1}/${obj.size}`);
+      ah.set("Content-Length", String(len));
+      return cors(new Response(body, { status: 206, headers: ah }));
+    }
+    ah.set("Content-Length", String(obj.size));
+    return cors(new Response(body, { headers: ah }));
   }
 
   // ---- download: a fresh Discord link (cached up to 12 hours)
@@ -10574,7 +11521,8 @@ async function workshopRoutes(request, env, url, ctx) {
         out.judged++;
         if (!dry) await rememberReplay(env, `board|${songId}|${chartId}`, e.playerId, r.signature);
         const counts = Array.isArray(e.counts) && e.counts.length === 6 ? e.counts : null;
-        const set = { score: r.score, accuracy: round2(r.accuracy), grade: r.grade, maxCombo: r.maxCombo, fullCombo: r.fullCombo, counts: r.counts, judged: JUDGE_VERSION };
+        // (2.2.1) the judge's score has the song speed already (rs: 1), so readBoard doesn't multiply it again
+        const set = { score: r.score, accuracy: round2(r.accuracy), grade: r.grade, maxCombo: r.maxCombo, fullCombo: r.fullCombo, counts: r.counts, judged: JUDGE_VERSION, rs: 1 };
         if (r.score === e.score && (!counts || counts.join() === r.counts.join())) { out.same++; if (!dry) changes.set(e.playerId, { date: e.date, set: { judged: JUDGE_VERSION } }); continue; }
         const d = { ...tag, accuracy: e.accuracy, counts, judgedScore: set.score, judgedAccuracy: set.accuracy, judgedCounts: set.counts };
         if (dry) out.differ.push(d);
@@ -10598,6 +11546,148 @@ async function workshopRoutes(request, env, url, ctx) {
   // server got it wrong: it left out plays it wrongly took for impossible, kept PR formula 4 as 3, and never managed to
   // write the leaderboard (entries stayed as games wrote them before 1.5.2). A few per call: pass every id back in
   // "skip". The pace record starts over from the new numbers, so the correction isn't held as a jump.
+  // ---- (2.2.0) board scores played at a rate, priced again with the chart's stars at that speed (they were held to normal
+  // speed's PR), and the players' judged records with them. Boards in key order from "after", a few with rate scores per
+  // call; each board's old copy goes to backups/rate-pr/ first and scores done are marked (rp: 1), so it can be repeated.
+  // Then /api/admin/rank-recompute (Tools/stars_v5.py rates --apply, then ranks --apply).
+  // (2.2.2) plays kept before 2.2.1 have no score, judgements or max combo: they come from the player's board score
+  // when that's the same play (same mods, accuracy within 0.02), so the website's play popup needn't fetch the board
+  if (path === "/api/admin/play-details" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 50_000).catch(() => ({}));
+    const dry = b.dry === true, limit = Math.max(1, Math.min(40, Number(b.limit) || 15));
+    const out = { boards: 0, plays: 0, filled: 0, next: null, done: false };
+    let cursor, after = String(b.after || "");
+    scan: do {
+      const list = await env.RELEASES.list({ prefix: "scores/", cursor, startAfter: !cursor && after ? after : undefined });
+      for (const o of list.objects) {
+        const mm = o.key.match(/^scores\/([^/]+)\/([^/]+)\.json$/);
+        if (!mm) continue;
+        if (out.boards >= limit) { out.next = after; break scan; }
+        out.boards++;
+        after = o.key;
+        const k = `${mm[1]}/${mm[2]}`;
+        const data = await readBoard(env, mm[1], mm[2]);
+        for (const e of data.entries || []) {
+          if (!e || !okPlayerId(e.playerId)) continue;
+          const det = playDetail(e.score, e.counts, e.maxCombo);
+          if (det.sc == null || !det.n) continue;
+          out.plays++;
+          if (dry) continue;
+          const same = (r) => r && r.sc == null && String(r.m || "") === String(e.mods || "") && Math.abs((Number(r.acc) || 0) - (Number(e.accuracy) || 0)) < 0.02;
+          let did = false;
+          await r2update(env, judgedKey(e.playerId), () => null, (d) => {
+            if (!d) return false;
+            const cur = d.charts && d.charts[k];
+            if (same(cur)) { Object.assign(cur, det); did = true; }
+            for (const r of Array.isArray(d.recent) ? d.recent : []) if (r && r.k === k && same(r)) { Object.assign(r, det); did = true; }
+            if (!did) return false;
+          }).catch((err) => console.log("play details", e.playerId, err && err.message));
+          if (did) out.filled++;
+        }
+      }
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
+    if (!out.next) out.done = true;
+    return reply(out);
+  }
+  // (2.2.2) the profile pages on the website written now ({ dry } to see what would change, { force } to write all)
+  if (path === "/api/admin/profile-pages" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 50_000).catch(() => ({}));
+    return reply(await syncProfilePages(env, { force: b.force === true, dry: b.dry === true }));
+  }
+  // (2.2.2) a supporter's profile link taken away (offensive, or someone else's): { link } or { player }
+  if (path === "/api/admin/link-remove" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 50_000).catch(() => ({}));
+    const out = { removed: [] };
+    await r2update(env, LINKS_KEY, () => ({}), (L) => {
+      out.removed = [];
+      for (const [k, v] of Object.entries(L)) if ((b.link && k === String(b.link).toLowerCase()) || (b.player && v && v.id === b.player)) { out.removed.push(v); delete L[k]; }
+      if (!out.removed.length) return false;
+    });
+    linksCache = null;
+    return reply(out);
+  }
+  // (2.2.2) crews nobody is in any more (no member's wallet points to them: copies made by a create sent twice) leave
+  // the crew board; their files are kept, marked gone
+  if (path === "/api/admin/crew-orphans" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 50_000).catch(() => ({}));
+    const dry = b.dry === true;
+    const idx = await r2json(env, CREW_INDEX, { crews: {} });
+    const out = { checked: 0, orphans: [] };
+    for (const [id, x] of Object.entries(idx.crews || {})) {
+      out.checked++;
+      const c = await r2json(env, crewKey(id), null);
+      const members = c && !c.gone ? c.members || [] : [];
+      const used = (await Promise.all(members.map(async (m) => ((await walletOf(env, m.id)).crew || {}).id === id))).some(Boolean);
+      if (used) continue;
+      out.orphans.push({ id, name: x.name, tag: x.tag, members: members.map((m) => m.name) });
+      if (dry) continue;
+      if (c && !c.gone) await r2update(env, crewKey(id), () => null, (cc) => { if (!cc) return false; cc.gone = true; cc.goneWhy = "orphan"; });
+      await r2update(env, CREW_INDEX, () => ({ crews: {} }), (d) => { if (!d.crews || !d.crews[id]) return false; delete d.crews[id]; });
+    }
+    return reply(out);
+  }
+  if (path === "/api/admin/rate-rescore" && request.method === "POST") {
+    if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
+    const b = await bodyOf(request, 50_000).catch(() => ({}));
+    const dry = b.dry === true, limit = Math.max(1, Math.min(10, Number(b.limit) || 4));
+    const out = { boards: 0, scores: 0, prBefore: 0, prAfter: 0, players: 0, failed: [], examples: [], next: null, done: false };
+    const info = await boardChartInfo(env);
+    let cursor, after = String(b.after || "");
+    scan: do {
+      const list = await env.RELEASES.list({ prefix: "scores/", cursor, startAfter: !cursor && after ? after : undefined });
+      for (const o of list.objects) {
+        const mm = o.key.match(/^scores\/([^/]+)\/([^/]+)\.json$/);
+        if (!mm) continue;
+        const [, songId, chartId] = mm;
+        const data = await readBoard(env, songId, chartId);
+        const todo = (data.entries || []).filter((e) => e && !e.rp && rateOf(e.mods) !== 1 && Array.isArray(e.counts) && e.counts.length >= 6);
+        if (!todo.length) continue;
+        if (out.boards >= limit) { out.next = after; break scan; }
+        out.boards++;
+        after = o.key;
+        const i = info.charts.get(`${songId}/${chartId}`);
+        let where = null;
+        try { where = i && i.stv === STAR_VERSION && i.stars > 0 ? await boardChartOf(env, songId, chartId, i.difficulty) : null; } catch (e) { console.log("rate rescore", o.key, e && e.message); }
+        if (!where) { out.failed.push(o.key); continue; }
+        const priced = new Map(); // playerId -> { pp, mods, acc }
+        for (const e of todo) {
+          const st = await boardStarsAt(env, where, songId, chartId, i.stars, rateOf(e.mods));
+          if (!(st > 0)) continue;
+          const targets = e.counts.slice(0, 6).reduce((a, n) => a + (Number(n) || 0), 0);
+          const pp = playPR(st, e.counts, targets, false, e.mods);
+          out.scores++; out.prBefore += Number(e.pp) || 0; out.prAfter += pp;
+          if (out.examples.length < 12) out.examples.push({ board: o.key, name: e.name, mods: e.mods, acc: e.accuracy, before: e.pp, after: pp, stars: round2(st) });
+          priced.set(e.playerId, { pp, mods: e.mods, acc: e.accuracy, date: e.date });
+        }
+        if (dry || !priced.size) continue;
+        if (!(await env.RELEASES.head(`backups/rate-pr/${o.key}`))) await env.RELEASES.put(`backups/rate-pr/${o.key}`, JSON.stringify(data));
+        await r2update(env, o.key, () => ({ entries: [] }), (x) => {
+          for (const e of x.entries || []) { const p = e && !e.rp && priced.get(e.playerId); if (p && e.mods === p.mods) { e.pp = p.pp; e.rp = 1; } }
+        });
+        boards.delete(o.key);
+        // the players' best judged PR on this board: this play's new price (it was the same play), or more than before
+        for (const [pid, p] of priced) {
+          await r2update(env, judgedKey(pid), () => ({ v: 1, charts: {} }), (d) => {
+            d.charts ||= {};
+            const k = `${songId}/${chartId}`, cur = d.charts[k];
+            if (cur && cur.m === p.mods && Math.abs((Number(cur.acc) || 0) - (Number(p.acc) || 0)) < 0.02) cur.pp = p.pp;
+            else if (!cur || p.pp > (Number(cur.pp) || 0)) d.charts[k] = { ...(cur || {}), pp: p.pp, acc: p.acc, m: p.mods, at: p.date || (cur && cur.at) };
+            else return false;
+          }).catch((e) => console.log("rate rescore judged", pid, e && e.message));
+          out.players++;
+        }
+      }
+      cursor = list.truncated ? list.cursor : undefined;
+    } while (cursor);
+    if (!out.next) out.done = true;
+    out.prBefore = round2(out.prBefore); out.prAfter = round2(out.prAfter);
+    return reply(out);
+  }
   if (path === "/api/admin/rank-recompute" && request.method === "POST") {
     if (!(await officialImporter(request, env))) fail(403, "Only the developer's tools can do this.");
     const b = await bodyOf(request, 50_000).catch(() => ({}));
@@ -11106,7 +12196,7 @@ async function workshopRoutes(request, env, url, ctx) {
     const footer = [diff, keys ? `${keys}K` : "", mods, "Shared from OCTIVE"].filter(Boolean).join("  ·  ");
     const embed = {
       color: gradeColor,
-      author: { name, url: `${SITE}#/u/${encodeURIComponent(who.playerId)}`, ...(avatarHash ? { icon_url: `${WORKER_BASE}/avatar/${encodeURIComponent(who.playerId)}?v=${encodeURIComponent(avatarHash)}` } : {}) },
+      author: { name, url: `${SITE}u/${encodeURIComponent(who.playerId)}`, ...(avatarHash ? { icon_url: `${WORKER_BASE}/avatar/${encodeURIComponent(who.playerId)}?v=${encodeURIComponent(avatarHash)}` } : {}) },
       title: title.slice(0, 256), fields,
       ...(bytes ? { image: { url: `attachment://score.${kind}` } } : {}),
       footer: { text: footer.slice(0, 2000) }, timestamp: new Date().toISOString(),
@@ -11154,7 +12244,14 @@ async function workshopRoutes(request, env, url, ctx) {
     // the developer and the official account can change who it's credited to
     const canCredit = who.playerId === OWNER || isOfficial(who.playerId);
     const creator = canCredit && form.get("creator") != null ? clean(form.get("creator"), 40) || it.creator : it.creator;
-    const newCreatorId = canCredit && /^[A-Za-z0-9_-]{8,64}$/.test(String(form.get("creatorId") || "")) ? String(form.get("creatorId")) : it.creatorId;
+    let newCreatorId = canCredit && /^[A-Za-z0-9_-]{8,64}$/.test(String(form.get("creatorId") || "")) ? String(form.get("creatorId")) : it.creatorId;
+    // (2.2.0) the credited name changed in this edit and the ID was left as it was: the item goes to the player with that
+    // name (exact, on the ranking, only one), so "by <name>", the Creator button and the profile follow it. Only on a
+    // change: names aren't unique, so re-linking on every save would hand items to anyone who copies a name.
+    if (canCredit && newCreatorId === it.creatorId && creator.toLowerCase() !== String(it.creator || "").toLowerCase()) {
+      const named = await wsPlayerNamed(env, creator);
+      if (named) newCreatorId = named;
+    }
     // a new version: one file, or (a pack) all its songs again
     const upFiles = await wsInputs(env, form, who.playerId);
     const upParts = [];
@@ -11296,7 +12393,7 @@ async function discordMessageAlert(env, to, from, fromName, preview) {
   await discordApi(env, "POST", `/channels/${ch.id}/messages`, {
     embeds: [{ color: 0x8b7bff, title: `💬 ${String(fromName).slice(0, 40)} sent you a message on OCTIVE`, description: String(preview || "").slice(0, 300),
       footer: { text: "Reply in the game (F8) or on the website · turn these off in Settings → Profile → Discord" } }],
-    components: [{ type: 1, components: [{ type: 2, style: 5, label: "Open messages", url: `${SITE}#/messages/${encodeURIComponent(from)}` }] }],
+    components: [{ type: 1, components: [{ type: 2, style: 5, label: "Open messages", url: `${SITE}messages/${encodeURIComponent(from)}` }] }],
     allowed_mentions: { parse: [] },
   });
 }
@@ -11600,10 +12697,14 @@ export default {
   async scheduled(event, env, ctx) {
     // 21:00 UTC: streak reminders (3 hours before the daily charts change)
     if (event.cron === "0 21 * * *") { ctx.waitUntil(streakReminders(env).catch((e) => console.log("streak reminders", e && e.message))); return; }
+    // :45 every hour: small copies of new Workshop pictures for the bot's cards (on their own: they take a lot of CPU)
+    if (event.cron === "45 * * * *") { ctx.waitUntil(wsThumbTick(env).catch((e) => console.log("workshop thumbs", e && e.message))); return; }
     // :15 every hour: the 2.0 ranking move, a few ranking entries at a time (does nothing once it's through), and more
     // chart shapes (Ranked's ban screen shows them; verified uploads go first; nothing to do once they're all in)
     if (event.cron === "15 * * * *") {
       ctx.waitUntil(Promise.all([recomputeRanking(env, 6).catch((e) => console.log("ranking recompute", e && e.message)),
+        // (2.2.2) profile pages on the website for new players, new names and changed links
+        syncProfilePages(env).catch((e) => console.log("profile pages", e && e.message)),
         fillChartShapes(env, 20).catch((e) => console.log("chart shapes", e && e.message)),
         fillModchartFlags(env, 15).catch((e) => console.log("modchart flags", e && e.message)),
         rkDiscordTick(env).catch((e) => console.log("ranked discord", e && e.message)),
@@ -11687,6 +12788,29 @@ export default {
       if (url.pathname === "/official/status") return json({ ...(await officialStatus(env)), now: Date.now() }, 30);
       const m = url.pathname.match(/^\/avatar\/([A-Za-z0-9_-]{1,64})$/);
       if (m) return await avatar(env, m[1], url.searchParams.get("v"));
+      // (2.2.2) shared profile links, their card pictures, and supporters' own links (the website asks who a link is)
+      const um = url.pathname.match(/^\/u\/([A-Za-z0-9_-]{1,64})\/?$/);
+      if (um) return await profileSharePage(env, um[1], request);
+      const cm = url.pathname.match(/^\/card\/([A-Za-z0-9_-]{1,64})\.png$/);
+      if (cm) return await profileCardRoute(env, cm[1]);
+      // (2.2.2) the website's pages and things: their card pictures
+      const pg = url.pathname.match(/^\/card\/page\/([a-z]{2,20})\.png$/);
+      if (pg && Object.prototype.hasOwnProperty.call(PAGE_CARDS, pg[1])) { const c = await PAGE_CARDS[pg[1]](env); return await cachedCard(env, `cards/page/${pg[1]}.png`, c.data, c.card, ctx, pageCardLook(pg[1])); }
+      // (2.2.2) the Discord bot's command cards
+      const bc = url.pathname.match(/^\/card\/bot\/([a-z]{3,20})\/([A-Za-z0-9_~.-]{1,140})\.png$/);
+      if (bc) return await botCardRoute(env, bc[1], bc[2], url, ctx);
+      const cw = url.pathname.match(/^\/card\/(ws|crew|update)\/([A-Za-z0-9.]{3,40})\.png$/);
+      if (cw) {
+        const c = cw[1] === "ws" ? await wsCard(env, cw[2]) : cw[1] === "crew" ? await crewCard(env, cw[2]) : await updateCard(env, cw[2]);
+        if (!c) return cors(new Response("Not found", { status: 404 }));
+        return await cachedCard(env, `cards/${cw[1]}/${cw[2]}.png`, c.data, c.card, ctx);
+      }
+      const lm = url.pathname.match(/^\/links\/(of\/)?([A-Za-z0-9_-]{1,64})$/);
+      if (lm) {
+        const who = lm[1] ? { id: lm[2], link: await linkOf(env, lm[2]) } : await resolveProfile(env, lm[2]);
+        if (!who) return json({ error: "Nobody has that link." }, 60, 404);
+        return json({ id: who.id, link: who.link || null, share: shareUrl(who.link || who.id) }, 60);
+      }
       // /web/<version>/[~<build stamp>/]Build/... — the stamp only makes browsers fetch a re-uploaded build
       const w = url.pathname.match(/^\/web\/(\d{1,3}\.\d{1,3}\.\d{1,3}|t-[a-f0-9]{24})\/(?:~[A-Za-z0-9-]{1,40}\/)?((?:Build|StreamingAssets)\/[A-Za-z0-9._\/-]{1,200})$/);
       if (w && !w[2].includes("..")) return await webFile(env, w[1], w[2], request);
